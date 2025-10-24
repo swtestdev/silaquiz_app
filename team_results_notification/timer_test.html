@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Timer Trigger Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        .button-group {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin: 20px 0;
+        }
+        button {
+            padding: 12px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: bold;
+            transition: all 0.3s;
+        }
+        .start-btn { background: #4CAF50; color: white; }
+        .stop-btn { background: #f44336; color: white; }
+        .pause-btn { background: #ff9800; color: white; }
+        .resume-btn { background: #2196F3; color: white; }
+        button:hover { transform: translateY(-2px); box-shadow: 0 4px 8px rgba(0,0,0,0.2); }
+        .custom-input {
+            margin: 20px 0;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+        .response {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 5px;
+            padding: 15px;
+            margin-top: 20px;
+            white-space: pre-wrap;
+            font-family: monospace;
+        }
+        .success { border-color: #28a745; background: #d4edda; }
+        .error { border-color: #dc3545; background: #f8d7da; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎮 Timer Trigger Test</h1>
+        <p>Use the buttons below to test different timer actions. Make sure your backend is running on <code>localhost:8000</code> and your Flutter app is connected.</p>
+        
+        <div class="button-group">
+            <button class="start-btn" onclick="sendTimerTrigger('>>>>>>>START_TIMER>>>>>>>Slide#58##')">
+                ▶️ Start Timer (Slide 58)
+            </button>
+            <button class="start-btn" onclick="sendTimerTrigger('>>>>>>>START_TIMER>>>>>>>Slide#1##')">
+                ▶️ Start Timer (Slide 1)
+            </button>
+            <button class="stop-btn" onclick="sendTimerTrigger('>>>>>>>STOP_TIMER>>>>>>>')">
+                ⏹️ Stop Timer
+            </button>
+            <button class="pause-btn" onclick="sendTimerTrigger('>>>>>>>PAUSE_TIMER>>>>>>>')">
+                ⏸️ Pause Timer
+            </button>
+            <button class="resume-btn" onclick="sendTimerTrigger('>>>>>>>RESUME_TIMER>>>>>>>')">
+                ⏯️ Resume Timer
+            </button>
+        </div>
+        
+        <div class="custom-input">
+            <label for="customTrigger">Custom Trigger Data:</label>
+            <input type="text" id="customTrigger" placeholder="Enter custom trigger data..." 
+                   value=">>>>>>>START_TIMER>>>>>>>Slide#25##">
+            <button onclick="sendCustomTrigger()" style="margin-top: 10px; background: #6c757d; color: white;">
+                🚀 Send Custom Trigger
+            </button>
+        </div>
+        
+        <div id="response" class="response" style="display: none;"></div>
+    </div>
+
+    <script>
+        // Change this to your server's IP address when testing remotely
+        const SERVER_IP = 'DESKTOP-638BFEB';//'localhost'; // Change to your server IP (e.g., '192.168.1.100', 'DESKTOP-638BFEB')
+        const API_URL = `http://${SERVER_IP}:8000/api/timer/trigger`;
+        
+        async function sendTimerTrigger(triggerData) {
+            const responseDiv = document.getElementById('response');
+            responseDiv.style.display = 'block';
+            responseDiv.className = 'response';
+            responseDiv.textContent = 'Sending request...';
+            
+            try {
+                const response = await fetch(API_URL, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        trigger_data: triggerData
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    responseDiv.className = 'response success';
+                    responseDiv.textContent = `✅ Success!\n\n${JSON.stringify(data, null, 2)}`;
+                } else {
+                    responseDiv.className = 'response error';
+                    responseDiv.textContent = `❌ Error (${response.status}):\n\n${JSON.stringify(data, null, 2)}`;
+                }
+            } catch (error) {
+                responseDiv.className = 'response error';
+                responseDiv.textContent = `❌ Network Error:\n\n${error.message}`;
+            }
+        }
+        
+        function sendCustomTrigger() {
+            const customData = document.getElementById('customTrigger').value;
+            if (customData.trim()) {
+                sendTimerTrigger(customData);
+            } else {
+                alert('Please enter custom trigger data');
+            }
+        }
+        
+        // Allow Enter key in input field
+        document.getElementById('customTrigger').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                sendCustomTrigger();
+            }
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,36 @@
+name: team_people_counter
+description: A simple team people counter app
+publish_to: none
+
+environment:
+  sdk: '>=3.2.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  mobile_scanner: ^3.5.6
+  provider: ^6.0.5
+  clipboard: ^0.1.3
+  flutter_local_notifications: ^19.0.0
+  flutter_localizations:
+    sdk: flutter
+  intl: ^0.20.2
+  path_provider: ^2.1.5
+  path: ^1.9.0
+  shared_preferences: ^2.3.5
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_launcher_icons: ^0.13.1
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/cilamisly.png
+    - assets/app_icon.png
+
+flutter_icons:
+  android: true
+  ios: true
+  image_path: "assets/app_icon.png"
