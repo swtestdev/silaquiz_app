@@ -33,6 +33,9 @@ class _MainPageState extends State<MainPage> {
   String? _currentWriterName;
   String? _previousWriterName;
   
+  // Visible connected status tracking
+  int _visibleConnected = 0;
+  
   // Timer and WebSocket state
   WebSocketChannel? _channel;
   Timer? _timer;
@@ -146,6 +149,7 @@ class _MainPageState extends State<MainPage> {
           setState(() {
             _userName = freshUserData?['name'] ?? 'User';
             _isWriter = freshUserData?['writer'] ?? false;
+            _visibleConnected = freshUserData?['visible_connected'] ?? 0;
             _userId = freshUserData?['id']?.toString() ?? '';
             _userRole = freshUserData?['role'] ?? 'player';
           });
@@ -187,6 +191,7 @@ class _MainPageState extends State<MainPage> {
     setState(() {
       _userName = userData['name'] ?? 'User';
       _isWriter = userData['writer'] ?? false;
+      _visibleConnected = userData['visible_connected'] ?? 0;
       _userId = userData['id']?.toString() ?? '';
       _hasTeam = hasTeam;
       _userRole = userData['role'] ?? 'player';
@@ -233,6 +238,7 @@ class _MainPageState extends State<MainPage> {
     setState(() {
       _userName = localUserData['name'] ?? 'User';
       _isWriter = localUserData['writer'] ?? false;
+      _visibleConnected = localUserData['visible_connected'] ?? 0;
       _userId = localUserData['id']?.toString() ?? '';
       _userRole = localUserData['role'] ?? 'player';
     });
@@ -268,6 +274,7 @@ class _MainPageState extends State<MainPage> {
     setState(() {
       _userName = localUserData['name'] ?? 'User';
       _isWriter = localUserData['writer'] ?? false;
+      _visibleConnected = localUserData['visible_connected'] ?? 0;
       _userId = localUserData['id']?.toString() ?? '';
       _hasTeam = hasTeam;
       _userRole = localUserData['role'] ?? 'player';
@@ -478,6 +485,26 @@ class _MainPageState extends State<MainPage> {
         backgroundColor: Colors.blue,
         foregroundColor: Colors.white,
         actions: [
+          // Connection Status Indicator
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                _visibleConnected == 1 ? Icons.wifi : Icons.wifi_off,
+                color: _visibleConnected == 1 ? Colors.green : Colors.red,
+                size: 16,
+              ),
+              const SizedBox(width: 4),
+              Text(
+                _visibleConnected == 1 ? 'Online' : 'Offline',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: _visibleConnected == 1 ? Colors.green : Colors.red,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(width: 8),
           // Writer Toggle
           Row(
             mainAxisSize: MainAxisSize.min,
@@ -882,6 +909,12 @@ class _MainPageState extends State<MainPage> {
         Uri.parse(wsUrl),
       );
       
+      // Set visible connected status when WebSocket connects
+      setState(() {
+        _visibleConnected = 1;
+      });
+      print('WebSocket connected, setting visible_connected = 1');
+      
       _channel!.stream.listen(
         (data) {
           final message = json.decode(data);
@@ -891,11 +924,25 @@ class _MainPageState extends State<MainPage> {
         },
         onError: (error) {
           print('WebSocket error: $error');
+          // Set visible connected status to 0 on error
+          if (mounted) {
+            setState(() {
+              _visibleConnected = 0;
+            });
+            print('WebSocket error, setting visible_connected = 0');
+          }
           // WebSocket error might indicate connection issues, check if we should logout
           _handleWebSocketDisconnection();
         },
         onDone: () {
           print('WebSocket connection closed - this might be due to new device login');
+          // Set visible connected status to 0 when WebSocket disconnects
+          if (mounted) {
+            setState(() {
+              _visibleConnected = 0;
+            });
+            print('WebSocket disconnected, setting visible_connected = 0');
+          }
           // WebSocket connection closed, this might be due to new device login
           // Show immediate warning to user
           if (mounted) {
@@ -1255,7 +1302,7 @@ class _MainPageState extends State<MainPage> {
             return {'success': false, 'should_logout': false};
           },
         );
-        print('ECHO call result: visible=$_isAppVisible, success=${echoResult['success']}, should_logout=${echoResult['should_logout']}');
+        print('ECHO call result: visible=$_isAppVisible, success=${echoResult['success']}, should_logout=${echoResult['should_logout']}, visible_connected=${echoResult['visible_connected']}');
         
         if (echoResult['should_logout'] == true) {
           print('ECHO call indicates session invalid, logging out user');
@@ -1266,6 +1313,15 @@ class _MainPageState extends State<MainPage> {
           if (_userRole == 'player' && _channel == null) {
             print('ECHO successful but WebSocket disconnected, reconnecting...');
             _connectWebSocket();
+          }
+          
+          // Update visible connected status
+          final visibleConnected = echoResult['visible_connected'];
+          if (visibleConnected != null && visibleConnected != _visibleConnected) {
+            setState(() {
+              _visibleConnected = visibleConnected;
+            });
+            print('Visible connected status updated: $_visibleConnected');
           }
           
           // Handle writer status changes

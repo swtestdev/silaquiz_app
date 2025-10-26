@@ -180,6 +180,7 @@ class DatabaseService {
           'success': responseData['success'] ?? false,
           'message': responseData['message'] ?? 'Unknown response',
           'should_logout': responseData['should_logout'] ?? false,
+          'visible_connected': responseData['visible_connected'] ?? 0,
           'writer_status': responseData['writer_status'] ?? null,
         };
       } else {

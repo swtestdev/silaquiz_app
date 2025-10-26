@@ -141,6 +141,7 @@ class User(Base):
     logged_in_at = Column(DateTime, default=datetime.utcnow)
     session_token = Column(String(255), nullable=True, unique=True)  # Unique session token for single session management
     last_seen = Column(DateTime, nullable=True)  # Last time user was seen (for ECHO calls)
+    visible_connected = Column(Integer, default=0)  # 1 if user is connected and visible, 0 if disconnected or not visible
 
 class ActiveGame(Base):
     __tablename__ = "active_games"
@@ -208,6 +209,7 @@ class UserResponse(BaseModel):
     created_at: datetime
     playing_in_team_id: constr(max_length=6)  # Team ID 6 symbols where the user is playing (Null means not assigned to any team)
     logged_in_at: datetime
+    visible_connected: int  # 1 if user is connected and visible, 0 if disconnected or not visible
 
 # Model for users updating
 class UpdateUserActiveStatus(BaseModel):
@@ -432,6 +434,7 @@ async def login_user(user_credentials: UserLogin, db: Session = Depends(get_db))
     # Update user with new session token (single session enforcement)
     user.session_token = new_session_token
     user.logged_in_at = datetime.utcnow()
+    user.visible_connected = 0  # Initially not connected/visible until WebSocket connects
     
     # Commit the update
     db.commit()
@@ -481,7 +484,8 @@ async def login_user(user_credentials: UserLogin, db: Session = Depends(get_db))
             "writer": is_writer,  # Now based on team table
             "playing_in_team_id": user.playing_in_team_id,
             "is_captain": is_captain,
-            "logged_in_at": user.logged_in_at
+            "logged_in_at": user.logged_in_at,
+            "visible_connected": user.visible_connected
         },
         "access_token": access_token,
         "session_token": new_session_token,
@@ -497,11 +501,12 @@ async def logout_user(current_user: dict = Depends(get_current_user), db: Sessio
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         
-        # Clear session token (this will invalidate the session)
+        # Clear session token and set as not visible/connected (this will invalidate the session)
         user.session_token = None
+        user.visible_connected = 0
         db.commit()
         
-        logger.info(f"User {user.email} logged out, session token cleared")
+        logger.info(f"User {user.email} logged out, session token cleared and marked as not visible/connected")
         
         return {"message": "Logout successful"}
         
@@ -2759,6 +2764,11 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
         await manager.connect(websocket, connection_id, user_id)
         logger.info(f"WebSocket connected for user {user_id} with valid session")
         
+        # Set user as visible and connected
+        user.visible_connected = 1
+        db.commit()
+        logger.info(f"User {user_id} marked as visible and connected")
+        
         while True:
             # Keep connection alive and listen for any incoming messages
             data = await websocket.receive_text()
@@ -2770,9 +2780,23 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
     except WebSocketDisconnect:
         manager.disconnect(connection_id, user_id)
         logger.info(f"WebSocket disconnected for user {user_id}")
+        
+        # Set user as not visible and disconnected
+        user = db.query(User).filter(User.id == user_id).first()
+        if user:
+            user.visible_connected = 0
+            db.commit()
+            logger.info(f"User {user_id} marked as not visible and disconnected")
     except Exception as e:
         logger.error(f"WebSocket error for user {user_id}: {e}")
         manager.disconnect(connection_id, user_id)
+        
+        # Set user as not visible and disconnected on error
+        user = db.query(User).filter(User.id == user_id).first()
+        if user:
+            user.visible_connected = 0
+            db.commit()
+            logger.info(f"User {user_id} marked as not visible and disconnected due to error")
     finally:
         db.close()
 
@@ -2902,7 +2926,8 @@ async def validate_session(current_user: User = Depends(get_current_user), db: S
                 "writer": is_writer,  # Now based on team table
                 "playing_in_team_id": current_user.playing_in_team_id,
                 "is_captain": is_captain,
-                "logged_in_at": current_user.logged_in_at
+                "logged_in_at": current_user.logged_in_at,
+                "visible_connected": current_user.visible_connected
             }
         }
     except Exception as e:
@@ -3037,8 +3062,9 @@ async def echo_session(
                 "should_logout": True
             }
         
-        # Update last seen timestamp
+        # Update last seen timestamp and visible_connected status
         current_user.last_seen = datetime.utcnow()
+        current_user.visible_connected = 1 if app_visible else 0
         db.commit()
         
         # Log visibility status for monitoring
@@ -3073,6 +3099,7 @@ async def echo_session(
             "should_logout": False,
             "user_id": current_user.id,
             "email": current_user.email,
+            "visible_connected": current_user.visible_connected,
             "writer_status": {
                 "is_writer": is_current_user_writer,
                 "current_writer_id": current_writer_id,
