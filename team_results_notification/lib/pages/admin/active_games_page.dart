@@ -789,9 +789,28 @@ class _AddActiveGameDialogState extends State<AddActiveGameDialog> {
           .where((game) => !usedGameIds.contains(game['id']))
           .toList();
       
+      // Filter out teams that are already participating in other active games
+      final usedTeamIds = <String>{};
+      for (final activeGame in activeGames) {
+        if (widget.existingGame == null || activeGame['id'] != widget.existingGame!['id']) {
+          // Parse teams_ids string and add to used teams
+          final teamsIds = activeGame['teams_ids'] as String?;
+          if (teamsIds != null && teamsIds.isNotEmpty) {
+            final teamIdList = teamsIds.split(',');
+            for (final teamId in teamIdList) {
+              usedTeamIds.add(teamId.trim());
+            }
+          }
+        }
+      }
+      
+      final availableTeams = teams
+          .where((team) => !usedTeamIds.contains(team['id'].toString()))
+          .toList();
+      
       setState(() {
         _availableGames = availableGames;
-        _availableTeams = teams;
+        _availableTeams = availableTeams;
         _isLoading = false;
       });
       

@@ -180,6 +180,7 @@ class DatabaseService {
           'success': responseData['success'] ?? false,
           'message': responseData['message'] ?? 'Unknown response',
           'should_logout': responseData['should_logout'] ?? false,
+          'writer_status': responseData['writer_status'] ?? null,
         };
       } else {
         return {
@@ -194,6 +195,50 @@ class DatabaseService {
         'success': false,
         'message': 'Echo call failed: ${e.toString()}',
         'should_logout': false  // Don't logout on network errors
+      };
+    }
+  }
+
+  // Method to toggle writer status
+  static Future<Map<String, dynamic>> toggleWriterStatus(String action) async {
+    try {
+      final userData = await UserDataService.getUserData();
+      if (userData == null || userData['access_token'] == null) {
+        return {
+          'success': false,
+          'message': 'No active session found',
+        };
+      }
+
+      final response = await http.post(
+        Uri.parse('$_baseUrl/team/toggle-writer'),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ${userData['access_token']}',
+        },
+        body: jsonEncode({
+          'action': action, // 'on' or 'off'
+        }),
+      ).timeout(const Duration(seconds: 10));
+
+      if (response.statusCode == 200) {
+        final responseData = jsonDecode(response.body);
+        return {
+          'success': responseData['success'] ?? false,
+          'message': responseData['message'] ?? 'Unknown response',
+          'writer_status': responseData['writer_status'] ?? null,
+        };
+      } else {
+        return {
+          'success': false,
+          'message': 'Toggle writer status failed with status ${response.statusCode}',
+        };
+      }
+    } catch (e) {
+      print('Toggle writer status error: $e');
+      return {
+        'success': false,
+        'message': 'Toggle writer status failed: ${e.toString()}',
       };
     }
   }
@@ -356,39 +401,22 @@ class DatabaseService {
         headers: {
           'Content-Type': 'application/json',
         },
+      ).timeout(
+        const Duration(seconds: 5),
+        onTimeout: () {
+          throw Exception('Database initialization request timed out');
+        },
       );
       
       if (response.statusCode == 200) {
         print('Database initialized admin successfully');
       } else {
         print('Database initialization admin failed: ${response.body}');
+        throw Exception('Database initialization failed with status ${response.statusCode}');
       }
     } catch (e) {
       print('Database initialization admin error: $e');
-    }
-  }
-
-  // Update writer user status
-  static Future<Map<String, dynamic>> updateWriterUserStatus(String userId, bool isActive) async {
-    try {
-      final response = await http.put(
-        Uri.parse('$_baseUrl/users/$userId/status'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'writer': isActive}),
-      );
-
-      final data = jsonDecode(response.body);
-      
-      if (response.statusCode == 200 && data['success'] == true) {
-        return {'success': true, 'user': data['user']};
-      } else {
-        return {
-          'success': false, 
-          'message': data['message'] ?? 'Failed to update status'
-        };
-      }
-    } catch (e) {
-      return {'success': false, 'message': 'Error: $e'};
+      rethrow; // Re-throw to be caught by the calling method
     }
   }
 
@@ -1218,6 +1246,7 @@ class _LoginPageState extends State<LoginPage> {
   void initState() {
     super.initState();
     if (!_databaseInitialized) {
+      // Don't await this - let it run in background
       _initializeDatabase();
     }
   }
@@ -1236,11 +1265,19 @@ class _LoginPageState extends State<LoginPage> {
     if (_databaseInitialized) return; // Prevent multiple calls
     
     try {
-      await DatabaseService.createUsersTable();
+      // Add timeout to prevent hanging
+      await DatabaseService.createUsersTable().timeout(
+        const Duration(seconds: 5),
+        onTimeout: () {
+          print('Database initialization timed out - backend may not be running');
+        },
+      );
       _databaseInitialized = true; // Set flag after successful call
       print('Database initialized request successfully');
     } catch (e) {
       print('Database initialization request failed: $e');
+      // Don't set _databaseInitialized to true on error
+      // This allows retry on next login attempt
     }
   }
 

@@ -18,7 +18,6 @@ class MainPage extends StatefulWidget {
 class _MainPageState extends State<MainPage> {
   bool _isLoading = true;
   String _userName = 'User';
-  bool _isReporter = false;
   String _userId = '';
   bool _hasShownTeamNotification = false;
   bool _hasTeam = false;
@@ -28,6 +27,11 @@ class _MainPageState extends State<MainPage> {
   Timer? _echoTimer;
   bool _isAppVisible = true;
   bool _hasShownNotification = false;
+  
+  // Writer status tracking
+  bool _isWriter = false;
+  String? _currentWriterName;
+  String? _previousWriterName;
   
   // Timer and WebSocket state
   WebSocketChannel? _channel;
@@ -141,7 +145,7 @@ class _MainPageState extends State<MainPage> {
           print('Fresh user data: $freshUserData');
           setState(() {
             _userName = freshUserData?['name'] ?? 'User';
-            _isReporter = freshUserData?['writer'] ?? false;
+            _isWriter = freshUserData?['writer'] ?? false;
             _userId = freshUserData?['id']?.toString() ?? '';
             _userRole = freshUserData?['role'] ?? 'player';
           });
@@ -182,7 +186,7 @@ class _MainPageState extends State<MainPage> {
     
     setState(() {
       _userName = userData['name'] ?? 'User';
-      _isReporter = userData['writer'] ?? false;
+      _isWriter = userData['writer'] ?? false;
       _userId = userData['id']?.toString() ?? '';
       _hasTeam = hasTeam;
       _userRole = userData['role'] ?? 'player';
@@ -228,7 +232,7 @@ class _MainPageState extends State<MainPage> {
     // Set basic user data
     setState(() {
       _userName = localUserData['name'] ?? 'User';
-      _isReporter = localUserData['writer'] ?? false;
+      _isWriter = localUserData['writer'] ?? false;
       _userId = localUserData['id']?.toString() ?? '';
       _userRole = localUserData['role'] ?? 'player';
     });
@@ -263,7 +267,7 @@ class _MainPageState extends State<MainPage> {
     
     setState(() {
       _userName = localUserData['name'] ?? 'User';
-      _isReporter = localUserData['writer'] ?? false;
+      _isWriter = localUserData['writer'] ?? false;
       _userId = localUserData['id']?.toString() ?? '';
       _hasTeam = hasTeam;
       _userRole = localUserData['role'] ?? 'player';
@@ -461,70 +465,6 @@ class _MainPageState extends State<MainPage> {
     _hasShownTeamNotification = false;
   }
 
-  // Update reporter status
-  Future<void> _updateReporterStatus(bool newStatus) async {
-    if (_userId.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('User ID not found')),
-      );
-      return;
-    }
-    
-    if (!_hasTeam) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('You must be assigned to a team to become a reporter'),
-          backgroundColor: Colors.orange,
-        ),
-      );
-      return;
-    }
-
-    try {
-      final result = await DatabaseService.updateWriterUserStatus(_userId, newStatus);
-      
-      if (result['success']) {
-        setState(() {
-          _isReporter = newStatus;
-        });
-        
-        // Update local user data - merge with existing data to preserve tokens
-        final currentUserData = await UserDataService.getUserData();
-        final updatedUser = result['user'];
-        final mergedUserData = <String, dynamic>{
-          ...currentUserData ?? {},
-          ...updatedUser,
-        };
-        await UserDataService.saveUserData(mergedUserData);
-        
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              newStatus 
-                ? 'You are now a team reporter' 
-                : 'You are no longer a team reporter'
-            ),
-            backgroundColor: newStatus ? Colors.green : Colors.orange,
-          ),
-        );
-      } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Failed to update status: ${result['message']}'),
-            backgroundColor: Colors.red,
-          ),
-        );
-      }
-    } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Error updating status: $e'),
-          backgroundColor: Colors.red,
-        ),
-      );
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     if (_isLoading) {
@@ -538,12 +478,12 @@ class _MainPageState extends State<MainPage> {
         backgroundColor: Colors.blue,
         foregroundColor: Colors.white,
         actions: [
-          // Team Reporter Toggle
+          // Writer Toggle
           Row(
             mainAxisSize: MainAxisSize.min,
             children: [
               Text(
-                'Reporter',
+                'Writer',
                 style: TextStyle(
                   fontSize: 12,
                   color: _hasTeam ? Colors.white : Colors.grey.shade400,
@@ -552,12 +492,12 @@ class _MainPageState extends State<MainPage> {
               const SizedBox(width: 8),
               Tooltip(
                 message: _hasTeam 
-                    ? 'Toggle reporter status' 
-                    : 'You must be assigned to a team to become a reporter',
+                    ? 'Toggle writer status' 
+                    : 'You must be assigned to a team to become a writer',
                 child: Switch(
-                  value: _isReporter,
-                  onChanged: _hasTeam ? _updateReporterStatus : null,
-                  activeColor: Colors.green,
+                  value: _isWriter,
+                  onChanged: _hasTeam ? _toggleWriterStatus : null,
+                  activeColor: Colors.orange,
                 ),
               ),
             ],
@@ -1119,6 +1059,96 @@ class _MainPageState extends State<MainPage> {
     }
   }
 
+  void _handleWriterStatusChange(Map<String, dynamic> writerStatus) {
+    final isWriter = writerStatus['is_writer'] ?? false;
+    final currentWriterName = writerStatus['current_writer_name'];
+    final previousWriterName = writerStatus['previous_writer_name'];
+    
+    // Check if writer status changed
+    if (_isWriter != isWriter || _currentWriterName != currentWriterName) {
+      setState(() {
+        _previousWriterName = _currentWriterName;
+        _isWriter = isWriter;
+        _currentWriterName = currentWriterName;
+      });
+      
+      // Show notification if writer status changed
+      if (_previousWriterName != null && _currentWriterName != _previousWriterName) {
+        _showWriterStatusNotification();
+      }
+    }
+  }
+
+  void _showWriterStatusNotification() {
+    String message;
+    if (_isWriter) {
+      message = 'You are now the writer for your team';
+    } else if (_currentWriterName != null) {
+      message = 'Writer privilege changed to: $_currentWriterName';
+    } else {
+      message = 'Writer privilege has been turned OFF';
+    }
+    
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        duration: const Duration(seconds: 4),
+        backgroundColor: _isWriter ? Colors.green : Colors.orange,
+      ),
+    );
+  }
+
+  Future<void> _toggleWriterStatus(bool value) async {
+    try {
+      final action = value ? 'on' : 'off';
+      final result = await DatabaseService.toggleWriterStatus(action);
+      
+      if (result['success'] == true) {
+        // Update local state
+        setState(() {
+          _isWriter = value;
+        });
+        
+        // Show success message
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(result['message'] ?? 'Writer status updated'),
+            duration: const Duration(seconds: 2),
+            backgroundColor: Colors.green,
+          ),
+        );
+      } else {
+        // Show error message
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(result['message'] ?? 'Failed to update writer status'),
+            duration: const Duration(seconds: 3),
+            backgroundColor: Colors.red,
+          ),
+        );
+        
+        // Revert the switch state
+        setState(() {
+          _isWriter = !value;
+        });
+      }
+    } catch (e) {
+      print('Error toggling writer status: $e');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Error updating writer status: $e'),
+          duration: const Duration(seconds: 3),
+          backgroundColor: Colors.red,
+        ),
+      );
+      
+      // Revert the switch state
+      setState(() {
+        _isWriter = !value;
+      });
+    }
+  }
+
   // Show notification popup after successful login
   void _showNotificationPopup() {
     print('=== _showNotificationPopup START ===');
@@ -1236,6 +1266,12 @@ class _MainPageState extends State<MainPage> {
           if (_userRole == 'player' && _channel == null) {
             print('ECHO successful but WebSocket disconnected, reconnecting...');
             _connectWebSocket();
+          }
+          
+          // Handle writer status changes
+          final writerStatus = echoResult['writer_status'];
+          if (writerStatus != null) {
+            _handleWriterStatusChange(writerStatus);
           }
         }
       } catch (e) {

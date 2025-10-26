@@ -22,6 +22,63 @@ from typing import Optional, List, Dict, Any
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Global dictionary to track round information for active games
+# Format: {"round_#1#": {"Name": None, "Slide": None, "time_now": None}, ...}
+rounds_info = {}
+for i in range(1, 21):  # rounds 1-20
+    rounds_info[f"round_#{i}#"] = {"Name": None, "Slide": None, "time_now": None}
+
+def populate_rounds_info(active_game_id: int, db: Session):
+    """
+    Populate the global rounds_info dictionary with round names from the game table
+    when an active game is started/running
+    """
+    try:
+        # Get the active game
+        active_game = db.query(ActiveGame).filter(ActiveGame.id == active_game_id).first()
+        if not active_game:
+            logger.warning(f"Active game {active_game_id} not found")
+            return
+        
+        # Get the game info
+        game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
+        if not game:
+            logger.warning(f"Game {active_game.game_id} not found")
+            return
+        
+        # Create the game table name
+        logger.info(f"Active game crated from Game: {game.game_name}")
+        
+        # Query the game table to get unique round names
+        sql_query = f"SELECT DISTINCT round_name FROM {game.game_name} WHERE round_name IS NOT NULL AND round_name != '' ORDER BY id"
+        try:
+            # Construct the SQL query with proper escaping
+            logger.info(f"Executing SQL query: {sql_query}")
+            result = db.execute(text(sql_query))
+            round_names = [row[0] for row in result.fetchall()]
+            
+            logger.info(f"Found {len(round_names)} unique rounds for game {game.game_name}: {round_names}")
+            
+            # Reset all rounds to None first
+            for i in range(1, 21):
+                rounds_info[f"round_#{i}#"] = {"Name": None, "Slide": None, "time_now": None}
+            
+            # Populate rounds_info with found round names
+            for i, round_name in enumerate(round_names[:20], 1):  # Limit to 20 rounds
+                rounds_info[f"round_#{i}#"] = {
+                    "Name": round_name,
+                    "Slide": None,
+                    "time_now": None
+                }
+                logger.info(f"Set round_#{i}# to: {round_name}")
+            
+        except Exception as e:
+            logger.error(f"Error querying game table {game.game_name}: {e}")
+            logger.error(f"SQL query that failed: {sql_query}")
+            
+    except Exception as e:
+        logger.error(f"Error populating rounds info: {e}")
+
 # Database configuration
 DATABASE_URL = "mysql+pymysql://root:19761982@localhost:3306/game_sila_misly"
 engine = create_engine(DATABASE_URL)
@@ -79,7 +136,6 @@ class User(Base):
     name = Column(String(44), nullable=False)
     role = Column(Enum('player', 'admin', name='user_roles'), default="player", nullable=False)
     is_active = Column(Boolean, default=True)
-    writer = Column(Boolean, default=False)  # User can be writer only (not admin)
     created_at = Column(DateTime, default=datetime.utcnow)
     playing_in_team_id = Column(String(6), nullable=True)  # Team ID(6 symbols) where the user is playing (null means not assigned to any team)
     logged_in_at = Column(DateTime, default=datetime.utcnow)
@@ -109,6 +165,7 @@ class Teams(Base):
     team_created_at = Column(DateTime, default=datetime.utcnow)
     team_captain = Column(Integer, unique=True, nullable=True)  # unique team captain of the team (user ID must be in the team_members_idsas well)
     team_members_ids = Column(String(255), nullable=True)  # Comma-separated team IDs participating in the game
+    writer_user_id = Column(Integer, nullable=True)  # User ID who has writer privileges for this team (can be null)
 
     @validates('team_captain')
     def validate_team_captain(self, key, value):
@@ -148,15 +205,11 @@ class UserResponse(BaseModel):
     name: str
     role: str
     is_active: bool
-    writer: bool
     created_at: datetime
     playing_in_team_id: constr(max_length=6)  # Team ID 6 symbols where the user is playing (Null means not assigned to any team)
     logged_in_at: datetime
 
 # Model for users updating
-class  UpdateUserWriterStatus(BaseModel):
-    writer: bool
-
 class UpdateUserActiveStatus(BaseModel):
     is_active: bool
 
@@ -346,8 +399,7 @@ async def register_user(user: UserCreate, db: Session = Depends(get_db)):
                 "email": db_user.email,
                 "name": db_user.name,
                 "role": db_user.role,
-                "is_active": db_user.is_active,
-                "writer": db_user.writer
+                "is_active": db_user.is_active
             }
         }
     except HTTPException:
@@ -405,6 +457,19 @@ async def login_user(user_credentials: UserLogin, db: Session = Depends(get_db))
     # Check if user is a captain of any team
     is_captain = db.query(Teams).filter(Teams.team_captain == user.id).first() is not None
     
+    # Check if user is a writer for their team
+    is_writer = False
+    if user.playing_in_team_id:
+        # Convert team ID to integer if it's a string
+        try:
+            team_id = int(user.playing_in_team_id) if isinstance(user.playing_in_team_id, str) else user.playing_in_team_id
+            team = db.query(Teams).filter(Teams.id == team_id).first()
+            if team and team.writer_user_id == user.id:
+                is_writer = True
+        except (ValueError, TypeError):
+            # If playing_in_team_id is not a valid integer, user is not a writer
+            pass
+    
     return {
         "message": "Login successful",
         "user": {
@@ -413,7 +478,7 @@ async def login_user(user_credentials: UserLogin, db: Session = Depends(get_db))
             "name": user.name,
             "role": user.role,
             "is_active": user.is_active,
-            "writer": user.writer,
+            "writer": is_writer,  # Now based on team table
             "playing_in_team_id": user.playing_in_team_id,
             "is_captain": is_captain,
             "logged_in_at": user.logged_in_at
@@ -468,30 +533,6 @@ async def initialize_database(db: Session = Depends(get_db)):
 async def read_users_me(current_user: User = Depends(get_current_user)):
     return current_user
 
-@app.put("/api/users/{user_id}/status")
-async def update_writer_status(user_id: int, status: UpdateUserWriterStatus, db: Session = Depends(get_db)):
-    """Update user active status"""
-    try:
-        logger.info(f"Updating writer status i the user player for user ID: {user_id}")
-        user = get_user_by_user_id(db, user_id)
-        if not user:
-            return {"success": False, "message": "User not found"}
-        if user.role != "player":
-            return {"success": False, "message": "Only players can have writer status"}
-        user.writer = status.writer
-        db.commit()
-        db.refresh(user)
-        return {
-            "success": True,
-            "user": {
-                "id": user.id,
-                "email": user.email,
-                "writer": user.writer
-            }
-        }
-    except Exception as e:
-        logger.error(f"Status update error: {e}")
-        return {"success": False, "message": f"Error updating status: {str(e)}"}
 
 @app.put("/api/users/{user_id}/profile", response_model=dict)
 async def update_user_profile(user_id: int, profile_data: UserProfileUpdate, db: Session = Depends(get_db)):
@@ -598,8 +639,7 @@ async def update_user_profile(user_id: int, profile_data: UserProfileUpdate, db:
                 "email": user.email,
                 "role": user.role,
                 "playing_in_team_id": team_code_for_response,  # Return team code for frontend
-                "is_active": user.is_active,
-                "writer": user.writer
+                "is_active": user.is_active
             }
         }
 
@@ -780,7 +820,6 @@ async def get_all_users(db: Session = Depends(get_db)):
                 "email": user.email,
                 "role": user.role,
                 "is_active": user.is_active,
-                "writer": user.writer,
                 "created_at": user.created_at.isoformat() if user.created_at else None,
                 "playing_in_team_id": user.playing_in_team_id,
                 "logged_in_at": user.logged_in_at.isoformat() if user.logged_in_at else None,
@@ -1428,7 +1467,8 @@ async def _create_temp_tables_for_active_game(db: Session, active_game: ActiveGa
             answer TEXT,
             is_correct BOOLEAN DEFAULT FALSE,
             score INT DEFAULT 0,
-            answered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            answered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            player_id INT DEFAULT NULL
         )
         """
         db.execute(text(answers_table_sql))
@@ -1838,6 +1878,9 @@ async def resume_active_game(active_game_id: int, db: Session = Depends(get_db))
         db.commit()
         db.refresh(active_game)
         
+        # Populate rounds info when game starts running
+        populate_rounds_info(active_game_id, db)
+        
         return {
             "success": True,
             "message": "Active game resumed successfully",
@@ -1919,6 +1962,9 @@ async def run_active_game(active_game_id: int, db: Session = Depends(get_db)):
         
         db.commit()
         db.refresh(active_game)
+        
+        # Populate rounds info when game starts running
+        populate_rounds_info(active_game_id, db)
         
         return {
             "success": True,
@@ -2587,9 +2633,6 @@ async def update_user_admin(user_id: int, user_data: AdminUserUpdate, db: Sessio
         if user_data.is_active is not None:
             user.is_active = user_data.is_active
         
-        if user_data.writer is not None:
-            user.writer = user_data.writer
-        
         if user_data.playing_in_team_id is not None:
             # Handle team removal (set to empty/null)
             if user_data.playing_in_team_id == "":
@@ -2661,8 +2704,8 @@ async def update_user_admin(user_id: int, user_data: AdminUserUpdate, db: Sessio
                 if not team:
                     return {"success": False, "message": f"Team with code '{user_data.playing_in_team_id}' not found"}
                 
-                # Add user to new team
-                user.playing_in_team_id = user_data.playing_in_team_id
+                # Add user to new team - store team ID, not team code
+                user.playing_in_team_id = str(team.id)
                 if team.team_members_ids:
                     member_ids = [int(mid.strip()) for mid in team.team_members_ids.split(',') if mid.strip().isdigit()]
                     if user_id not in member_ids:
@@ -2680,7 +2723,6 @@ async def update_user_admin(user_id: int, user_data: AdminUserUpdate, db: Sessio
             "email": user.email,
             "role": user.role,
             "is_active": user.is_active,
-            "writer": user.writer,
             "created_at": user.created_at.isoformat() if user.created_at else None,
             "playing_in_team_id": user.playing_in_team_id,
             "logged_in_at": user.logged_in_at.isoformat() if user.logged_in_at else None,
@@ -2744,9 +2786,13 @@ async def trigger_timer(request: TimerTriggerRequest):
     try:
         trigger_data = request.trigger_data.strip()
         logger.info(f"Received timer trigger: {trigger_data}")
+        import temp.time_check
+        temp.time_check.check_time()
         
         # Parse the trigger data
         slide_number = None
+        round_number = None
+        date_action = None
         timer_action = None
         
         if "START_TIMER" in trigger_data:
@@ -2826,9 +2872,25 @@ async def cleanup_connections():
         return {"success": False, "message": f"Error cleaning up connections: {str(e)}"}
 
 @app.get("/api/auth/validate-session")
-async def validate_session(current_user: User = Depends(get_current_user)):
+async def validate_session(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Validate current session and return user data"""
     try:
+        # Check if user is a captain of any team
+        is_captain = db.query(Teams).filter(Teams.team_captain == current_user.id).first() is not None
+        
+        # Check if user is a writer for their team
+        is_writer = False
+        if current_user.playing_in_team_id:
+            # Convert team ID to integer if it's a string
+            try:
+                team_id = int(current_user.playing_in_team_id) if isinstance(current_user.playing_in_team_id, str) else current_user.playing_in_team_id
+                team = db.query(Teams).filter(Teams.id == team_id).first()
+                if team and team.writer_user_id == current_user.id:
+                    is_writer = True
+            except (ValueError, TypeError):
+                # If playing_in_team_id is not a valid integer, user is not a writer
+                pass
+        
         return {
             "success": True,
             "user": {
@@ -2837,15 +2899,108 @@ async def validate_session(current_user: User = Depends(get_current_user)):
                 "name": current_user.name,
                 "role": current_user.role,
                 "is_active": current_user.is_active,
-                "writer": current_user.writer,
+                "writer": is_writer,  # Now based on team table
                 "playing_in_team_id": current_user.playing_in_team_id,
-                "is_captain": getattr(current_user, 'is_captain', False),
+                "is_captain": is_captain,
                 "logged_in_at": current_user.logged_in_at
             }
         }
     except Exception as e:
         logger.error(f"Error validating session: {e}")
         return {"success": False, "message": "Session validation failed"}
+
+@app.get("/api/rounds-info")
+async def get_rounds_info():
+    """
+    Get the current rounds information dictionary
+    """
+    return {
+        "success": True,
+        "rounds_info": rounds_info
+    }
+
+@app.post("/api/team/toggle-writer")
+async def toggle_writer_status(
+    request: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Toggle writer status for the current user's team
+    Any team member can turn writer status ON or OFF
+    """
+    try:
+        if not current_user.playing_in_team_id:
+            return {"success": False, "message": "User is not assigned to any team"}
+        
+        # Get user's team
+        try:
+            team_id = int(current_user.playing_in_team_id) if isinstance(current_user.playing_in_team_id, str) else current_user.playing_in_team_id
+            team = db.query(Teams).filter(Teams.id == team_id).first()
+        except (ValueError, TypeError):
+            return {"success": False, "message": "Invalid team ID"}
+        
+        if not team:
+            return {"success": False, "message": "Team not found"}
+        
+        # Check if user is a member of this team
+        if not team.team_members_ids or str(current_user.id) not in team.team_members_ids.split(','):
+            return {"success": False, "message": "User is not a member of this team"}
+        
+        action = request.get('action')  # 'on' or 'off'
+        if action not in ['on', 'off']:
+            return {"success": False, "message": "Action must be 'on' or 'off'"}
+        
+        previous_writer_id = team.writer_user_id
+        previous_writer_name = None
+        
+        if action == 'on':
+            # Set current user as writer
+            team.writer_user_id = current_user.id
+            message = f"Writer status turned ON for {current_user.name}"
+        else:
+            # Turn off writer status
+            team.writer_user_id = None
+            message = f"Writer status turned OFF for {current_user.name}"
+        
+        # Get previous writer's name for notification
+        if previous_writer_id and previous_writer_id != current_user.id:
+            previous_writer = db.query(User).filter(User.id == previous_writer_id).first()
+            if previous_writer:
+                previous_writer_name = previous_writer.name
+        
+        db.commit()
+        
+        return {
+            "success": True,
+            "message": message,
+            "writer_status": {
+                "is_writer": action == 'on',
+                "current_writer_id": team.writer_user_id,
+                "current_writer_name": current_user.name if action == 'on' else None,
+                "previous_writer_name": previous_writer_name
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error toggling writer status: {e}")
+        db.rollback()
+        return {"success": False, "message": f"Error toggling writer status: {str(e)}"}
+
+@app.get("/api/round/{round_id}")
+async def test_rounds_query(round_id: int):
+    """
+    Get data about the specific round
+    """
+    if rounds_info.get(f"round_#{round_id}#") is not None:
+        return {
+            "success": True,
+            "round_name": rounds_info[f"round_#{id}#"]["Name"],
+            "round_slide": rounds_info[f"round_#{id}#"]["Slide"],
+            "round_time": rounds_info[f"round_#{id}#"]["time_now"]
+        }
+    else:
+        return {"success": False, "message": "Round not found"}
 
 @app.get("/api/health")
 async def health_check():
@@ -2892,12 +3047,37 @@ async def echo_session(
         else:
             logger.warning(f"Echo call successful for user {current_user.email} - APP IS NOT VISIBLE (user may have switched tabs/apps)")
         
+        # Check current writer status for the user's team
+        current_writer_id = None
+        current_writer_name = None
+        is_current_user_writer = False
+        
+        if current_user.playing_in_team_id:
+            try:
+                team_id = int(current_user.playing_in_team_id) if isinstance(current_user.playing_in_team_id, str) else current_user.playing_in_team_id
+                team = db.query(Teams).filter(Teams.id == team_id).first()
+                if team and team.writer_user_id:
+                    current_writer_id = team.writer_user_id
+                    is_current_user_writer = (team.writer_user_id == current_user.id)
+                    
+                    # Get writer's name
+                    writer_user = db.query(User).filter(User.id == team.writer_user_id).first()
+                    if writer_user:
+                        current_writer_name = writer_user.name
+            except (ValueError, TypeError):
+                pass
+        
         return {
             "success": True,
             "message": "Session valid",
             "should_logout": False,
             "user_id": current_user.id,
-            "email": current_user.email
+            "email": current_user.email,
+            "writer_status": {
+                "is_writer": is_current_user_writer,
+                "current_writer_id": current_writer_id,
+                "current_writer_name": current_writer_name
+            }
         }
         
     except Exception as e:

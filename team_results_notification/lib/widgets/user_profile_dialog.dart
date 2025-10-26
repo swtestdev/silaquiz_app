@@ -334,7 +334,7 @@ class _UserProfileDialogState extends State<UserProfileDialog> {
                     border: OutlineInputBorder(),
                     filled: true,
                     fillColor: Colors.white,
-                    helperText: 'Enter your team code to join a team',
+                    helperText: 'Enter your team ID to join a team',
                   ),
                 ),
                 const SizedBox(height: 20),

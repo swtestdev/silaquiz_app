@@ -65,7 +65,10 @@ class _UserInfoWidgetState extends State<UserInfoWidget> {
       
       // If user is a captain, also fetch team code
       if (data != null && data['is_captain'] == true && data['playing_in_team_id'] != null) {
+        print('User is captain, fetching team code for team ID: ${data['playing_in_team_id']}');
         await _fetchTeamCodeFromAPI(data['playing_in_team_id']);
+      } else {
+        print('User is not captain or missing data. is_captain: ${data?['is_captain']}, playing_in_team_id: ${data?['playing_in_team_id']}');
       }
     } catch (e) {
       setState(() {
@@ -128,15 +131,21 @@ class _UserInfoWidgetState extends State<UserInfoWidget> {
     if (teamIdentifier.isEmpty) return;
 
     try {
+      print('Fetching team code for team identifier: $teamIdentifier');
       final result = await DatabaseService.getTeamName(teamIdentifier);
+      print('Team code API result: $result');
       
       if (result['success'] == true) {
         final fetchedTeamCode = result['team_code'];
+        print('Fetched team code: $fetchedTeamCode');
         setState(() {
           teamCode = fetchedTeamCode;
         });
+      } else {
+        print('Failed to fetch team code: ${result['message']}');
       }
     } catch (e) {
+      print('Error fetching team code: $e');
       // If fetching fails, teamCode remains null
     }
   }
