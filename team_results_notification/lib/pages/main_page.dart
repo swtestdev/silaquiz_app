@@ -22,6 +22,7 @@ class _MainPageState extends State<MainPage> {
   bool _hasShownTeamNotification = false;
   bool _hasTeam = false;
   String _userRole = 'player';
+  bool _eligibleForActiveGame = false;
   bool _sessionValidationInProgress = false;
   bool _disconnectionHandlerRunning = false;
   Timer? _echoTimer;
@@ -199,7 +200,7 @@ class _MainPageState extends State<MainPage> {
     });
     
     // Check if user has a team assigned
-    _checkTeamAssignment(userData);
+    await _checkTeamAssignment(userData);
     
     // Connect to WebSocket for timer updates (only for players)
     if (_userRole == 'player') {
@@ -214,9 +215,10 @@ class _MainPageState extends State<MainPage> {
     print('Starting ECHO timer...');
     _startEchoTimer();
     
-    // Show notification popup after successful login (only for players)
-    if (_userRole == 'player') {
-      print('Showing notification popup for player...');
+    // Show notification popup after successful login (only for players with a team)
+    // If no team, the team dialog will show instead
+    if (_userRole == 'player' && _hasTeam) {
+      print('Showing notification popup for player with team...');
       _showNotificationPopup();
     }
     
@@ -234,18 +236,35 @@ class _MainPageState extends State<MainPage> {
       return;
     }
     
+    // Get team status
+    final playingInTeamId = localUserData['playing_in_team_id'];
+    final teamName = await UserDataService.getTeamName();
+    bool hasTeamId = playingInTeamId != null && playingInTeamId.toString().isNotEmpty;
+    bool hasTeamName = teamName != null && teamName.isNotEmpty;
+    bool hasTeam = hasTeamId || hasTeamName;
+    
     // Set basic user data
     setState(() {
       _userName = localUserData['name'] ?? 'User';
       _isWriter = localUserData['writer'] ?? false;
       _visibleConnected = localUserData['visible_connected'] ?? 0;
       _userId = localUserData['id']?.toString() ?? '';
+      _hasTeam = hasTeam;
       _userRole = localUserData['role'] ?? 'player';
+      _isLoading = false;
     });
+    
+    // Check if user has a team assigned
+    await _checkTeamAssignment(localUserData);
     
     // Connect WebSocket if player
     if (_userRole == 'player') {
       _connectWebSocket();
+    }
+    
+    // Show notification popup only if user has a team
+    if (_userRole == 'player' && hasTeam && !_hasShownNotification) {
+      _showNotificationPopup();
     }
     
     print('=== _loadUserDataFallback COMPLETE ===');
@@ -281,6 +300,14 @@ class _MainPageState extends State<MainPage> {
     });
     
     print('User data refreshed successfully');
+    
+    // Check team assignment after refresh (in case team was removed)
+    await _checkTeamAssignment(localUserData);
+    
+    // Re-evaluate active game eligibility after profile change
+    if (_userRole == 'player' && _userId.isNotEmpty) {
+      await _checkForActiveGames();
+    }
   }
 
   // Check for active games with bonus options
@@ -293,6 +320,13 @@ class _MainPageState extends State<MainPage> {
       if (result['success'] == true) {
         final activeGames = result['active_games'] as List? ?? [];
         print('Found ${activeGames.length} active games');
+        // Player is eligible if at least one active/running game includes their team
+        final eligible = activeGames.isNotEmpty;
+        if (mounted) {
+          setState(() {
+            _eligibleForActiveGame = eligible;
+          });
+        }
         
         // Only show dialog if there are games with bonus options
         final gamesWithOptions = activeGames.where((game) {
@@ -312,9 +346,15 @@ class _MainPageState extends State<MainPage> {
         }
       } else {
         print('Failed to get active games: ${result['message']}');
+        if (mounted) {
+          setState(() { _eligibleForActiveGame = false; });
+        }
       }
     } catch (e) {
       print('Error checking for active games: $e');
+      if (mounted) {
+        setState(() { _eligibleForActiveGame = false; });
+      }
     }
   }
 
@@ -345,11 +385,19 @@ class _MainPageState extends State<MainPage> {
     
     // Primary check: playing_in_team_id from user data
     // Secondary check: team name (only if playing_in_team_id is missing)
-    bool hasTeamId = playingInTeamId != null && playingInTeamId.toString().isNotEmpty;
+    bool hasTeamId = playingInTeamId != null && 
+                     playingInTeamId.toString().isNotEmpty && 
+                     playingInTeamId.toString() != 'null' &&
+                     playingInTeamId.toString().trim() != '';
     bool hasTeamName = teamName != null && teamName.isNotEmpty;
     
     // User has a team if they have either a team ID or a team name
     bool hasTeam = hasTeamId || hasTeamName;
+    
+    // Update the _hasTeam state variable
+    setState(() {
+      _hasTeam = hasTeam;
+    });
     
     if (!hasTeam) {
       // Show notification popup after a short delay to ensure UI is ready
@@ -373,82 +421,84 @@ class _MainPageState extends State<MainPage> {
       context: context,
       barrierDismissible: false, // User must interact with the dialog
       builder: (BuildContext context) {
-        return AlertDialog(
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
-          ),
-          title: Row(
-            children: [
-              Icon(Icons.group_remove, color: Colors.orange.shade600, size: 28),
-              const SizedBox(width: 12),
-              const Expanded(
-                child: Text(
-                  'No Team Assigned',
-                  style: TextStyle(
-                    fontSize: 20,
-                    fontWeight: FontWeight.bold,
+        return PopScope(
+          canPop: false, // Prevent back button from dismissing
+          child: AlertDialog(
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(16),
+            ),
+            title: Row(
+              children: [
+                Icon(Icons.group_remove, color: Colors.orange.shade600, size: 28),
+                const SizedBox(width: 12),
+                const Expanded(
+                  child: Text(
+                    'No Team Assigned',
+                    style: TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.bold,
+                    ),
                   ),
                 ),
-              ),
-            ],
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                'You are not currently assigned to any team.',
-                style: TextStyle(fontSize: 16),
-              ),
-              const SizedBox(height: 12),
-              const Text(
-                'To participate in team activities and view team results, you need to join a team.',
-                style: TextStyle(fontSize: 14, color: Colors.grey),
-              ),
-              const SizedBox(height: 16),
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: Colors.blue.shade50,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: Colors.blue.shade200),
-                ),
-                child: Row(
-                  children: [
-                    Icon(Icons.info_outline, color: Colors.blue.shade600, size: 20),
-                    const SizedBox(width: 8),
-                    const Expanded(
-                      child: Text(
-                        'Tap the blue settings icon next to your name to update your team assignment.',
-                        style: TextStyle(fontSize: 13),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.of(context).pop(); // Close the dialog
-                // Optionally open the profile dialog
-                _openProfileDialog();
-              },
-              style: TextButton.styleFrom(
-                backgroundColor: Colors.blue.shade600,
-                foregroundColor: Colors.white,
-                padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(8),
-                ),
-              ),
-              child: const Text(
-                'Update Team',
-                style: TextStyle(fontWeight: FontWeight.bold),
-              ),
+              ],
             ),
-          ],
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'You are not currently assigned to any team.',
+                  style: TextStyle(fontSize: 16),
+                ),
+                const SizedBox(height: 12),
+                const Text(
+                  'To participate in team activities and view team results, you need to join a team.',
+                  style: TextStyle(fontSize: 14, color: Colors.grey),
+                ),
+                const SizedBox(height: 16),
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Colors.blue.shade50,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: Colors.blue.shade200),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(Icons.info_outline, color: Colors.blue.shade600, size: 20),
+                      const SizedBox(width: 8),
+                      const Expanded(
+                        child: Text(
+                          'Tap the blue settings icon next to your name to update your team assignment.',
+                          style: TextStyle(fontSize: 13),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () {
+                  Navigator.of(context).pop(); // Close the dialog
+                  _openProfileDialog();
+                },
+                style: TextButton.styleFrom(
+                  backgroundColor: Colors.blue.shade600,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                ),
+                child: const Text(
+                  'Update Team',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+              ),
+            ],
+          ),
         );
       },
     );
@@ -491,15 +541,15 @@ class _MainPageState extends State<MainPage> {
             children: [
               Icon(
                 _visibleConnected == 1 ? Icons.wifi : Icons.wifi_off,
-                color: _visibleConnected == 1 ? Colors.green : Colors.red,
+                color: _visibleConnected == 1 ? Colors.lightGreen : Colors.red,
                 size: 16,
               ),
               const SizedBox(width: 4),
               Text(
                 _visibleConnected == 1 ? 'Online' : 'Offline',
                 style: TextStyle(
-                  fontSize: 12,
-                  color: _visibleConnected == 1 ? Colors.green : Colors.red,
+                  fontSize: 16,
+                  color: _visibleConnected == 1 ? Colors.lightGreen : Colors.red,
                 ),
               ),
             ],
@@ -696,21 +746,30 @@ class _MainPageState extends State<MainPage> {
       );
     } else {
       // Player buttons
+      final canAccess = _hasTeam && _eligibleForActiveGame;
       return Column(
         children: [
-          // Time bar for players (moved to top)
-          _buildTimeBar(),
-          const SizedBox(height: 16),
+          // Timer moved to Question page
           Row(
             children: [
               Expanded(
-                child: _buildActionCard(
-                  'Start Quiz',
-                  Icons.play_arrow,
-                  Colors.green,
-                  () {
-                    Navigator.pushNamed(context, '/question');
-                  },
+                child: Opacity(
+                  opacity: canAccess ? 1.0 : 0.5,
+                  child: _buildActionCard(
+                    'Start Quiz',
+                    Icons.play_arrow,
+                    Colors.green,
+                    canAccess 
+                      ? () { Navigator.pushNamed(context, '/question'); }
+                      : () {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                              content: Text('Your team is not in the active game, the team must be in an active game to start the quiz'),
+                              duration: Duration(seconds: 5),
+                            ),
+                          );
+                        },
+                  ),
                 ),
               ),
             ],
@@ -844,12 +903,11 @@ class _MainPageState extends State<MainPage> {
   }
 
   Widget _buildViewSummaryCard() {
+    final enabled = _hasTeam && _eligibleForActiveGame;
     return Card(
       elevation: 2,
       child: InkWell(
-        onTap: () {
-          Navigator.pushNamed(context, '/summary');
-        },
+        onTap: enabled ? () { Navigator.pushNamed(context, '/summary'); } : null,
         borderRadius: BorderRadius.circular(8),
         child: Padding(
           padding: const EdgeInsets.all(16),
@@ -886,7 +944,7 @@ class _MainPageState extends State<MainPage> {
               ),
               Icon(
                 Icons.arrow_forward_ios,
-                color: Colors.grey.shade400,
+                color: enabled ? Colors.grey.shade600 : Colors.grey.shade300,
                 size: 16,
               ),
             ],
@@ -1299,6 +1357,12 @@ class _MainPageState extends State<MainPage> {
           const Duration(seconds: 5),
           onTimeout: () {
             print('ECHO call timed out');
+            // Mark as offline on timeout
+            if (mounted) {
+              setState(() {
+                _visibleConnected = 0;
+              });
+            }
             return {'success': false, 'should_logout': false};
           },
         );
@@ -1329,10 +1393,22 @@ class _MainPageState extends State<MainPage> {
           if (writerStatus != null) {
             _handleWriterStatusChange(writerStatus);
           }
+        } else {
+          // Any non-success from echo means backend may be unavailable – show Offline
+          if (mounted) {
+            setState(() {
+              _visibleConnected = 0;
+            });
+          }
         }
       } catch (e) {
         print('Error during ECHO call: $e');
-        // Don't logout on network errors, just log the error
+        // On network errors mark as Offline, do not logout
+        if (mounted) {
+          setState(() {
+            _visibleConnected = 0;
+          });
+        }
       }
     });
     print('ECHO timer started');

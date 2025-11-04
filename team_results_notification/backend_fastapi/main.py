@@ -16,17 +16,54 @@ import os
 import logging
 import json
 import asyncio
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Global dictionary to track round information for active games
-# Format: {"round_#1#": {"Name": None, "Slide": None, "time_now": None}, ...}
+# Format: {"round_1": {"Name": None, "Slide": None, "time_now": None}, ...}
 rounds_info = {}
 for i in range(1, 21):  # rounds 1-20
-    rounds_info[f"round_#{i}#"] = {"Name": None, "Slide": None, "time_now": None}
+    rounds_info[f"round_{i}"] = {"Name": None, "Slide": None, "time_now": None}
+
+def create_action_game_control_table(active_game_id: int, db: Session) -> None:
+    """Create per-game control table action_game_control_<game_name> if it doesn't exist.
+    Columns:
+      - slide_number INTEGER UNIQUE NOT NULL
+      - question_id  INTEGER UNIQUE NOT NULL
+      - time_to_complete FLOAT NOT NULL DEFAULT 0
+    """
+    try:
+        active_game = db.query(ActiveGame).filter(ActiveGame.id == active_game_id).first()
+        if not active_game:
+            logger.warning(f"Active game {active_game_id} not found - cannot create control table")
+            return
+        game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
+        if not game:
+            logger.warning(f"Game {active_game.game_id} not found - cannot create control table")
+            return
+
+        # Normalize game name for table identifier
+        game_name_safe = str(game.game_name).strip().lower().replace(' ', '_').replace('-', '_')
+        table_name = f"action_game_control_{game_name_safe}"
+
+        # Create table if not exists
+        create_sql = text(
+            f"""
+            CREATE TABLE IF NOT EXISTS {table_name} (
+                slide_number INTEGER UNIQUE NOT NULL,
+                question_id INTEGER UNIQUE NOT NULL,
+                time_to_complete FLOAT NOT NULL DEFAULT 0
+            )
+            """
+        )
+        logger.info(f"Ensuring control table exists: {table_name}")
+        db.execute(create_sql)
+        db.commit()
+    except Exception as e:
+        logger.error(f"Error creating control table: {e}")
 
 def populate_rounds_info(active_game_id: int, db: Session):
     """
@@ -61,16 +98,16 @@ def populate_rounds_info(active_game_id: int, db: Session):
             
             # Reset all rounds to None first
             for i in range(1, 21):
-                rounds_info[f"round_#{i}#"] = {"Name": None, "Slide": None, "time_now": None}
+                rounds_info[f"round_{i}"] = {"Name": None, "Slide": None, "time_now": None}
             
             # Populate rounds_info with found round names
             for i, round_name in enumerate(round_names[:20], 1):  # Limit to 20 rounds
-                rounds_info[f"round_#{i}#"] = {
+                rounds_info[f"round_{i}"] = {
                     "Name": round_name,
                     "Slide": None,
                     "time_now": None
                 }
-                logger.info(f"Set round_#{i}# to: {round_name}")
+                logger.info(f"Set round_{i} to: {round_name}")
             
         except Exception as e:
             logger.error(f"Error querying game table {game.game_name}: {e}")
@@ -1663,6 +1700,13 @@ async def stop_active_game(active_game_id: int, db: Session = Depends(get_db)):
         if active_game.is_started != 'active':
             return {"success": False, "message": "Can only stop games that are in 'active' state"}
         
+        # Delete the action_game_control table
+        try:
+            _delete_action_game_control_table(db, active_game)
+        except Exception as e:
+            logger.warning(f"Could not delete action_game_control table: {e}")
+            # Continue even if table deletion fails
+        
         # Change status back to idle
         active_game.is_started = 'idle'
         db.commit()
@@ -1914,6 +1958,13 @@ async def stop_active_game(active_game_id: int, db: Session = Depends(get_db)):
         if active_game.is_started != 'active':
             return {"success": False, "message": f"Game is not active (current status: {active_game.is_started})"}
         
+        # Delete the action_game_control table
+        try:
+            _delete_action_game_control_table(db, active_game)
+        except Exception as e:
+            logger.warning(f"Could not delete action_game_control table: {e}")
+            # Continue even if table deletion fails
+        
         # Update game status to idle
         active_game.is_started = 'idle'
         active_game.timer_off_at = datetime.utcnow()
@@ -1953,17 +2004,21 @@ async def run_active_game(active_game_id: int, db: Session = Depends(get_db)):
         active_game.is_started = 'running'
         active_game.timer_on_at = datetime.utcnow()
         
-        # Clean up empty player_approved entries for all teams in this game
+        # Clean up unselected bonus options (where player_approved IS NULL) when game starts running
+        # This removes options that teams didn't select, keeping only the selected ones
         game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
         if game:
             game_name = game.game_name.replace(' ', '_').replace('-', '_').lower()
             scores_table_name = f"active_new_scores_{game_name}"
             
-            # Remove all entries where player_approved is NULL
-            db.execute(text(f"""
+            # Remove all unselected bonus options (where player_approved IS NULL)
+            # This preserves selected options (where player_approved IS NOT NULL)
+            result = db.execute(text(f"""
                 DELETE FROM `{scores_table_name}` 
                 WHERE player_approved IS NULL
             """))
+            deleted_count = result.rowcount
+            logger.info(f"Cleaned up {deleted_count} unselected bonus options when game {active_game_id} started running")
         
         db.commit()
         db.refresh(active_game)
@@ -2054,38 +2109,43 @@ async def get_player_active_games(user_id: int, db: Session = Depends(get_db)):
                             team_id_for_query = team.id
                             logger.info(f"Using team ID {team.id} for team code {user.playing_in_team_id}")
                     
-                    # Check if player has already made any selection (bonus option or default)
-                    player_approved = None
-                    try:
-                        result = db.execute(text(f"SELECT player_approved FROM `{scores_table_name}` WHERE team_id = {team_id_for_query} AND player_approved IS NOT NULL LIMIT 1"))
-                        row = result.fetchone()
-                        if row:
-                            player_approved = row[0]
-                    except Exception as e:
-                        logger.warning(f"Could not check player approval for game {active_game.id}: {e}")
-                    
-                    # Only include games where player hasn't made any selection yet and game is active/running
-                    if player_approved is None and active_game.is_started in ['active', 'running']:
-                        # Get unique bonus options
-                        result = db.execute(text(f"SELECT DISTINCT option_name, correct_score, wrong_score FROM `{scores_table_name}` WHERE team_id = {team_id_for_query} AND option_name IS NOT NULL AND option_name != ''"))
+                    # Only include games that are active or running
+                    if active_game.is_started in ['active', 'running']:
+                        # Check if player has already made any selection (bonus option or default)
+                        player_approved = None
+                        try:
+                            result = db.execute(text(f"SELECT player_approved FROM `{scores_table_name}` WHERE team_id = {team_id_for_query} AND player_approved IS NOT NULL LIMIT 1"))
+                            row = result.fetchone()
+                            if row:
+                                player_approved = row[0]
+                        except Exception as e:
+                            logger.warning(f"Could not check player approval for game {active_game.id}: {e}")
+                        
+                        # Get unique bonus options (only if player hasn't made a selection yet)
                         bonus_options = []
-                        for row in result.fetchall():
-                            bonus_options.append({
-                                'name': row[0],
-                                'correct_score': row[1],
-                                'wrong_score': row[2]
-                            })
+                        if player_approved is None:
+                            try:
+                                result = db.execute(text(f"SELECT DISTINCT option_name, correct_score, wrong_score FROM `{scores_table_name}` WHERE team_id = {team_id_for_query} AND option_name IS NOT NULL AND option_name != ''"))
+                                for row in result.fetchall():
+                                    bonus_options.append({
+                                        'name': row[0],
+                                        'correct_score': row[1],
+                                        'wrong_score': row[2]
+                                    })
+                            except Exception as e:
+                                logger.warning(f"Could not get bonus options for game {active_game.id}: {e}")
                         
-                        logger.info(f"Found {len(bonus_options)} bonus options for game {active_game.id}, team {team_id_for_query}")
+                        logger.info(f"Found {len(bonus_options)} bonus options for game {active_game.id}, team {team_id_for_query}, player_approved={player_approved}")
                         
-                        # Only include games that have bonus options available
-                        if bonus_options:
-                            player_active_games.append({
-                                'id': active_game.id,
-                                'game_name': game.game_name,
-                                'status': active_game.is_started,
-                                'bonus_options': bonus_options
-                            })
+                        # Include ALL active/running games where team matches (even without bonus options)
+                        # Frontend will filter for bonus options when showing dialog
+                        player_active_games.append({
+                            'id': active_game.id,
+                            'game_name': game.game_name,
+                            'status': active_game.is_started,
+                            'bonus_options': bonus_options,
+                            'player_approved': player_approved
+                        })
         
         logger.info(f"Returning {len(player_active_games)} active games for player {user.email}")
         return {
@@ -2101,6 +2161,7 @@ async def get_player_active_games(user_id: int, db: Session = Depends(get_db)):
 async def select_bonus_option(request: dict, db: Session = Depends(get_db)):
     """
     Player selects a bonus option for an active game
+    Allows selection only in 'active' state
     """
     try:
         active_game_id = request.get('active_game_id')
@@ -2119,6 +2180,10 @@ async def select_bonus_option(request: dict, db: Session = Depends(get_db)):
         active_game = db.query(ActiveGame).filter(ActiveGame.id == active_game_id).first()
         if not active_game:
             return {"success": False, "message": "Active game not found"}
+        
+        # Allow bonus option selection only in 'active' state
+        if active_game.is_started != 'active':
+            return {"success": False, "message": f"Bonus options can only be selected when the game is in 'active' state (current: {active_game.is_started})"}
         
         # Verify user's team is in this game
         teams_ids = active_game.teams_ids.split(',') if active_game.teams_ids else []
@@ -2186,6 +2251,7 @@ async def select_bonus_option(request: dict, db: Session = Depends(get_db)):
 async def select_default_option(request: dict, db: Session = Depends(get_db)):
     """
     Player selects default scoring (removes all bonus options for the team)
+    Allows selection only in 'active' state
     """
     try:
         active_game_id = request.get('active_game_id')
@@ -2203,6 +2269,10 @@ async def select_default_option(request: dict, db: Session = Depends(get_db)):
         active_game = db.query(ActiveGame).filter(ActiveGame.id == active_game_id).first()
         if not active_game:
             return {"success": False, "message": "Active game not found"}
+        
+        # Allow default option selection only in 'active' state
+        if active_game.is_started != 'active':
+            return {"success": False, "message": f"Default option can only be selected when the game is in 'active' state (current: {active_game.is_started})"}
         
         # Verify user's team is in this game
         teams_ids = active_game.teams_ids.split(',') if active_game.teams_ids else []
@@ -2412,7 +2482,7 @@ async def get_game_structure(game_id: int, db: Session = Depends(get_db)):
 
 async def _delete_temp_tables_for_active_game(db: Session, active_game: ActiveGame):
     """
-    Delete the 3 temporary tables for the active game
+    Delete the 3 temporary tables and action_game_control table for the active game
     """
     try:
         
@@ -2435,11 +2505,42 @@ async def _delete_temp_tables_for_active_game(db: Session, active_game: ActiveGa
             drop_sql = f"DROP TABLE IF EXISTS `{table_name}`"
             db.execute(text(drop_sql))
         
+        # Drop the action_game_control table
+        action_control_table = f"action_game_control_{game_name}"
+        drop_control_sql = f"DROP TABLE IF EXISTS `{action_control_table}`"
+        db.execute(text(drop_control_sql))
+        
         db.commit()
-        logger.info(f"Deleted temporary tables for active game: {game_name}")
+        logger.info(f"Deleted temporary tables and action_game_control table for active game: {game_name}")
         
     except Exception as e:
         logger.error(f"Error deleting temporary tables: {e}")
+        db.rollback()
+        raise e
+
+def _delete_action_game_control_table(db: Session, active_game: ActiveGame) -> None:
+    """
+    Delete the action_game_control_<game_name> table for the active game
+    """
+    try:
+        game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
+        if not game:
+            logger.warning(f"Game not found for active_game_id: {active_game.id} - cannot delete action_game_control table")
+            return
+        
+        # Normalize game name for table identifier (same as in create function)
+        game_name_safe = str(game.game_name).strip().lower().replace(' ', '_').replace('-', '_')
+        table_name = f"action_game_control_{game_name_safe}"
+        
+        # Drop the table if it exists
+        drop_sql = text(f"DROP TABLE IF EXISTS `{table_name}`")
+        db.execute(drop_sql)
+        db.commit()
+        
+        logger.info(f"Deleted action_game_control table: {table_name}")
+        
+    except Exception as e:
+        logger.error(f"Error deleting action_game_control table: {e}")
         db.rollback()
         raise e
 
@@ -2592,7 +2693,7 @@ class ConnectionManager:
 
 # Timer Trigger Models
 class TimerTriggerRequest(BaseModel):
-    trigger_data: str  # The text data like ">>>>>>>START_TIMER>>>>>>>Slide#58##"
+    trigger_data: str  # The text data like "START_TIMER and STOP_TIMER"
 
 class TimerTriggerResponse(BaseModel):
     success: bool
@@ -2805,14 +2906,17 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
 async def trigger_timer(request: TimerTriggerRequest):
     """
     Trigger timer for all connected players based on received text data
-    Expected format: ">>>>>>>START_TIMER>>>>>>>Slide#58##"
+    Expected format:
+    "Slide#" & slideIndex & "#START_TIMER#" & round_number & "#at#" & Time&Date & "#time#" & _sec or min_ or Minute Countdown
+    "Slide#" & slideIndex & "#STOP_TIMER#" & round_number & "#at#" & Time&Date
+    Examples:
+         "Slide#164#START_TIMER#round_7#at#2025-10-29 10:16:49 PM#time#1 min_black"
+         "Slide#159#STOP_TIMER##at#2025-10-29 10:14:19 PM"
     """
     try:
         trigger_data = request.trigger_data.strip()
         logger.info(f"Received timer trigger: {trigger_data}")
-        import temp.time_check
-        temp.time_check.check_time()
-        
+
         # Parse the trigger data
         slide_number = None
         round_number = None
@@ -2944,6 +3048,113 @@ async def get_rounds_info():
         "rounds_info": rounds_info
     }
 
+@app.post("/api/be_ready_to_start")
+async def be_ready_to_start(
+    data: dict,
+    db: Session = Depends(get_db)
+):
+    """
+    Parse and validate START_GAME data,Expected format:
+      "Slide#40#START_GAME#round_1#at#2025-10-27 12:05:21 AM"
+    Update the rounds_info dictionary accordingly
+      with slide number and time for the specified round.
+    """
+    try:
+        text_data = data.get('trigger_data', '')
+        
+        # Check if data contains "START_GAME"
+        if "START_GAME" not in text_data or "round_" not in text_data:
+            logger.warning(f"Invalid request - does not contain START_GAME or round: {text_data}")
+            return {
+                "success": False,
+                "reason": "Wrong request"
+            }
+        
+        # Parse the data
+        # Format: "Slide#40#START_GAME#round_1#at#2025-10-27 12:05:21 AM"
+        # Extract: Slide number, Round number and Time
+        try:
+            # Split by '#'
+            parts = text_data.split('#')
+            
+            if len(parts) < 6:
+                logger.error(f"Invalid data format, not enough parts: {text_data}")
+                return {
+                    "success": False,
+                    "reason": "Invalid data format"
+                }
+            
+            # parts[0] = "Slide", parts[1] = slide_number,
+            # parts[2] = "START_GAME", parts[3] = round_number,
+            # parts[4] = "at", parts[5:] = datetime
+            slide_number = parts[1]
+            round_number = parts[3]
+            time_str = '#'.join(parts[5:])  # Rejoin in case datetime has spaces
+            logger.info(f"Parsed data - Slide: {slide_number}, Round: {round_number}, Time: {time_str}")
+
+            # Get the running game ID (assume that on the same PC running one game only)
+            active_game = db.query(ActiveGame).filter(
+                ActiveGame.is_started.in_(['running'])
+            ).first()
+            
+            if not active_game:
+                logger.error("No running game found")
+                return {
+                    "success": False,
+                    "reason": "No active game found"
+                }
+            
+            # Ensure control table exists for this game
+            create_action_game_control_table(active_game.id, db)
+
+            # Populate rounds_info to get it with all existing in game rounds
+            populate_rounds_info(active_game.id, db)
+            
+            # Check if round exists in rounds_info
+            if round_number not in rounds_info:
+                logger.error(f"Round key not found: {round_number}")
+                return {
+                    "success": False,
+                    "reason": "The Round # is not found"
+                }
+            
+            # Check if round Name is None
+            round_data = rounds_info[round_number]
+            if round_data["Name"] is None:
+                logger.error(f"Round name is None for {round_number}")
+                return {
+                    "success": False,
+                    "reason": "The Round # is not existing in the game"
+                }
+            
+            # Update the round data with slide and time
+            round_data["Slide"] = slide_number
+            round_data["time_now"] = time_str
+            logger.info(f"Updated {round_number} with Slide: {slide_number}, Time: {time_str}")
+            
+            # Keep only this round in the dictionary
+            rounds_info.clear()
+            rounds_info[round_number] = round_data
+            logger.info(f"Cleared rounds_info, keeping only {round_number}")
+            logger.info(f"{rounds_info}")
+            return {
+                "success": True,
+                "round_data": round_data
+            }
+        except Exception as e:
+            logger.error(f"Error parsing data: {e}")
+            return {
+                "success": False,
+                "reason": f"Error parsing data: {str(e)}"
+            }
+        
+    except Exception as e:
+        logger.error(f"Error in be_ready_to_start: {e}")
+        return {
+            "success": False,
+            "reason": f"Error processing request: {str(e)}"
+        }
+
 @app.post("/api/team/toggle-writer")
 async def toggle_writer_status(
     request: dict,
@@ -3017,12 +3228,12 @@ async def test_rounds_query(round_id: int):
     """
     Get data about the specific round
     """
-    if rounds_info.get(f"round_#{round_id}#") is not None:
+    if rounds_info.get(f"round_{round_id}") is not None:
         return {
             "success": True,
-            "round_name": rounds_info[f"round_#{id}#"]["Name"],
-            "round_slide": rounds_info[f"round_#{id}#"]["Slide"],
-            "round_time": rounds_info[f"round_#{id}#"]["time_now"]
+            "round_name": rounds_info[f"round_{id}"]["Name"],
+            "round_slide": rounds_info[f"round_{id}"]["Slide"],
+            "round_time": rounds_info[f"round_{id}"]["time_now"]
         }
     else:
         return {"success": False, "message": "Round not found"}

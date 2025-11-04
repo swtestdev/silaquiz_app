@@ -8,6 +8,7 @@ class DatabaseService {
   // FastAPI backend endpoint (mutable at runtime) 
   // static String _baseUrl = 'http://localhost:8000/api';
   // static String _baseUrl = 'http://192.168.2.14:8000/api';
+  // static String _baseUrl = 'http://192.168.0.101:8000/api';
   static String _baseUrl = 'http://DESKTOP-638BFEB:8000/api';
 
   static String get baseUrl => _baseUrl;

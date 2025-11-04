@@ -40,16 +40,58 @@
 
   <title>Quiz PWA</title>
   <link rel="manifest" href="manifest.json">
+  <style>
+    /* Show loading spinner while app initializes */
+    .loading {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      flex-direction: column;
+      gap: 20px;
+    }
+    .spinner {
+      width: 50px;
+      height: 50px;
+      border: 5px solid #f3f3f3;
+      border-top: 5px solid #3498db;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+  </style>
 </head>
 <body>
+  <div id="loading" class="loading">
+    <div class="spinner"></div>
+    <div>Loading Quiz App...</div>
+  </div>
+  <script>
+    // Debug logging for app loading
+    console.log('App protocol:', window.location.protocol);
+    console.log('App URL:', window.location.href);
+  </script>
   <script src="flutter_bootstrap.js" async></script>
   <script>
     // Register service worker for PWA functionality
     if ('serviceWorker' in navigator) {
       window.addEventListener('flutter-first-frame', function () {
         navigator.serviceWorker.register('sw.js');
+        // Hide loading spinner when app loads
+        document.getElementById('loading').style.display = 'none';
       });
     }
+    
+    // Hide loading spinner after timeout (if app fails to load)
+    setTimeout(function() {
+      var loading = document.getElementById('loading');
+      if (loading) {
+        loading.style.display = 'none';
+      }
+    }, 30000); // Hide after 30 seconds
   </script>
 </body>
 </html>

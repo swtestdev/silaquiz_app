@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'dart:async';
 
 class QuestionPage extends StatefulWidget {
   const QuestionPage({super.key});
@@ -13,6 +14,133 @@ class _QuestionPageState extends State<QuestionPage> {
   bool _isAnswered = false;
   bool _showResult = false;
   int _score = 0;
+
+  // Simple local quiz timer (UI moved from main page)
+  Duration _gameTime = Duration.zero;
+  Duration _totalTime = const Duration(minutes: 45);
+  bool _isTimerRunning = false;
+  int? _currentSlide;
+  Timer? _tick;
+
+  @override
+  void initState() {
+    super.initState();
+    _startLocalTimer();
+  }
+
+  @override
+  void dispose() {
+    _tick?.cancel();
+    super.dispose();
+  }
+
+  void _startLocalTimer() {
+    _isTimerRunning = true;
+    _tick?.cancel();
+    _tick = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      if (_isTimerRunning) {
+        setState(() {
+          _gameTime = Duration(seconds: _gameTime.inSeconds + 1);
+        });
+      }
+    });
+  }
+
+  String _formatDuration(Duration duration) {
+    final minutes = duration.inMinutes;
+    final seconds = duration.inSeconds % 60;
+    return '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
+  }
+
+  Widget _buildTimeBar() {
+    final progress = _totalTime.inSeconds > 0 ? _gameTime.inSeconds / _totalTime.inSeconds : 0.0;
+    final currentTime = _formatDuration(_gameTime);
+    final totalTime = _formatDuration(_totalTime);
+    return Card(
+      elevation: 2,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  _isTimerRunning ? Icons.play_arrow : Icons.pause,
+                  color: _isTimerRunning ? Colors.green.shade700 : Colors.orange.shade700,
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  'Quiz Timer',
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                    color: _isTimerRunning ? Colors.green.shade700 : Colors.orange.shade700,
+                  ),
+                ),
+                if (_currentSlide != null) ...[
+                  const SizedBox(width: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: Colors.blue.shade100,
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Text(
+                      'Slide $_currentSlide',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w500,
+                        color: Colors.blue.shade700,
+                      ),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+            const SizedBox(height: 12),
+            Container(
+              height: 8,
+              decoration: BoxDecoration(
+                color: Colors.grey.shade300,
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: LinearProgressIndicator(
+                value: progress.clamp(0.0, 1.0),
+                backgroundColor: Colors.transparent,
+                valueColor: AlwaysStoppedAnimation<Color>(
+                  _isTimerRunning ? Colors.green.shade600 : Colors.orange.shade600,
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  currentTime,
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w500,
+                    color: _isTimerRunning ? Colors.green.shade600 : Colors.orange.shade600,
+                  ),
+                ),
+                Text(
+                  totalTime,
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w500,
+                    color: Colors.grey.shade600,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 
   // Sample questions data
   final List<Map<String, dynamic>> _questions = [
@@ -70,6 +198,9 @@ class _QuestionPageState extends State<QuestionPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            // Timer moved here under Question page
+            _buildTimeBar(),
+            const SizedBox(height: 16),
             // Progress indicator
             LinearProgressIndicator(
               value: (_currentQuestionIndex + 1) / _questions.length,
