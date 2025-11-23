@@ -1420,11 +1420,10 @@ class _LoginPageState extends State<LoginPage> {
             ),
           );
           
-          // Add a small delay to ensure data is saved before navigation
-          await Future.delayed(const Duration(milliseconds: 500));
-          
-          // Navigate to main page
-          Navigator.pushReplacementNamed(context, '/main');
+          // Navigate to main page immediately (data is already saved)
+          if (mounted) {
+            Navigator.pushReplacementNamed(context, '/main');
+          }
         } else {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(content: Text(result['message'] ?? 'Login failed')),
@@ -1523,10 +1522,12 @@ class _LoginPageState extends State<LoginPage> {
   Widget build(BuildContext context) {
     final screenWidth = MediaQuery.of(context).size.width;
     final screenHeight = MediaQuery.of(context).size.height;
+    final keyboardHeight = MediaQuery.of(context).viewInsets.bottom;
     final isSmallScreen = screenWidth < 600;
     final isVerySmallScreen = screenWidth < 400;
     
     return Scaffold(
+      resizeToAvoidBottomInset: true,
       body: Container(
         decoration: const BoxDecoration(
           gradient: LinearGradient(
@@ -1535,38 +1536,42 @@ class _LoginPageState extends State<LoginPage> {
             colors: [Colors.blue, Colors.purple],
           ),
         ),
-        child: Stack(
-          children: [
-            // Left icon (LaLaFa)
-            Positioned(
-              left: isVerySmallScreen ? 8 : isSmallScreen ? 16 : 32,
-              top: isVerySmallScreen ? 20 : 40,
-              child: Image.asset(
-                'images/right.png',
-                width: isVerySmallScreen ? 40 : isSmallScreen ? 160 : 180,
-                height: isVerySmallScreen ? 40 : isSmallScreen ? 160 : 180,
-                fit: BoxFit.contain,
+        child: SafeArea(
+          child: Stack(
+            children: [
+              // Left icon (LaLaFa)
+              Positioned(
+                left: isVerySmallScreen ? 8 : isSmallScreen ? 16 : 32,
+                top: isVerySmallScreen ? 20 : 40,
+                child: Image.asset(
+                  'images/right.png',
+                  width: isVerySmallScreen ? 40 : isSmallScreen ? 160 : 180,
+                  height: isVerySmallScreen ? 40 : isSmallScreen ? 160 : 180,
+                  fit: BoxFit.contain,
+                ),
               ),
-            ),
-            // Right icon (SilaMisli)
-            Positioned(
-              right: isVerySmallScreen ? 8 : isSmallScreen ? 16 : 32,
-              top: isVerySmallScreen ? 20 : 40,
-              child: Image.asset(
-                'images/left.png',
-                width: isVerySmallScreen ? 40 : isSmallScreen ? 160 : 180,
-                height: isVerySmallScreen ? 40 : isSmallScreen ? 160 : 180,
-                fit: BoxFit.contain,
+              // Right icon (SilaMisli)
+              Positioned(
+                right: isVerySmallScreen ? 8 : isSmallScreen ? 16 : 32,
+                top: isVerySmallScreen ? 20 : 40,
+                child: Image.asset(
+                  'images/left.png',
+                  width: isVerySmallScreen ? 40 : isSmallScreen ? 160 : 180,
+                  height: isVerySmallScreen ? 40 : isSmallScreen ? 160 : 180,
+                  fit: BoxFit.contain,
+                ),
               ),
-            ),
-            // Main content
-            Center(
-              child: SingleChildScrollView(
-            padding: EdgeInsets.symmetric(
-              horizontal: isVerySmallScreen ? 16 : isSmallScreen ? 24 : 32,
-              vertical: isVerySmallScreen ? 16 : 24,
-            ),
-            child: Card(
+              // Main content
+              Center(
+                child: SingleChildScrollView(
+                  keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+                  padding: EdgeInsets.only(
+                    left: isVerySmallScreen ? 16 : isSmallScreen ? 24 : 32,
+                    right: isVerySmallScreen ? 16 : isSmallScreen ? 24 : 32,
+                    top: isVerySmallScreen ? 16 : 24,
+                    bottom: keyboardHeight > 0 ? keyboardHeight + 16 : (isVerySmallScreen ? 16 : 24),
+                  ),
+                  child: Card(
               margin: EdgeInsets.all(isVerySmallScreen ? 8 : isSmallScreen ? 16 : 32),
               elevation: 8,
               child: Padding(
@@ -1796,13 +1801,14 @@ class _LoginPageState extends State<LoginPage> {
                   ),
                 ),
               ),
-              ),
+            ),
             ),
           ),
           ),
-        ],
+            ],
+          ),
+        ),
       ),
-    ),
     );
   }
 }

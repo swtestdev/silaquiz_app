@@ -17,9 +17,9 @@ class _SplashPageState extends State<SplashPage> {
 
   Future<void> _checkLoginStatus() async {
     print('=== SPLASH PAGE _checkLoginStatus START ===');
-    // Add a small delay for splash screen effect
-    print('Waiting 2 seconds for splash screen effect...');
-    await Future.delayed(const Duration(seconds: 2));
+    // Add a minimal delay for splash screen effect (reduced from 2 seconds)
+    print('Waiting 0.5 seconds for splash screen effect...');
+    await Future.delayed(const Duration(milliseconds: 500));
     
     print('Checking login status...');
     final isLoggedIn = await UserDataService.isLoggedIn();

@@ -7,6 +7,7 @@ import 'dart:html' as html;
 import '../widgets/user_info_widget.dart';
 import '../services/user_data_service.dart';
 import 'login_page.dart'; // For DatabaseService
+import 'question_page.dart' as question_page; // For timer message forwarding
 
 class MainPage extends StatefulWidget {
   const MainPage({super.key});
@@ -37,13 +38,8 @@ class _MainPageState extends State<MainPage> {
   // Visible connected status tracking
   int _visibleConnected = 0;
   
-  // Timer and WebSocket state
+  // WebSocket state
   WebSocketChannel? _channel;
-  Timer? _timer;
-  Duration _gameTime = Duration.zero;
-  Duration _totalTime = const Duration(minutes: 45);
-  bool _isTimerRunning = false;
-  int? _currentSlide;
 
   @override
   void initState() {
@@ -530,6 +526,7 @@ class _MainPageState extends State<MainPage> {
       );
     }
     return Scaffold(
+      resizeToAvoidBottomInset: true,
       appBar: AppBar(
         title: Text('Welcome, $_userName'),
         backgroundColor: Colors.blue,
@@ -583,6 +580,19 @@ class _MainPageState extends State<MainPage> {
           IconButton(
             icon: const Icon(Icons.logout),
             onPressed: () async {
+              // Call backend logout API to set visible_connected = 0
+              try {
+                await DatabaseService.logoutUser();
+              } catch (e) {
+                print('Error calling logout API: $e');
+                // Continue with logout even if API call fails
+              }
+              
+              // Close WebSocket connection
+              _channel?.sink.close();
+              _echoTimer?.cancel();
+              
+              // Clear user data
               await UserDataService.clearUserData();
               Navigator.pushReplacementNamed(context, '/splash');
             },
@@ -590,14 +600,16 @@ class _MainPageState extends State<MainPage> {
           ),
         ],
       ),
-      body: Column(
-        children: [
-          Expanded(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: SingleChildScrollView(
-                physics: const BouncingScrollPhysics(),
-                child: Column(
+      body: SafeArea(
+        child: Column(
+          children: [
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: SingleChildScrollView(
+                  keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+                  physics: const BouncingScrollPhysics(),
+                  child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     // User Info Widget
@@ -681,6 +693,7 @@ class _MainPageState extends State<MainPage> {
             ),
           ),
         ],
+        ),
       ),
     );
   }
@@ -806,101 +819,7 @@ class _MainPageState extends State<MainPage> {
     );
   }
 
-  Widget _buildTimeBar() {
-    final progress = _totalTime.inSeconds > 0 ? _gameTime.inSeconds / _totalTime.inSeconds : 0.0;
-    final currentTime = _formatDuration(_gameTime);
-    final totalTime = _formatDuration(_totalTime);
-    
-    return Card(
-      elevation: 2,
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(
-                  _isTimerRunning ? Icons.play_arrow : Icons.pause,
-                  color: _isTimerRunning ? Colors.green.shade700 : Colors.orange.shade700,
-                ),
-                const SizedBox(width: 8),
-                Text(
-                  'Quiz Timer',
-                  style: TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                    color: _isTimerRunning ? Colors.green.shade700 : Colors.orange.shade700,
-                  ),
-                ),
-                if (_currentSlide != null) ...[
-                  const SizedBox(width: 8),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                    decoration: BoxDecoration(
-                      color: Colors.blue.shade100,
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: Text(
-                      'Slide $_currentSlide',
-                      style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w500,
-                        color: Colors.blue.shade700,
-                      ),
-                    ),
-                  ),
-                ],
-              ],
-            ),
-            const SizedBox(height: 12),
-            Container(
-              height: 8,
-              decoration: BoxDecoration(
-                color: Colors.grey.shade300,
-                borderRadius: BorderRadius.circular(4),
-              ),
-              child: LinearProgressIndicator(
-                value: progress.clamp(0.0, 1.0),
-                backgroundColor: Colors.transparent,
-                valueColor: AlwaysStoppedAnimation<Color>(
-                  _isTimerRunning ? Colors.green.shade600 : Colors.orange.shade600,
-                ),
-              ),
-            ),
-            const SizedBox(height: 8),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text(
-                  currentTime,
-                  style: TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.w500,
-                    color: _isTimerRunning ? Colors.green.shade600 : Colors.orange.shade600,
-                  ),
-                ),
-                Text(
-                  totalTime,
-                  style: TextStyle(
-                    fontSize: 14,
-                    fontWeight: FontWeight.w500,
-                    color: Colors.grey.shade600,
-                  ),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
 
-  String _formatDuration(Duration duration) {
-    final minutes = duration.inMinutes;
-    final seconds = duration.inSeconds % 60;
-    return '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
-  }
 
   Widget _buildViewSummaryCard() {
     final enabled = _hasTeam && _eligibleForActiveGame;
@@ -975,9 +894,19 @@ class _MainPageState extends State<MainPage> {
       
       _channel!.stream.listen(
         (data) {
-          final message = json.decode(data);
-          if (message['type'] == 'timer_trigger') {
-            _handleTimerTrigger(message);
+          print('=== WebSocket Message Received ===');
+          print('Data: $data');
+          try {
+            final message = json.decode(data) as Map<String, dynamic>;
+            print('Parsed message: $message');
+            
+            // Forward timer messages to question_page if it's listening
+            if (message['type'] == 'timer_trigger') {
+              print('Forwarding timer message to question_page');
+              question_page.forwardTimerMessage(message);
+            }
+          } catch (e) {
+            print('Error parsing WebSocket message: $e');
           }
         },
         onError: (error) {
@@ -1087,14 +1016,22 @@ class _MainPageState extends State<MainPage> {
   // Logout user and redirect to login
   Future<void> _logoutUser() async {
     try {
-      // Clear user data
-      await UserDataService.clearUserData();
+      // Call backend logout API to set visible_connected = 0
+      try {
+        await DatabaseService.logoutUser();
+      } catch (e) {
+        print('Error calling logout API: $e');
+        // Continue with logout even if API call fails
+      }
       
       // Close WebSocket connection
       _channel?.sink.close();
       
-      // Cancel timer
-      _timer?.cancel();
+      // Cancel timers
+      _echoTimer?.cancel();
+      
+      // Clear user data
+      await UserDataService.clearUserData();
       
       // Show logout message
       if (mounted) {
@@ -1443,73 +1380,9 @@ class _MainPageState extends State<MainPage> {
     });
   }
 
-  void _handleTimerTrigger(Map<String, dynamic> message) {
-    final action = message['action'] as String;
-    final slideNumber = message['slide_number'] as int?;
-    
-    setState(() {
-      _currentSlide = slideNumber;
-    });
-    
-    switch (action) {
-      case 'start':
-        _startTimer();
-        break;
-      case 'stop':
-        _stopTimer();
-        break;
-      case 'pause':
-        _pauseTimer();
-        break;
-      case 'resume':
-        _resumeTimer();
-        break;
-    }
-  }
-
-  void _startTimer() {
-    setState(() {
-      _isTimerRunning = true;
-      _gameTime = Duration.zero;
-    });
-    _startTimerTick();
-  }
-
-  void _stopTimer() {
-    setState(() {
-      _isTimerRunning = false;
-    });
-    _timer?.cancel();
-  }
-
-  void _pauseTimer() {
-    setState(() {
-      _isTimerRunning = false;
-    });
-    _timer?.cancel();
-  }
-
-  void _resumeTimer() {
-    setState(() {
-      _isTimerRunning = true;
-    });
-    _startTimerTick();
-  }
-
-  void _startTimerTick() {
-    _timer?.cancel();
-    _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (_isTimerRunning) {
-        setState(() {
-          _gameTime = Duration(seconds: _gameTime.inSeconds + 1);
-        });
-      }
-    });
-  }
 
   @override
   void dispose() {
-    _timer?.cancel();
     _echoTimer?.cancel();
     _channel?.sink.close();
     WidgetsBinding.instance.removeObserver(_AppLifecycleObserver(
@@ -1568,7 +1441,7 @@ class _BonusOptionSelectionDialogState extends State<BonusOptionSelectionDialog>
                 Icon(Icons.notifications_active, color: Colors.blue),
                 const SizedBox(width: 8),
                 const Text(
-                  'Active Game - Select Bonus Option',
+                  'Game Options',
                   style: TextStyle(
                     fontSize: 18,
                     fontWeight: FontWeight.bold,
