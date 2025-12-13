@@ -50,7 +50,11 @@ class _MainPageState extends State<MainPage> {
     WidgetsBinding.instance.addObserver(_AppLifecycleObserver(
       onResumed: () {
         _isAppVisible = true;
-        print('App became visible');
+        print('App became visible - checking WebSocket connection');
+        // Reconnect WebSocket if needed when app becomes visible
+        if (_userRole == 'player') {
+          _ensureWebSocketConnected();
+        }
       },
       onPaused: () {
         _isAppVisible = false;
@@ -878,6 +882,17 @@ class _MainPageState extends State<MainPage> {
     if (_userId.isEmpty || _userRole != 'player') return;
     
     try {
+      // Close existing connection if any
+      if (_channel != null) {
+        try {
+          _channel!.sink.close();
+          print('Closed existing WebSocket connection before reconnecting');
+        } catch (e) {
+          print('Error closing existing WebSocket: $e');
+        }
+        _channel = null;
+      }
+      
       // Get WebSocket URL from configurable server URL
       final wsUrl = DatabaseService.getWebSocketUrl(_userId);
       print('Connecting to WebSocket: $wsUrl');
@@ -894,7 +909,12 @@ class _MainPageState extends State<MainPage> {
       
       _channel!.stream.listen(
         (data) {
+          final now = DateTime.now();
+          final utcNow = DateTime.now().toUtc();
           print('=== WebSocket Message Received ===');
+          print('Timestamp (Local): ${now.toIso8601String()}');
+          print('Timestamp (UTC): ${utcNow.toIso8601String()}');
+          print('Time since epoch (ms): ${now.millisecondsSinceEpoch}');
           print('Data: $data');
           try {
             final message = json.decode(data) as Map<String, dynamic>;
@@ -950,6 +970,46 @@ class _MainPageState extends State<MainPage> {
       );
     } catch (e) {
       print('Error connecting to WebSocket: $e');
+      // Set visible connected status to 0 on connection error
+      if (mounted) {
+        setState(() {
+          _visibleConnected = 0;
+        });
+      }
+    }
+  }
+
+  // Ensure WebSocket is connected, reconnect if needed
+  void _ensureWebSocketConnected() {
+    if (_userId.isEmpty || _userRole != 'player') return;
+    
+    // Check if WebSocket is null or closed
+    bool needsReconnect = false;
+    
+    if (_channel == null) {
+      print('WebSocket is null, needs reconnection');
+      needsReconnect = true;
+    } else {
+      // Try to check if connection is still alive by checking the stream
+      // If the stream is closed, we need to reconnect
+      try {
+        // The stream might be closed, but we can't directly check it
+        // So we'll just try to reconnect if channel exists but visible_connected is 0
+        if (_visibleConnected == 0) {
+          print('WebSocket exists but visible_connected is 0, attempting reconnection');
+          needsReconnect = true;
+        }
+      } catch (e) {
+        print('Error checking WebSocket state: $e, will reconnect');
+        needsReconnect = true;
+      }
+    }
+    
+    if (needsReconnect) {
+      print('Reconnecting WebSocket...');
+      _connectWebSocket();
+    } else {
+      print('WebSocket is already connected');
     }
   }
 
@@ -961,55 +1021,70 @@ class _MainPageState extends State<MainPage> {
     }
     
     _disconnectionHandlerRunning = true;
-    print('WebSocket disconnected, checking if user should be logged out');
+    print('WebSocket disconnected, attempting to reconnect...');
     
-    // Add a delay to avoid race conditions
-    Future.delayed(const Duration(seconds: 2), () async {
+    // Try to reconnect immediately if user is still logged in
+    Future.delayed(const Duration(seconds: 1), () async {
       if (!mounted) {
         _disconnectionHandlerRunning = false;
         return;
       }
       
-      // Try to check if user is still logged in using simpler method
-      print('Checking login status after WebSocket disconnection...');
-      try {
-        final loginCheck = await DatabaseService.checkLoginStatus();
-        print('Login check result: ${loginCheck['success']}, message: ${loginCheck['message']}');
-        
-        if (loginCheck['success'] == false) {
-          print('Login check failed after WebSocket disconnection, but checking if we have valid local data...');
-          // Check if we have valid local data before logging out
-          final userData = await UserDataService.getUserData();
-          if (userData != null && userData['access_token'] != null) {
-            print('Have valid local data, assuming still logged in and reconnecting...');
-            if (_userRole == 'player') {
-              _connectWebSocket();
-            }
-          } else {
-            print('No valid local data, logging out user');
-            await _logoutUser();
-          }
-        } else {
-          print('User still logged in after WebSocket disconnection, will reconnect on next ECHO call...');
-          // User is still logged in, but don't immediately reconnect
-          // Let the ECHO timer handle reconnection
-        }
-      } catch (e) {
-        print('Error during login check after WebSocket disconnection: $e');
-        // Check if we have valid local data before giving up
-        final userData = await UserDataService.getUserData();
-        if (userData != null && userData['access_token'] != null) {
-          print('Network error but have valid local data, attempting to reconnect...');
-          if (_userRole == 'player') {
-            _connectWebSocket();
-          }
-        } else {
-          print('No valid local data and network error, logging out user');
-          await _logoutUser();
-        }
+      // Check if we have valid local data first (faster check)
+      final userData = await UserDataService.getUserData();
+      if (userData != null && userData['access_token'] != null && _userRole == 'player') {
+        print('Have valid local data, attempting immediate reconnection...');
+        _ensureWebSocketConnected();
       }
       
-      _disconnectionHandlerRunning = false;
+      // Also check login status with backend (more thorough)
+      Future.delayed(const Duration(seconds: 1), () async {
+        if (!mounted) {
+          _disconnectionHandlerRunning = false;
+          return;
+        }
+        
+        try {
+          final loginCheck = await DatabaseService.checkLoginStatus();
+          print('Login check result: ${loginCheck['success']}, message: ${loginCheck['message']}');
+          
+          if (loginCheck['success'] == false) {
+            print('Login check failed after WebSocket disconnection, but checking if we have valid local data...');
+            // Check if we have valid local data before logging out
+            final userData = await UserDataService.getUserData();
+            if (userData != null && userData['access_token'] != null) {
+              print('Have valid local data, assuming still logged in and reconnecting...');
+              if (_userRole == 'player') {
+                _ensureWebSocketConnected();
+              }
+            } else {
+              print('No valid local data, logging out user');
+              await _logoutUser();
+            }
+          } else {
+            print('User still logged in after WebSocket disconnection, ensuring WebSocket is connected...');
+            // User is still logged in, ensure WebSocket is connected
+            if (_userRole == 'player') {
+              _ensureWebSocketConnected();
+            }
+          }
+        } catch (e) {
+          print('Error during login check after WebSocket disconnection: $e');
+          // Check if we have valid local data before giving up
+          final userData = await UserDataService.getUserData();
+          if (userData != null && userData['access_token'] != null) {
+            print('Network error but have valid local data, attempting to reconnect...');
+            if (_userRole == 'player') {
+              _ensureWebSocketConnected();
+            }
+          } else {
+            print('No valid local data and network error, logging out user');
+            await _logoutUser();
+          }
+        }
+        
+        _disconnectionHandlerRunning = false;
+      });
     });
   }
 
@@ -1077,6 +1152,10 @@ class _MainPageState extends State<MainPage> {
           // Tab is visible (user returned to this tab)
           _isAppVisible = true;
           print('Browser tab became visible - user returned to this tab');
+          // Reconnect WebSocket if needed when tab becomes visible
+          if (_userRole == 'player') {
+            _ensureWebSocketConnected();
+          }
         }
       });
       
@@ -1089,6 +1168,10 @@ class _MainPageState extends State<MainPage> {
       html.window.addEventListener('focus', (event) {
         _isAppVisible = true;
         print('Browser window gained focus - user returned to this application');
+        // Reconnect WebSocket if needed when window gains focus
+        if (_userRole == 'player') {
+          _ensureWebSocketConnected();
+        }
       });
       
       // Listen for page unload (user closes tab/window)
@@ -1311,9 +1394,8 @@ class _MainPageState extends State<MainPage> {
           await _logoutUser();
         } else if (echoResult['success'] == true) {
           // ECHO call successful, ensure WebSocket is connected
-          if (_userRole == 'player' && _channel == null) {
-            print('ECHO successful but WebSocket disconnected, reconnecting...');
-            _connectWebSocket();
+          if (_userRole == 'player') {
+            _ensureWebSocketConnected();
           }
           
           // Update visible connected status

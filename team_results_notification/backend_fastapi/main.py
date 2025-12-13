@@ -30,7 +30,8 @@ for i in range(1, 21):  # rounds 1-20
     rounds_info[f"round_{i}"] = {"Name": None, "Slide": None, "time_now": None}
 
 def create_action_game_control_table(active_game_id: int, db: Session) -> None:
-    """Create per-game control table action_game_control_<game_name> if it doesn't exist.
+    """
+    Create per-game control table action_game_control_<game_name> if it doesn't exist.
     Columns:
       - question_id INT AUTO_INCREMENT PRIMARY KEY,
       - slide_number INTEGER UNIQUE NOT NULL,
@@ -173,6 +174,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Exception handler for connection errors
+@app.exception_handler(ConnectionResetError)
+async def connection_reset_handler(request: Request, exc: ConnectionResetError):
+    """Handle connection reset errors gracefully"""
+    logger.debug(f"Connection reset by client: {request.url}")
+    # Return a simple response since the client has already disconnected
+    from fastapi.responses import Response
+    return Response(status_code=499)  # 499 Client Closed Request
+
+@app.exception_handler(BrokenPipeError)
+async def broken_pipe_handler(request: Request, exc: BrokenPipeError):
+    """Handle broken pipe errors gracefully"""
+    logger.debug(f"Broken pipe error: {request.url}")
+    from fastapi.responses import Response
+    return Response(status_code=499)  # 499 Client Closed Request
+
+@app.exception_handler(OSError)
+async def os_error_handler(request: Request, exc: OSError):
+    """Handle OS-level connection errors gracefully"""
+    # Only handle connection-related OS errors
+    if "10054" in str(exc) or "Broken pipe" in str(exc) or "Connection reset" in str(exc):
+        logger.debug(f"Connection error: {request.url} - {exc}")
+        from fastapi.responses import Response
+        return Response(status_code=499)  # 499 Client Closed Request
+    # Re-raise other OS errors
+    raise exc
+
 # Request logging middleware
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
@@ -182,6 +210,12 @@ async def log_requests(request: Request, call_next):
         response = await call_next(request)
         logger.info(f"Response: {response.status_code}")
         return response
+    except (ConnectionResetError, BrokenPipeError, OSError) as e:
+        # These are common when clients disconnect abruptly (browser tab closed, network issues, etc.)
+        # They're harmless and don't need to be logged as errors
+        logger.debug(f"Client disconnected: {type(e).__name__}")
+        # Re-raise to let FastAPI handle it properly
+        raise
     except Exception as e:
         logger.error(f"Request error: {e}")
         raise
@@ -1784,7 +1818,7 @@ async def get_active_game_results_structure(active_game_id: int, db: Session = D
                 question_columns.append({
                     'name': column_name,
                     'type': column_type,
-                    'question_number': column_name.replace('q', '').replace('_score', '')
+                    'question_num': column_name.replace('q', '').replace('_score', '')
                 })
             else:
                 other_columns.append({
@@ -2601,10 +2635,16 @@ class ConnectionManager:
                 try:
                     await self.active_connections[old_connection_id].close(code=1000, reason="New connection from same user")
                     logger.info(f"Closed existing connection {old_connection_id} for user {user_id}")
+                except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                    # Client already disconnected - this is normal
+                    logger.debug(f"Existing connection {old_connection_id} already closed: {type(e).__name__}")
                 except Exception as e:
                     logger.warning(f"Error closing existing connection for user {user_id}: {e}")
                 # Remove from active connections
-                del self.active_connections[old_connection_id]
+                try:
+                    del self.active_connections[old_connection_id]
+                except KeyError:
+                    pass  # Already removed
             
             # Remove from user connections mapping
             del self.user_connections[user_id]
@@ -2640,6 +2680,22 @@ class ConnectionManager:
         if connection_id in self.active_connections:
             try:
                 await self.active_connections[connection_id].send_text(message)
+            except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                # Client disconnected abruptly - this is normal and not an error
+                logger.debug(f"Client {connection_id} disconnected during send: {type(e).__name__}")
+                # Remove the connection
+                try:
+                    del self.active_connections[connection_id]
+                    # Also remove from user_connections if it exists
+                    user_id_to_remove = None
+                    for uid, cid in self.user_connections.items():
+                        if cid == connection_id:
+                            user_id_to_remove = uid
+                            break
+                    if user_id_to_remove:
+                        del self.user_connections[user_id_to_remove]
+                except Exception:
+                    pass  # Already removed or doesn't exist
             except Exception as e:
                 logger.error(f"Error sending message to {connection_id}: {e}")
 
@@ -2708,6 +2764,23 @@ class ConnectionManager:
                 await websocket.send_text(message)
                 sent_count += 1
                 logger.info(f"Message successfully sent to {connection_id}")
+            except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                # Client disconnected abruptly - this is normal and not an error
+                logger.debug(f"Client {connection_id} disconnected during broadcast: {type(e).__name__}")
+                # Remove failed connection
+                try:
+                    del self.active_connections[connection_id]
+                    # Also remove from user_connections if it exists
+                    user_id_to_remove = None
+                    for uid, cid in self.user_connections.items():
+                        if cid == connection_id:
+                            user_id_to_remove = uid
+                            break
+                    if user_id_to_remove:
+                        del self.user_connections[user_id_to_remove]
+                    logger.debug(f"Removed disconnected connection {connection_id}")
+                except Exception as cleanup_error:
+                    logger.debug(f"Error cleaning up disconnected connection {connection_id}: {cleanup_error}")
             except Exception as e:
                 logger.error(f"Error broadcasting to {connection_id}: {e}")
                 # Remove failed connection
@@ -2765,7 +2838,7 @@ class ConnectionManager:
 
 # Timer Trigger Models
 class TimerTriggerRequest(BaseModel):
-    trigger_data: str  # The text data like "START_TIMER and STOP_TIMER"
+    trigger_data: str  # The text data like "START_TIMER, STOP_TIMER and etc"
 
 class TimerTriggerResponse(BaseModel):
     success: bool
@@ -2972,6 +3045,17 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
             user.visible_connected = 0
             db.commit()
             logger.info(f"User {user_id} marked as not visible and disconnected")
+    except (ConnectionResetError, BrokenPipeError, OSError) as e:
+        # Client disconnected abruptly - this is normal and not an error
+        logger.debug(f"WebSocket connection reset for user {user_id}: {type(e).__name__}")
+        manager.disconnect(connection_id, user_id)
+        
+        # Set user as not visible and disconnected
+        user = db.query(User).filter(User.id == user_id).first()
+        if user:
+            user.visible_connected = 0
+            db.commit()
+            logger.debug(f"User {user_id} marked as not visible and disconnected due to connection reset")
     except Exception as e:
         logger.error(f"WebSocket error for user {user_id}: {e}")
         manager.disconnect(connection_id, user_id)
@@ -2998,8 +3082,10 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
          "Slide#159#STOP_TIMER##at#2025-10-29 10:14:19 PM"
     """
     try:
+        timer_start = datetime.utcnow()
         trigger_data = request.trigger_data.strip()
         logger.info(f"Received timer trigger: {trigger_data}")
+
 
         # Get the current active game that is running
         active_game = db.query(ActiveGame).filter(ActiveGame.is_started == 'running').first()
@@ -3008,7 +3094,7 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
                 success=False,
                 message="No active game is currently running"
             )
-        
+
         # Get game info
         game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
         if not game:
@@ -3016,7 +3102,7 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
                 success=False,
                 message=f"Game {active_game.game_id} not found"
             )
-        
+
         game_name_safe = str(game.game_name).strip().lower().replace(' ', '_').replace('-', '_')
         control_table_name = f"action_game_control_{game_name_safe}"
         game_table_name = game.game_name
@@ -3025,7 +3111,7 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
         # Every odd item is a key, every even item is a value:
         # "Slide#164#START_TIMER#round_7#at#2025-10-29 10:16:49 PM#time#1 min_black"
         timer_data = trigger_data.split("#")
-        parts = {}
+
         # If the list has an odd number of elements, the last key has no value → assign None
         if len(timer_data) % 2 != 0:
             timer_data.append(None)
@@ -3058,7 +3144,7 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
                             " Expected: START_TIMER, STOP_TIMER, PAUSE_TIMER or LAST_TIMER with valid round name."
                 )
             slide_number = int(parts["Slide"])
-            timer_start = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # timer_start = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             # timer_start = datetime.utcnow()
         except (IndexError, ValueError):
             logger.warning(f"Could not parse slide number from: {trigger_data}")
@@ -3066,32 +3152,32 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
                 success=False,
                 message=f"Could not parse slide number from: {trigger_data}"
             )
-        
+
         # Handle different timer actions
-        broadcast_message = None
         _id = 0  # question_id
         _timer = 0  # final_timer
         question_timer = 0  # time_to_get_answer
-        
+
         if timer_action == "START_TIME":
             """
-            Check if slide_number exists in action_game_control_<game_name> table and If exists, update timer_start """
+            Check if slide_number exists in action_game_control_<game_name> table and If exists, update timer_start
+            """
             check_sql = text(f"SELECT question_id, round_name FROM `{control_table_name}` WHERE slide_number = :slide_num")
             result = db.execute(check_sql, {"slide_num": slide_number})
             existing_row = result.fetchone()
-            
+
             if existing_row:
                 # Update existing row in DB
                 question_id = existing_row[0]
                 _id = question_id
                 update_sql = text(f"""
-                    UPDATE `{control_table_name}` 
-                    SET timer_start = :timer_start 
+                    UPDATE `{control_table_name}`
+                    SET timer_start = :timer_start
                     WHERE slide_number = :slide_num
                 """)
                 db.execute(update_sql, {"timer_start": timer_start, "slide_num": slide_number})
                 db.commit()
-                
+
                 # Get final_timer and time_to_get_answer from game table
                 try:
                     question_data_result = db.execute(text(f"SELECT type_game, time_to_get_answer FROM `{game_table_name}` WHERE id = :qid"), {"qid": question_id})
@@ -3102,14 +3188,14 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
                     logger.warning(f"Could not get type_game/time_to_get_answer for question_id {question_id}: {e}")
                     _timer = 0
                     question_timer = 0
-                
+
                 # Update rounds_info with Slide and time_now (just in case the PPT is changed)
                 round_key = None
                 for key, value in rounds_info.items():
                     if value.get("Name") == round_name:
                         round_key = key
                         break
-                
+
                 if round_key:
                     rounds_info[round_key]["Slide"] = slide_number
                     rounds_info[round_key]["time_now"] = timer_start
@@ -3121,21 +3207,21 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
                 """)
                 db.execute(insert_sql, {"slide_num": slide_number, "round_name": round_name, "timer_start": timer_start})
                 db.commit()
-                
+
                 # Get the inserted question_id
                 get_id_sql = text(f"SELECT question_id FROM `{control_table_name}` WHERE slide_number = :slide_num")
                 id_result = db.execute(get_id_sql, {"slide_num": slide_number})
                 inserted_row = id_result.fetchone()
                 if inserted_row:
                     _id = inserted_row[0]
-                    
+
                     # Check if question_id exists in the game table,
                     # and the round_name from slide matches to the round_name for the question_id
                     try:
                         check_round_sql = text(f"SELECT round_name FROM `{game_table_name}` WHERE id = :qid")
                         round_result = db.execute(check_round_sql, {"qid": _id})
                         game_round_row = round_result.fetchone()
-                        
+
                         if game_round_row and game_round_row[0] == round_name:
                             # Valid - get final_timer (type_game) and time_to_get_answer
                             try:
@@ -3147,14 +3233,14 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
                                 logger.warning(f"Could not get type_game/time_to_get_answer for question_id {_id}: {e}")
                                 _timer = 0
                                 question_timer = 0
-                            
+
                             # Update rounds_info with Slide and time_now
                             round_key = None
                             for key, value in rounds_info.items():
                                 if value.get("Name") == round_name:
                                     round_key = key
                                     break
-                            
+
                             if round_key:
                                 rounds_info[round_key]["Slide"] = slide_number
                                 rounds_info[round_key]["time_now"] = timer_start
@@ -3165,32 +3251,32 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
                             db.commit()
                             logger.warning(f"Round name mismatch for question_id {_id}. Removed inserted row.")
                             # Don't send broadcast message
-                            broadcast_message = None
+
                     except Exception as e:
                         logger.error(f"Error checking round_name for question_id {_id}: {e}")
                         # Remove the inserted row on error
                         delete_sql = text(f"DELETE FROM `{control_table_name}` WHERE slide_number = :slide_num")
                         db.execute(delete_sql, {"slide_num": slide_number})
                         db.commit()
-                        broadcast_message = None
+
         elif timer_action == "LAST_TIMER":
             """
             Uses type_game from game table to define the final timer:
             - if '0' then each question gets timer in round and no final timer
             - if '<0' then despite each question can gets timer in round
-                and additional by the end of the round gets the final timer 
+                and additional by the end of the round gets the final timer
             """
             # Find the last question for this round_name
             try:
                 last_question_sql = text(f"""
-                    SELECT id, type_game FROM `{game_table_name}` 
-                    WHERE round_name = :round_name 
-                    ORDER BY id DESC 
+                    SELECT id, type_game FROM `{game_table_name}`
+                    WHERE round_name = :round_name
+                    ORDER BY id DESC
                     LIMIT 1
                 """)
                 last_result = db.execute(last_question_sql, {"round_name": round_name})
                 last_row = last_result.fetchone()
-                
+
                 if last_row:
                     _timer = int(last_row[1]) if last_row[1] is not None else 0
                 else:
@@ -3208,7 +3294,7 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
                     if value.get("Name") == round_name:
                         round_key = key
                         break
-                
+
                 if round_key:
                     rounds_info[round_key]["Slide"] = "LAST_TIMER"
                     rounds_info[round_key]["time_now"] = timer_start
@@ -3220,12 +3306,14 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
             pass
 
         # Create broadcast message
+        # Convert timer_start to ISO format string for JSON serialization
+        timer_start_str = timer_start.isoformat() if isinstance(timer_start, datetime) else str(timer_start)
         broadcast_message = json.dumps({
             "type": "timer_trigger",
             "timer_action": timer_action,
             "slide_number": slide_number,
             "round_name": round_name,
-            "timer_start": timer_start,
+            "timer_start": timer_start_str,
             "question_id": _id,
             "final_timer": _timer,
             "question_timer": question_timer
@@ -3242,15 +3330,15 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
             "timer_action": timer_action,
             "slide_number": slide_number,
             "round_name": round_name,
-            "timer_start": timer_start,
+            "timer_start": timer_start_str,
             "question_id": _id,
-            "final_timer": _timer,
-            "question_timer": question_timer,
+            "final_timer": _timer-2 if _timer > 0 else 0,
+            "question_timer": question_timer-2 if question_timer > 0 else 0
         }
         return TimerTriggerResponse(
             success=True,
             message=f"Timer {timer_action} triggered successfully",
-            timer_start = timer_start,
+            timer_start = timer_start_str,
             timer_action = timer_action
         )
     except Exception as e:
@@ -3686,9 +3774,137 @@ async def test_rounds_query(round_id: int):
     else:
         return {"success": False, "message": "Round not found"}
 
+@app.get("/api/games/{game_name}/round/{round_name}")
+async def get_game_questions_by_round(
+    game_name: str,
+    round_name: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Get all questions for a specific round in a game
+    Returns list of questions with all their data
+    """
+    try:
+        # Get game from GamesList
+        game = db.query(GamesList).filter(GamesList.game_name == game_name).first()
+        if not game:
+            raise HTTPException(status_code=404, detail=f"Game '{game_name}' not found")
+        
+        # Query the game table for questions matching round_name
+        game_table_name = game.game_name
+        query_sql = text(f"""
+            SELECT id, round_name, reg_score, bonus_score, answers_for_selection, 
+                   question_num, question, answer1, answer2, answer3, comments, 
+                    type_game, time_to_get_answer 
+            FROM `{game_table_name}`
+            WHERE round_name = :round_name
+            ORDER BY id
+        """)
+        
+        result = db.execute(query_sql, {"round_name": round_name})
+        rows = result.fetchall()
+        
+        # Convert to list of dictionaries
+        questions = []
+        for row in rows:
+            questions.append({
+                "id": row[0],
+                "round_name": row[1],
+                "reg_score": row[2],
+                "bonus_score": row[3],
+                "answers_for_selection": row[4],
+                "question_num": row[5],
+                "question": row[6],
+                "answer1": row[7],
+                "answer2": row[8],
+                "answer3": row[9],
+                "comments": row[10],
+                "type_game": row[11],
+                "time_to_get_answer": row[12],
+            })
+        
+        return questions
+        
+    except Exception as e:
+        logger.error(f"Error getting game questions by round: {e}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving questions: {str(e)}")
+
+@app.get("/api/active-games/team-answers/{game_name_safe}/{team_id}")
+async def get_team_answers_for_game(
+    game_name_safe: str,
+    team_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Get all recorded answers for a specific team in an active game
+    """
+    try:
+        # Construct answers table name
+        answers_table_name = f"active_teams_answers_{game_name_safe}"
+        
+        # Verify user has access (admin or belongs to the team)
+        if current_user.role != 'admin':
+            # Check if user belongs to the requested team
+            try:
+                user_team_id = int(current_user.playing_in_team_id) if current_user.playing_in_team_id else None
+                if user_team_id != team_id:
+                    raise HTTPException(status_code=403, detail="Access denied")
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=403, detail="Access denied")
+        
+        # Query answers table
+        query_sql = text(f"""
+            SELECT id, team_id, question_id, correct_score, wrong_score, 
+                   slide_id, answer, is_correct, answered_at, player_id
+            FROM `{answers_table_name}`
+            WHERE team_id = :team_id
+            ORDER BY question_id
+        """)
+        
+        result = db.execute(query_sql, {"team_id": team_id})
+        rows = result.fetchall()
+        
+        # Convert to list of dictionaries
+        answers = []
+        for row in rows:
+            answers.append({
+                "id": row[0],
+                "team_id": row[1],
+                "question_id": row[2],
+                "correct_score": row[3],
+                "wrong_score": row[4],
+                "slide_id": row[5],
+                "answer": row[6],
+                "is_correct": row[7],
+                "answered_at": row[8].isoformat() if row[8] else None,
+                "player_id": row[9],
+            })
+        
+        return answers
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting team answers: {e}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving team answers: {str(e)}")
+
 @app.get("/api/health")
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.utcnow()}
+
+@app.get("/api/app/version")
+async def get_app_version():
+    """
+    Get the latest app version information.
+    Update this version number when you release a new build.
+    Format: version (e.g., "1.0.0") and build (e.g., "2")
+    """
+    return {
+        "version": "1.0.0",  # Update this when releasing a new version
+        "build": "1"  # Update this build number for each new build
+    }
 
 @app.get("/api/auth/check-login")
 async def check_login_status(current_user: User = Depends(get_current_user)):

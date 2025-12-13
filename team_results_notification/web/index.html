@@ -76,10 +76,51 @@
   </script>
   <script src="flutter_bootstrap.js" async></script>
   <script>
-    // Register service worker for PWA functionality
+    // Mobile console for debugging (Eruda)
+    // Add ?debug=true to URL to enable console on mobile
+    (function() {
+      const urlParams = new URLSearchParams(window.location.search);
+      if (urlParams.get('debug') === 'true') {
+        var script = document.createElement('script');
+        script.src = 'https://cdn.jsdelivr.net/npm/eruda';
+        script.onload = function() {
+          eruda.init();
+          console.log('Eruda console enabled - add ?debug=true to URL to enable');
+        };
+        document.head.appendChild(script);
+      }
+    })();
+    
+    // Register service worker for PWA functionality with update checking
     if ('serviceWorker' in navigator) {
       window.addEventListener('flutter-first-frame', function () {
-        navigator.serviceWorker.register('sw.js');
+        navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' })
+          .then(function(registration) {
+            console.log('Service Worker registered:', registration);
+            
+            // Check for updates periodically
+            setInterval(function() {
+              registration.update();
+            }, 60000); // Check every minute
+            
+            // Listen for service worker updates
+            registration.addEventListener('updatefound', function() {
+              console.log('Service Worker update found');
+              const newWorker = registration.installing;
+              newWorker.addEventListener('statechange', function() {
+                if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+                  // New service worker is ready, notify the app
+                  console.log('New Service Worker installed, reloading...');
+                  // Force reload to activate new service worker
+                  window.location.reload();
+                }
+              });
+            });
+          })
+          .catch(function(error) {
+            console.error('Service Worker registration failed:', error);
+          });
+        
         // Hide loading spinner when app loads
         document.getElementById('loading').style.display = 'none';
       });

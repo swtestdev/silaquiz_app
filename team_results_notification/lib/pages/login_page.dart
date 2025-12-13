@@ -1,7 +1,12 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:http/http.dart' as http;
 import 'dart:convert';
+import 'dart:async';
+import 'package:package_info_plus/package_info_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../services/user_data_service.dart';
+import 'dart:html' as html;
 
 // API service class for authentication operations
 class DatabaseService {
@@ -1100,6 +1105,75 @@ class DatabaseService {
     }
   }
 
+  /// Get game questions by round name
+  /// Returns list of questions with all their data
+  static Future<List<Map<String, dynamic>>> getGameQuestionsByRound(String gameName, String roundName) async {
+    try {
+      final userData = await UserDataService.getUserData();
+      if (userData == null || userData['access_token'] == null) {
+        return [];
+      }
+      
+      final encodedGameName = Uri.encodeComponent(gameName);
+      final encodedRoundName = Uri.encodeComponent(roundName);
+      
+      final response = await http.get(
+        Uri.parse('$_baseUrl/games/$encodedGameName/round/$encodedRoundName'),
+        headers: {
+          'Authorization': 'Bearer ${userData['access_token']}',
+          'Content-Type': 'application/json',
+        },
+      );
+      
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        if (data is List) {
+          return data.cast<Map<String, dynamic>>();
+        } else if (data is Map) {
+          return [Map<String, dynamic>.from(data)];
+        }
+      }
+      return [];
+    } catch (e) {
+      print('Error fetching game questions by round: $e');
+      return [];
+    }
+  }
+
+  /// Get team answers for a specific game
+  /// Returns list of answers keyed by question_id
+  static Future<List<Map<String, dynamic>>> getTeamAnswersForGame(String gameNameSafe, int teamId) async {
+    try {
+      final userData = await UserDataService.getUserData();
+      if (userData == null || userData['access_token'] == null) {
+        return [];
+      }
+      
+      final encodedGameName = Uri.encodeComponent(gameNameSafe);
+      
+      final response = await http.get(
+        Uri.parse('$_baseUrl/active-games/team-answers/$encodedGameName/$teamId'),
+        headers: {
+          'Authorization': 'Bearer ${userData['access_token']}',
+          'Content-Type': 'application/json',
+        },
+      );
+      
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        if (data is List) {
+          return data.cast<Map<String, dynamic>>();
+        } else if (data is Map && data['answers'] is List) {
+          return (data['answers'] as List).cast<Map<String, dynamic>>();
+        }
+      }
+      return [];
+    } catch (e) {
+      print('Error fetching team answers: $e');
+      return [];
+    }
+  }
+
   static Future<Map<String, dynamic>> runActiveGame(int activeGameId) async {
     try {
       final response = await http.post(
@@ -1243,6 +1317,21 @@ class _LoginPageState extends State<LoginPage> {
   bool _isLoading = false;
   bool _isSignUp = false;
   bool _databaseInitialized = false; // Add flag to prevent multiple calls
+  
+  // Version info
+  String _appVersion = 'Loading...';
+  String _buildNumber = '';
+  bool _updateAvailable = false;
+  String? _latestVersion;
+  
+  // Periodic update check timer
+  Timer? _updateCheckTimer;
+  
+  // Fallback version - MUST match pubspec.yaml version
+  // Update this whenever you update pubspec.yaml version
+  // Current: version: 1.0.0+2
+  static const String _fallbackVersion = '1.0.0';
+  static const String _fallbackBuild = '1';
 
   @override
   void initState() {
@@ -1251,10 +1340,651 @@ class _LoginPageState extends State<LoginPage> {
       // Don't await this - let it run in background
       _initializeDatabase();
     }
+    
+    // Load version info immediately
+    _loadVersionInfo();
+    
+    // Check if this is an update reload
+    _checkIfUpdateReload();
+    
+    // Reload version info after a delay to ensure new bundle is loaded (important after update)
+    // This helps catch the new version after cache clear and reload
+    Future.delayed(const Duration(seconds: 1), () {
+      if (mounted) {
+        _loadVersionInfo(); // Reload version info
+      }
+    });
+    
+    // Delay update check to ensure page is fully loaded and any cached content is cleared
+    // This is especially important after a hard reload
+    Future.delayed(const Duration(seconds: 3), () {
+      if (mounted) {
+        _checkForUpdates();
+      }
+    });
+    
+    // Set up periodic update checks (every 5 minutes)
+    // This ensures the app automatically detects new versions even if user doesn't refresh
+    _updateCheckTimer = Timer.periodic(const Duration(minutes: 5), (timer) {
+      if (mounted) {
+        print('Periodic update check triggered');
+        _loadVersionInfo(); // Reload version to catch any automatic updates
+        _checkForUpdates(); // Check for new versions from backend
+      }
+    });
+  }
+  
+  
+  // Check if this page load was triggered by an update
+  Future<void> _checkIfUpdateReload() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final updatingApp = prefs.getBool('updating_app') ?? false;
+      final updateStartedAt = prefs.getString('update_started_at');
+      
+      if (updatingApp && updateStartedAt != null) {
+        print('This is an update reload, will verify version after short delay');
+        
+        // Suppress update notifications during the update process
+        setState(() {
+          _updateAvailable = false;
+        });
+        
+        // After a short delay, check if version updated and clear flags
+        // Reduced delay for faster update verification
+        Future.delayed(const Duration(seconds: 2), () async {
+          try {
+            // Reload version info once (faster update check)
+            await _loadVersionInfo();
+            
+            // Check if version now matches backend
+            String currentVersion = '';
+            
+            // On web, use fallback directly (package_info_plus doesn't work on web)
+            if (kIsWeb) {
+              currentVersion = '$_fallbackVersion+$_fallbackBuild';
+              print('Running on web - using fallback version: $currentVersion');
+            } else {
+              // Try to get version from PackageInfo (for mobile/native)
+              // Reduced retries for faster update verification
+              for (int i = 0; i < 3; i++) {
+                try {
+                  if (i > 0) {
+                    await Future.delayed(Duration(milliseconds: 300)); // Shorter delay
+                  }
+                  final packageInfo = await PackageInfo.fromPlatform();
+                  if (packageInfo.version.isNotEmpty && packageInfo.buildNumber.isNotEmpty) {
+                    currentVersion = '${packageInfo.version}+${packageInfo.buildNumber}';
+                    print('Got version on attempt ${i + 1}: $currentVersion');
+                    break;
+                  }
+                } catch (e) {
+                  // Handle MissingPluginException
+                  if (e.toString().contains('MissingPluginException') || 
+                      e.toString().contains('no implementation found')) {
+                    print('PackageInfo plugin not available, using fallback');
+                    currentVersion = '$_fallbackVersion+$_fallbackBuild';
+                    break;
+                  }
+                  print('Error getting version (attempt ${i + 1}): $e');
+                }
+              }
+              
+              // Fallback if all retries failed - must match pubspec.yaml
+              if (currentVersion.isEmpty) {
+                currentVersion = '$_fallbackVersion+$_fallbackBuild';
+                print('Using fallback version for comparison: $currentVersion');
+              }
+            }
+            
+            try {
+              final response = await http.get(
+                Uri.parse('${DatabaseService.baseUrl}/app/version'),
+              ).timeout(const Duration(seconds: 3));
+              
+              if (response.statusCode == 200) {
+                final data = jsonDecode(response.body);
+                final latestVersion = '${data['version']}+${data['build']}';
+                
+                if (currentVersion == latestVersion) {
+                  print('Update successful! Version now matches: $currentVersion');
+                  // Clear the update flag and last_update_version
+                  await prefs.remove('updating_app');
+                  await prefs.remove('update_started_at');
+                  await prefs.remove('last_update_version');
+                  
+                  // Update UI
+                  if (mounted) {
+                    setState(() {
+                      _updateAvailable = false;
+                      _latestVersion = null;
+                    });
+                  }
+                  print('Update flags cleared - version matches');
+                } else {
+                  print('Version still doesn\'t match. Current: $currentVersion, Latest: $latestVersion');
+                  print('This might mean the new version hasn\'t been deployed to the server yet.');
+                  // Don't clear flags yet - wait a bit longer and check again
+                  // But clear them after a shorter timeout to prevent infinite suppression
+                  Future.delayed(const Duration(seconds: 10), () async {
+                    final prefs = await SharedPreferences.getInstance();
+                    await prefs.remove('updating_app');
+                    await prefs.remove('update_started_at');
+                    print('Update flags cleared after timeout');
+                  });
+                }
+              }
+            } catch (e) {
+              print('Error checking version after update: $e');
+              // Clear flags after error to prevent infinite suppression
+              Future.delayed(const Duration(seconds: 8), () async {
+                final prefs = await SharedPreferences.getInstance();
+                await prefs.remove('updating_app');
+                await prefs.remove('update_started_at');
+                print('Update flags cleared after error timeout');
+              });
+            }
+          } catch (e) {
+            print('Error in update reload check: $e');
+          }
+        });
+      }
+    } catch (e) {
+      print('Error checking update reload: $e');
+    }
+  }
+  
+  // Load app version info with retry logic for mobile
+  Future<void> _loadVersionInfo({int retryCount = 0}) async {
+    const maxRetries = 3;
+    const retryDelay = Duration(milliseconds: 500);
+    
+    // On web, package_info_plus doesn't work reliably, use fallback directly
+    if (kIsWeb) {
+      print('Running on web - using fallback version: $_fallbackVersion+$_fallbackBuild');
+      setState(() {
+        _appVersion = _fallbackVersion;
+        _buildNumber = _fallbackBuild;
+      });
+      return;
+    }
+    
+    try {
+      final packageInfo = await PackageInfo.fromPlatform();
+      final version = packageInfo.version;
+      final build = packageInfo.buildNumber;
+      
+      print('PackageInfo (attempt ${retryCount + 1}) - version: "$version", build: "$build"');
+      
+      // Validate that we got valid version info
+      if (version.isNotEmpty && build.isNotEmpty) {
+        print('Setting version to: $version+$build');
+        setState(() {
+          _appVersion = version;
+          _buildNumber = build;
+        });
+        return; // Success, exit
+      } else {
+        print('PackageInfo returned empty values - version: "$version", build: "$build"');
+      }
+    } catch (e) {
+      // Handle MissingPluginException specifically (common on web)
+      if (e.toString().contains('MissingPluginException') || 
+          e.toString().contains('no implementation found')) {
+        print('PackageInfo plugin not available (web or plugin issue), using fallback');
+        setState(() {
+          _appVersion = _fallbackVersion;
+          _buildNumber = _fallbackBuild;
+        });
+        return;
+      }
+      print('Error loading version info (attempt ${retryCount + 1}): $e');
+    }
+    
+    // If we got here, PackageInfo failed or returned empty
+    // Retry if we haven't exceeded max retries
+    if (retryCount < maxRetries) {
+      print('Retrying version load in ${retryDelay.inMilliseconds}ms...');
+      await Future.delayed(retryDelay);
+      return _loadVersionInfo(retryCount: retryCount + 1);
+    }
+    
+    // All retries failed - use fallback
+    // IMPORTANT: This fallback MUST match pubspec.yaml version
+    print('All retries failed, using fallback version: $_fallbackVersion+$_fallbackBuild');
+    setState(() {
+      _appVersion = _fallbackVersion;
+      _buildNumber = _fallbackBuild;
+    });
+  }
+  
+  // Check for app updates
+  Future<void> _checkForUpdates() async {
+    try {
+      // Skip update check if we just updated (within last 5 seconds)
+      // This prevents the notification from reappearing immediately after update
+      final prefs = await SharedPreferences.getInstance();
+      final updateStartedAt = prefs.getString('update_started_at');
+      if (updateStartedAt != null) {
+        try {
+          final updateTime = DateTime.parse(updateStartedAt);
+          final timeSinceUpdate = DateTime.now().difference(updateTime);
+          if (timeSinceUpdate.inSeconds < 5) {
+            print('Skipping update check - update was just performed ${timeSinceUpdate.inSeconds}s ago');
+            return; // Skip this check, we're still in the update process
+          }
+        } catch (e) {
+          print('Error parsing update_started_at: $e');
+        }
+      }
+      
+      // Get current version with retry logic
+      String currentVersion = ''; // Initialize to empty string
+      int retryCount = 0;
+      const maxRetries = 3;
+      
+      // On web, package_info_plus doesn't work reliably, use fallback directly
+      if (kIsWeb) {
+        currentVersion = '$_fallbackVersion+$_fallbackBuild';
+        print('Running on web - using fallback version for comparison: $currentVersion');
+      } else {
+        // Try to get version from PackageInfo (for mobile/native)
+        while (retryCount < maxRetries) {
+          try {
+            final packageInfo = await PackageInfo.fromPlatform();
+            final version = packageInfo.version;
+            final build = packageInfo.buildNumber;
+            
+            if (version.isNotEmpty && build.isNotEmpty) {
+              currentVersion = '$version+$build';
+              print('✓ PackageInfo success (attempt ${retryCount + 1}): version="$version", build="$build"');
+              print('✓ Current app version: $currentVersion');
+              break; // Success
+            } else {
+              print('✗ PackageInfo returned empty - version: "$version", build: "$build"');
+            }
+          } catch (e) {
+            // Handle MissingPluginException specifically
+            if (e.toString().contains('MissingPluginException') || 
+                e.toString().contains('no implementation found')) {
+              print('PackageInfo plugin not available, using fallback');
+              currentVersion = '$_fallbackVersion+$_fallbackBuild';
+              break;
+            }
+            print('Error getting package info (attempt ${retryCount + 1}): $e');
+          }
+          
+          retryCount++;
+          if (retryCount < maxRetries) {
+            await Future.delayed(Duration(milliseconds: 500));
+          }
+        }
+        
+        // If all retries failed, use fallback matching pubspec.yaml
+        if (currentVersion.isEmpty) {
+          currentVersion = '$_fallbackVersion+$_fallbackBuild';
+          print('Using fallback version: $currentVersion');
+        }
+      }
+      
+      // Check if we've already shown update notification for this version
+      // (prefs was already declared above, reuse it)
+      final lastUpdateVersion = prefs.getString('last_update_version');
+      
+      // Check backend for latest version
+      try {
+        final response = await http.get(
+          Uri.parse('${DatabaseService.baseUrl}/app/version'),
+        ).timeout(const Duration(seconds: 3));
+        
+        if (response.statusCode == 200) {
+          final data = jsonDecode(response.body);
+          final latestVersion = data['version'] as String?;
+          final latestBuild = data['build'] as String?;
+          
+          if (latestVersion != null && latestBuild != null) {
+            final latestFullVersion = '$latestVersion+$latestBuild';
+            print('=== UPDATE CHECK ===');
+            print('Latest version from backend: $latestFullVersion');
+            print('Current app version: $currentVersion');
+            print('lastUpdateVersion (from SharedPreferences): $lastUpdateVersion');
+            print('Versions match: ${latestFullVersion == currentVersion}');
+            print('Comparison: "$latestFullVersion" != "$currentVersion" = ${latestFullVersion != currentVersion}');
+            
+            // Check if we're in the middle of an update process
+            final updateStartedAt = prefs.getString('update_started_at');
+            bool isUpdating = false;
+            if (updateStartedAt != null) {
+              try {
+                final updateTime = DateTime.parse(updateStartedAt);
+                final timeSinceUpdate = DateTime.now().difference(updateTime);
+                if (timeSinceUpdate.inSeconds < 5) {
+                  isUpdating = true;
+                  print('Update in progress (${timeSinceUpdate.inSeconds}s ago) - suppressing notification');
+                }
+              } catch (e) {
+                print('Error parsing update_started_at: $e');
+              }
+            }
+            
+            // Automatically update when versions are different
+            // No notification popup - update happens silently in the background
+            // BUT: Don't update if we're already in the middle of an update
+            if (latestFullVersion != currentVersion && !isUpdating) {
+              print('>>> UPDATE AVAILABLE! <<<');
+              print('Latest: $latestFullVersion, Current: $currentVersion');
+              print('Auto-updating silently (no notification)...');
+              
+              // Save that we're updating
+              await prefs.setString('last_update_version', latestFullVersion);
+              
+              // Automatically trigger update without showing notification
+              // Update happens immediately without delay
+              _handleUpdateSilently();
+            } else if (latestFullVersion == currentVersion) {
+              // Version matches - we're up to date!
+              print('>>> VERSION IS UP TO DATE <<<');
+              print('Current: $currentVersion matches Latest: $latestFullVersion');
+              print('No update notification needed (versions are the same).');
+              
+              // Clear any stored update notification flag
+              await prefs.remove('last_update_version');
+              
+              // Clear update available flag
+              setState(() {
+                _updateAvailable = false;
+                _latestVersion = null;
+              });
+              
+              // Reload version info to ensure UI shows correct version
+              _loadVersionInfo();
+            } else {
+              print('>>> UNEXPECTED STATE <<<');
+              print('Latest: $latestFullVersion, Current: $currentVersion');
+              print('Neither condition matched - this should not happen!');
+            }
+          }
+        }
+      } catch (e) {
+        // Backend endpoint might not exist yet, that's okay
+        print('Update check failed (endpoint may not exist): $e');
+      }
+    } catch (e) {
+      print('Error checking for updates: $e');
+    }
+  }
+  
+  // Show update notification dialog
+  void _showUpdateNotification() {
+    print('=== _showUpdateNotification() called ===');
+    print('_updateAvailable: $_updateAvailable');
+    print('_latestVersion: $_latestVersion');
+    print('mounted: $mounted');
+    
+    final screenWidth = MediaQuery.of(context).size.width;
+    final isSmallScreen = screenWidth < 600;
+    
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: Row(
+          children: [
+            Icon(Icons.system_update, color: Colors.orange, size: isSmallScreen ? 24 : 28),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                'Update Available',
+                style: TextStyle(fontSize: isSmallScreen ? 18 : 20),
+              ),
+            ),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'A new version of the app is available!',
+              style: TextStyle(fontSize: isSmallScreen ? 14 : 16),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'Current Version: $_appVersion+$_buildNumber',
+              style: TextStyle(
+                fontSize: isSmallScreen ? 12 : 14,
+                color: Colors.grey[600],
+              ),
+            ),
+            Text(
+              'Latest Version: $_latestVersion',
+              style: TextStyle(
+                fontSize: isSmallScreen ? 12 : 14,
+                color: Colors.grey[600],
+              ),
+            ),
+            const SizedBox(height: 16),
+            Text(
+              'Would you like to update now?',
+              style: TextStyle(fontSize: isSmallScreen ? 14 : 16),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.of(context).pop();
+            },
+            child: Text(
+              'Later',
+              style: TextStyle(fontSize: isSmallScreen ? 14 : 16),
+            ),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.of(context).pop();
+              _handleUpdate();
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.blue,
+              foregroundColor: Colors.white,
+            ),
+            child: Text(
+              'Update Now',
+              style: TextStyle(fontSize: isSmallScreen ? 14 : 16),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+  
+  // Handle app update silently - no UI, automatic update
+  Future<void> _handleUpdateSilently() async {
+    try {
+      print('Starting silent automatic update...');
+      
+      // Set update flags
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('updating_app', true);
+      await prefs.setString('update_started_at', DateTime.now().toIso8601String());
+      
+      // For PWA/web, delete all caches and reload immediately
+      if (kIsWeb) {
+        await _deleteAllCachesAndReload();
+      } else {
+        // For native mobile apps, we can't auto-update, but we'll try to reload
+        // The app will check for updates on next launch
+        print('Native app detected - update will be applied on next app restart');
+      }
+    } catch (e) {
+      print('Error handling silent update: $e');
+    }
+  }
+  
+  // Handle app update - simple approach: delete caches and reload
+  Future<void> _handleUpdate() async {
+    try {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Updating app... Clearing cache and reloading...'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+        
+        // Clear the update notification flag so we can check again after reload
+        final prefs = await SharedPreferences.getInstance();
+        // Don't remove last_update_version here - we'll check after reload
+        // Instead, set a flag that we're about to update
+        await prefs.setBool('updating_app', true);
+        await prefs.setString('update_started_at', DateTime.now().toIso8601String());
+        
+        // For PWA/web, delete all caches and reload
+        if (kIsWeb) {
+          await _deleteAllCachesAndReload();
+        } else {
+          // For mobile apps, show instructions
+          if (mounted) {
+            showDialog(
+              context: context,
+              builder: (context) => AlertDialog(
+                title: const Text('Update Instructions'),
+                content: const Text(
+                  'To update the app:\n\n'
+                  '1. Close the app completely\n'
+                  '2. Reopen the app from your app launcher\n\n'
+                  'The app will automatically download the latest version.',
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () {
+                      Navigator.of(context).pop();
+                    },
+                    child: const Text('OK'),
+                  ),
+                ],
+              ),
+            );
+          }
+        }
+      }
+    } catch (e) {
+      print('Error handling update: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error updating app: $e'),
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+    }
+  }
+  
+  // Aggressive cache deletion and reload for mobile PWA updates
+  Future<void> _deleteAllCachesAndReload() async {
+    try {
+      print('Starting aggressive cache deletion and reload...');
+      
+      // Step 1: Clear all storage (localStorage, sessionStorage)
+      try {
+        html.window.localStorage.clear();
+        html.window.sessionStorage.clear();
+        print('Local and session storage cleared');
+      } catch (e) {
+        print('Error clearing storage: $e');
+      }
+      
+      // Step 2: Delete all caches FIRST (before unregistering service worker)
+      final caches = html.window.caches;
+      if (caches != null) {
+        try {
+          final cacheNames = await caches.keys();
+          print('Found ${cacheNames.length} caches to delete');
+          for (var cacheName in cacheNames) {
+            await caches.delete(cacheName);
+            print('Cache deleted: $cacheName');
+          }
+          // Wait a bit to ensure cache deletion completes
+          await Future.delayed(const Duration(milliseconds: 200));
+        } catch (e) {
+          print('Error deleting caches: $e');
+        }
+      }
+      
+      // Step 3: Unregister all service workers
+      final serviceWorker = html.window.navigator.serviceWorker;
+      if (serviceWorker != null) {
+        try {
+          final registrations = await serviceWorker.getRegistrations();
+          print('Found ${registrations.length} service workers to unregister');
+          for (var registration in registrations) {
+            // Send message to skip waiting first
+            if (registration.installing != null) {
+              registration.installing!.postMessage({'type': 'SKIP_WAITING'});
+            }
+            if (registration.waiting != null) {
+              registration.waiting!.postMessage({'type': 'SKIP_WAITING'});
+            }
+            if (registration.active != null) {
+              registration.active!.postMessage({'type': 'SKIP_WAITING'});
+            }
+            // Now unregister
+            final unregistered = await registration.unregister();
+            print('Service worker unregistered: $unregistered');
+          }
+          // Wait for unregistration to complete
+          await Future.delayed(const Duration(milliseconds: 300));
+        } catch (e) {
+          print('Error unregistering service workers: $e');
+        }
+      }
+      
+      // Step 4: Force navigation to base URL with cache-busting parameters
+      print('Forcing page reload with cache bypass...');
+      final origin = html.window.location.origin;
+      final pathname = html.window.location.pathname;
+      final timestamp = DateTime.now().millisecondsSinceEpoch;
+      final random = (timestamp % 100000).toString();
+      
+      // Navigate to base URL with multiple cache-busting parameters
+      final reloadUrl = '$origin$pathname?_update=$timestamp&_cb=$random&_nocache=true';
+      
+      print('Navigating to: $reloadUrl');
+      
+      // Use location.replace to avoid history entry
+      html.window.location.replace(reloadUrl);
+      
+      // If that doesn't work, try location.href after a delay
+      Future.delayed(const Duration(milliseconds: 1000), () {
+        try {
+          print('Fallback: forcing reload via location.href');
+          html.window.location.href = reloadUrl;
+        } catch (e) {
+          print('Error with location.href fallback: $e');
+          // Last resort: regular reload
+          try {
+            html.window.location.reload();
+          } catch (e2) {
+            print('Error with final reload: $e2');
+          }
+        }
+      });
+    } catch (e) {
+      print('Error in deleteAllCachesAndReload: $e');
+      // Last resort: try regular reload
+      try {
+        html.window.location.reload();
+      } catch (e2) {
+        print('Error with final reload attempt: $e2');
+      }
+    }
   }
 
   @override
   void dispose() {
+    _updateCheckTimer?.cancel();
     _emailController.dispose();
     _passwordController.dispose();
     _nameController.dispose();
@@ -1795,6 +2525,19 @@ class _LoginPageState extends State<LoginPage> {
                           style: TextStyle(
                             fontSize: isVerySmallScreen ? 12 : 14,
                           ),
+                        ),
+                      ),
+                      // Version display at bottom
+                      SizedBox(height: isVerySmallScreen ? 12 : 16),
+                      Padding(
+                        padding: EdgeInsets.only(top: isVerySmallScreen ? 8 : 12),
+                        child: Text(
+                          'Version $_appVersion+$_buildNumber',
+                          style: TextStyle(
+                            fontSize: isVerySmallScreen ? 10 : 12,
+                            color: Colors.grey[600],
+                          ),
+                          textAlign: TextAlign.center,
                         ),
                       ),
                     ],

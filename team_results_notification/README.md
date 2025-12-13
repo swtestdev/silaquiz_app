@@ -1,6 +1,6 @@
 # team_results_notification
 
-A new Flutter project.
+A Progressive Web App (PWA) built with Flutter for interactive quizzes and team management.
 
 ## Getting Started
 
@@ -14,3 +14,7 @@ A few resources to get you started if this is your first Flutter project:
 For help getting started with Flutter development, view the
 [online documentation](https://docs.flutter.dev/), which offers tutorials,
 samples, guidance on mobile development, and a full API reference.
+
+## Documentation
+
+- **[Version Management Guide](VERSION_MANAGEMENT.md)** - Complete guide on managing app versions, build numbers, and service worker cache versions for PWA updates.

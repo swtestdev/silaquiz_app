@@ -1,5 +1,10 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io' show Platform;
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 import '../services/user_data_service.dart';
 import 'login_page.dart'; // For DatabaseService
 
@@ -57,9 +62,29 @@ class _QuestionPageState extends State<QuestionPage> {
   Timer? _writerStatusCheckTimer;
   bool _isAppVisible = true;
   
+  // Game data cache - keyed by question ID (primary key from game table)
+  Map<int, Map<String, dynamic>> _gameData = {};
+  
+  // Current game name for persistent storage
+  String _currentGameNameForStorage = '';
+  
+  // Auto-save timer (debounced)
+  Timer? _autoSaveTimer;
+  
   @override
   void initState() {
     super.initState();
+    
+    // Check if page was refreshed (no navigation history)
+    // If so, navigate to main page (same as back button behavior)
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && !Navigator.canPop(context)) {
+        print('QuestionPage: Page refreshed (no navigation history), redirecting to main page');
+        Navigator.pushReplacementNamed(context, '/main');
+        return;
+      }
+    });
+    
     // Initialize timer_counter_down to 0 when player enters question_page
     timer_counter_down = 0;
     _loadUserData();
@@ -77,6 +102,10 @@ class _QuestionPageState extends State<QuestionPage> {
     _writerStatusCheckTimer?.cancel();
     _blinkTimer?.cancel();
     _stopCountdownTimer?.cancel();
+    _autoSaveTimer?.cancel();
+    
+    // Save answers before disposing
+    _saveAnswers();
     
     // Unregister timer message handler
     if (_globalTimerMessageHandler == _handleTimerTrigger) {
@@ -84,6 +113,14 @@ class _QuestionPageState extends State<QuestionPage> {
       print('QuestionPage: Unregistered from timer messages');
     }
     super.dispose();
+  }
+  
+  /// Trigger auto-save with debounce (saves after 2 seconds of no changes)
+  void _triggerAutoSave() {
+    _autoSaveTimer?.cancel();
+    _autoSaveTimer = Timer(const Duration(seconds: 2), () {
+      _saveAnswers();
+    });
   }
 
   Future<void> _loadUserData() async {
@@ -172,7 +209,348 @@ class _QuestionPageState extends State<QuestionPage> {
   }
 
   Future<void> build_question_board(Map<String, dynamic> message) async {
-    // TODO: Implement build_question_board
+    try {
+      final roundName = message['round_name'] as String?;
+      final questionId = message['question_id'];
+      
+      if (roundName == null) {
+        print('QuestionPage: round_name is null in message');
+        return;
+      }
+      
+      print('QuestionPage: Building question board for round: $roundName, question_id: $questionId');
+      
+      // Get active game to get game name
+      final activeGame = await _getActiveGame();
+      if (activeGame == null) {
+        print('QuestionPage: No active game found');
+        return;
+      }
+      
+      final gameName = activeGame['game_name'] as String?;
+      if (gameName == null) {
+        print('QuestionPage: Game name is null');
+        return;
+      }
+      
+      // Update current game name for storage
+      _currentGameNameForStorage = gameName;
+      
+      // Load game data into cache if not already loaded
+      if (_gameData.isEmpty) {
+        await _loadGameDataIntoCache(gameName, roundName);
+      }
+      
+      // Get user's team ID
+      final userData = await UserDataService.getUserData();
+      final teamIdRaw = userData?['playing_in_team_id'];
+      if (teamIdRaw == null) {
+        print('QuestionPage: User has no team ID');
+        return;
+      }
+      
+      // Convert team ID to string for storage key (handles both int and string)
+      final teamId = teamIdRaw.toString();
+      
+      // Load saved answers from persistent storage
+      final savedAnswers = await _loadSavedAnswers(gameName, teamId);
+      
+      // Build answers list from game data and saved answers
+      await _buildAnswersFromGameData(roundName, questionId, savedAnswers);
+      
+      // Update game info
+      _updateGameInfo(activeGame);
+      
+    } catch (e) {
+      print('QuestionPage: Error in build_question_board: $e');
+    }
+  }
+  
+  /// Load all game data for a round into the cache dictionary
+  /// Key: question ID (primary key), Value: all row data as Map
+  Future<void> _loadGameDataIntoCache(String gameName, String roundName) async {
+    try {
+      print('QuestionPage: Loading game data into cache for game: $gameName, round: $roundName');
+      
+      final gameDataList = await DatabaseService.getGameQuestionsByRound(gameName, roundName);
+      
+      // Clear existing cache
+      _gameData.clear();
+      
+      // Populate cache with question ID as key
+      for (var question in gameDataList) {
+        final questionId = question['id'] as int?;
+        if (questionId != null) {
+          _gameData[questionId] = Map<String, dynamic>.from(question);
+        }
+      }
+      
+      print('QuestionPage: Loaded ${_gameData.length} questions into cache');
+    } catch (e) {
+      print('QuestionPage: Error loading game data into cache: $e');
+    }
+  }
+  
+  /// Build answers list from cached game data and saved answers
+  Future<void> _buildAnswersFromGameData(
+    String roundName,
+    dynamic questionId,
+    Map<int, Map<String, dynamic>> savedAnswers,
+  ) async {
+    try {
+      final mergedAnswers = <Map<String, dynamic>>[];
+      
+      // Get active game to check round_timer
+      final activeGame = await _getActiveGame();
+      final roundTimer = activeGame?['round_timer'] as int? ?? 0;
+      
+      // Process each question from cached game data
+      for (var entry in _gameData.entries) {
+        final qId = entry.key;
+        final question = entry.value;
+        
+        // Determine if answer should be enabled for editing
+        final isEnabled = roundTimer > 0 || (questionId != null && qId == questionId);
+        
+        // Get saved answer if exists
+        final savedAnswer = savedAnswers[qId];
+        final answerText = savedAnswer?['answer'] as String? ?? '';
+        final isSelected = savedAnswer?['selected'] as bool? ?? false;
+        
+        // Get question data
+        final answersForSelection = question['answers_for_selection'] as String?;
+        final questionNumer = question['question_num'] as int? ?? qId;
+        final bonusScore = question['bonus_score'] as String? ?? '0;0';
+        
+        // Determine input type
+        String inputType = 'text';
+        List<String> options = [];
+        
+        if (answersForSelection != null && 
+            answersForSelection.isNotEmpty && 
+            answersForSelection != '=') {
+          options = answersForSelection.split(',').map((e) => e.trim()).toList();
+          if (options.length == 1) {
+            inputType = 'radio';
+          } else if (options.length > 1) {
+            inputType = 'list';
+          }
+        }
+        
+        // Determine checkbox state
+        bool checkboxEnabled = true;
+        final bonusParts = bonusScore.split(';');
+        final bonusCorrect = int.tryParse(bonusParts[0]) ?? 0;
+        final bonusWrong = int.tryParse(bonusParts.length > 1 ? bonusParts[1] : '0') ?? 0;
+        
+        if (bonusCorrect == 0 && bonusWrong == 0) {
+          checkboxEnabled = false;
+        }
+        
+        mergedAnswers.add({
+          'id': qId,
+          'num': questionNumer,
+          'inputType': inputType,
+          'options': options,
+          'value': answerText,
+          'selected': isSelected,
+          'enabled': isEnabled,
+          'checkboxEnabled': checkboxEnabled,
+        });
+      }
+      
+      setState(() {
+        _answers = mergedAnswers;
+      });
+      
+      print('QuestionPage: Built ${mergedAnswers.length} answers from game data');
+    } catch (e) {
+      print('QuestionPage: Error building answers from game data: $e');
+    }
+  }
+  
+  /// Update game info from active game
+  void _updateGameInfo(Map<String, dynamic> activeGame) {
+    try {
+      final gameName = activeGame['game_name'] as String? ?? 'Current Game';
+      
+      // Get reg_score and bonus_score from first question in cache
+      if (_gameData.isNotEmpty) {
+        final firstQuestion = _gameData.values.first;
+        final regScoreStr = firstQuestion['reg_score'] as String? ?? '1;0';
+        final regParts = regScoreStr.split(';');
+        final regScore = int.tryParse(regParts[0]) ?? 1;
+        final regScoreTotal = int.tryParse(regParts.length > 1 ? regParts[1] : '0') ?? 0;
+        
+        final bonusScoreStr = firstQuestion['bonus_score'] as String? ?? '0;0';
+        final bonusParts = bonusScoreStr.split(';');
+        final bonusScore = int.tryParse(bonusParts[0]) ?? 0;
+        final bonusScoreTotal = int.tryParse(bonusParts.length > 1 ? bonusParts[1] : '0') ?? 0;
+        
+        setState(() {
+          _gameName = gameName;
+          _regScore = regScore;
+          _regScoreTotal = regScoreTotal;
+          _bonusScore = bonusScore;
+          _bonusScoreTotal = bonusScoreTotal;
+        });
+      } else {
+        setState(() {
+          _gameName = gameName;
+        });
+      }
+    } catch (e) {
+      print('QuestionPage: Error updating game info: $e');
+    }
+  }
+  
+  /// Get active game from backend
+  Future<Map<String, dynamic>?> _getActiveGame() async {
+    try {
+      final userData = await UserDataService.getUserData();
+      if (userData == null || userData['access_token'] == null) {
+        return null;
+      }
+      
+      final response = await http.get(
+        Uri.parse('${DatabaseService.baseUrl}/active-games'),
+        headers: {
+          'Authorization': 'Bearer ${userData['access_token']}',
+          'Content-Type': 'application/json',
+        },
+      );
+      
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body) as List;
+        if (data.isNotEmpty) {
+          // Get the first active game that is running
+          for (var game in data) {
+            if (game['is_started'] == 'running') {
+              return game as Map<String, dynamic>;
+            }
+          }
+          // If no running game, return the first one
+          return data[0] as Map<String, dynamic>;
+        }
+      }
+      return null;
+    } catch (e) {
+      print('Error fetching active game: $e');
+      return null;
+    }
+  }
+  
+  /// Load saved answers from persistent storage
+  /// Returns: Map<question_id, answer_data>
+  Future<Map<int, Map<String, dynamic>>> _loadSavedAnswers(String gameName, String teamId) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      // Normalize game name for storage (remove spaces, special chars)
+      final gameNameSafe = gameName.replaceAll(' ', '_').replaceAll('-', '_').toLowerCase();
+      final storageKey = 'game_answers_${gameNameSafe}_team_$teamId';
+      final savedDataJson = prefs.getString(storageKey);
+      
+      if (savedDataJson == null || savedDataJson.isEmpty) {
+        print('QuestionPage: No saved answers found for game: $gameName, team: $teamId');
+        return {};
+      }
+      
+      final savedData = json.decode(savedDataJson) as Map<String, dynamic>;
+      
+      // Convert string keys to int keys
+      final result = <int, Map<String, dynamic>>{};
+      for (var entry in savedData.entries) {
+        final questionId = int.tryParse(entry.key);
+        if (questionId != null) {
+          result[questionId] = Map<String, dynamic>.from(entry.value);
+        }
+      }
+      
+      print('QuestionPage: Loaded ${result.length} saved answers for game: $gameName, team: $teamId');
+      return result;
+    } catch (e) {
+      print('QuestionPage: Error loading saved answers: $e');
+      return {};
+    }
+  }
+  
+  /// Save answers to persistent storage
+  Future<void> _saveAnswers() async {
+    try {
+      if (_currentGameNameForStorage.isEmpty) {
+        print('QuestionPage: Cannot save answers - no game name set');
+        return;
+      }
+      
+      final userData = await UserDataService.getUserData();
+      final teamIdRaw = userData?['playing_in_team_id'];
+      if (teamIdRaw == null) {
+        print('QuestionPage: Cannot save answers - no team ID');
+        return;
+      }
+      
+      // Convert team ID to string for storage key
+      final teamId = teamIdRaw.toString();
+      
+      final prefs = await SharedPreferences.getInstance();
+      // Normalize game name for storage (remove spaces, special chars)
+      final gameNameSafe = _currentGameNameForStorage.replaceAll(' ', '_').replaceAll('-', '_').toLowerCase();
+      final storageKey = 'game_answers_${gameNameSafe}_team_$teamId';
+      
+      // Convert answers to map keyed by question ID
+      final answersMap = <String, Map<String, dynamic>>{};
+      for (var answer in _answers) {
+        final questionId = answer['id'] as int?;
+        if (questionId != null) {
+          answersMap[questionId.toString()] = {
+            'answer': answer['value'] as String? ?? '',
+            'selected': answer['selected'] as bool? ?? false,
+          };
+        }
+      }
+      
+      // Save to persistent storage
+      await prefs.setString(storageKey, json.encode(answersMap));
+      
+      // Print storage location info for debugging
+      _printStorageLocation(storageKey);
+      
+      print('QuestionPage: Saved ${answersMap.length} answers for game: $_currentGameNameForStorage, team: $teamId');
+      print('QuestionPage: Storage key: $storageKey');
+    } catch (e) {
+      print('QuestionPage: Error saving answers: $e');
+    }
+  }
+  
+  /// Print storage location information for debugging
+  void _printStorageLocation(String storageKey) {
+    try {
+      print('=== PERSISTENT STORAGE LOCATION ===');
+      print('Storage Key: $storageKey');
+      
+      if (kIsWeb) {
+        print('Platform: Web (Browser)');
+        print('Location: Browser localStorage');
+        print('Access: Open DevTools (F12) → Application/Storage → Local Storage → Your Domain');
+        print('Storage Key Format: game_answers_{gameName}_team_{teamId}');
+        print('Example: $storageKey');
+      } else if (!kIsWeb && Platform.isAndroid) {
+        print('Platform: Android');
+        print('Location: /data/data/{package_name}/shared_prefs/FlutterSharedPreferences.xml');
+        print('Package: Check android/app/build.gradle for applicationId');
+        print('Access: Requires root or ADB: adb shell run-as {package} cat /data/data/{package}/shared_prefs/FlutterSharedPreferences.xml');
+      } else if (!kIsWeb && Platform.isIOS) {
+        print('Platform: iOS');
+        print('Location: Library/Preferences/{bundle_id}.plist');
+        print('Bundle ID: Check ios/Runner/Info.plist');
+        print('Access: Requires device access or Xcode');
+      }
+      print('===================================');
+    } catch (e) {
+      // If platform detection fails, just print basic info
+      print('Storage Key: $storageKey');
+      print('Platform detection failed: $e');
+    }
   }
 
   Future<void> timer_trigger_action() async {
@@ -631,28 +1009,30 @@ class _QuestionPageState extends State<QuestionPage> {
                             child: _buildDynamicInput(answer, index),
                           ),
                           const SizedBox(width: 8),
-                          // Right side: Num field
+                          // Right side: Num label (non-editable)
                           SizedBox(
                             width: 60,
-                            child: TextField(
-                              decoration: const InputDecoration(
-                                labelText: 'Num',
-                                border: OutlineInputBorder(),
-                                contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-                              ),
-                              keyboardType: TextInputType.number,
-                              enabled: _isWriter,
-                              controller: TextEditingController(
-                                text: answer['num'].toString(),
-                              )..selection = TextSelection.fromPosition(
-                                TextPosition(offset: answer['num'].toString().length),
-                              ),
-                              onChanged: (value) {
-                                setState(() {
-                                  final numValue = int.tryParse(value) ?? 1;
-                                  _answers[index]['num'] = numValue;
-                                });
-                              },
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                const Text(
+                                  'Num',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w500,
+                                    color: Colors.grey,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  answer['num'].toString(),
+                                  style: const TextStyle(
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ],
                             ),
                           ),
                           const SizedBox(width: 8),
@@ -665,6 +1045,7 @@ class _QuestionPageState extends State<QuestionPage> {
                                     setState(() {
                                       _answers[index]['selected'] = value ?? false;
                                     });
+                                    _triggerAutoSave();
                                   },
                           ),
                         ],
@@ -721,6 +1102,7 @@ class _QuestionPageState extends State<QuestionPage> {
                     setState(() {
                       _answers[index]['value'] = value ?? '';
                     });
+                    _triggerAutoSave();
                   }
                 : null,
             contentPadding: EdgeInsets.zero,
@@ -761,6 +1143,7 @@ class _QuestionPageState extends State<QuestionPage> {
                         }
                         _answers[index]['value'] = selectedValues.join(',');
                       });
+                      _triggerAutoSave();
                     }
                   : null,
               child: Container(
@@ -822,44 +1205,124 @@ class _QuestionPageState extends State<QuestionPage> {
         setState(() {
           _answers[index]['value'] = value;
         });
+        _triggerAutoSave();
       },
     );
   }
 
   Future<void> _handleSave() async {
-    // TODO: Implement save logic when backend is ready
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('Save functionality will be implemented with backend integration'),
-        duration: Duration(seconds: 2),
-      ),
-    );
+    try {
+      // Save answers to persistent storage
+      await _saveAnswers();
+      
+      // Also save to backend if needed (can be implemented later)
+      // For now, just save to local storage
+      
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Answers saved successfully'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
+    } catch (e) {
+      print('Error saving answers: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error saving answers: $e'),
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+    }
   }
 
   Future<void> _handleRefresh() async {
-    // TODO: Implement refresh logic when backend is ready
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('Refresh functionality will be implemented with backend integration'),
-        duration: Duration(seconds: 2),
-      ),
-    );
+    try {
+      // Reload game data and saved answers
+      if (_currentGameNameForStorage.isNotEmpty) {
+        final userData = await UserDataService.getUserData();
+        final teamIdRaw = userData?['playing_in_team_id'];
+        
+        if (teamIdRaw != null) {
+          // Convert team ID to string
+          final teamId = teamIdRaw.toString();
+          
+          // Reload saved answers
+          final savedAnswers = await _loadSavedAnswers(_currentGameNameForStorage, teamId);
+          
+          // Rebuild answers from cached game data and saved answers
+          // Get round name from current message or from first answer
+          String? roundName;
+          if (_answers.isNotEmpty && _gameData.isNotEmpty) {
+            // Try to get round name from game data
+            final firstQuestion = _gameData.values.first;
+            roundName = firstQuestion['round_name'] as String?;
+          }
+          
+          if (roundName != null) {
+            await _buildAnswersFromGameData(roundName, null, savedAnswers);
+          }
+          
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('Answers refreshed from saved data'),
+                duration: Duration(seconds: 2),
+              ),
+            );
+          }
+        }
+      }
+    } catch (e) {
+      print('Error refreshing answers: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error refreshing answers: $e'),
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+    }
+  }
+
+  // Handle back button press
+  Future<bool> _onWillPop() async {
+    // Check if we can pop (i.e., there's a previous route in the stack)
+    if (Navigator.canPop(context)) {
+      Navigator.pop(context);
+      return false; // Don't allow default back behavior
+    } else {
+      // No previous route (e.g., after page refresh), navigate to main page
+      Navigator.pushReplacementNamed(context, '/main');
+      return false; // Don't allow default back behavior
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Question Page'),
-        backgroundColor: Colors.blue,
-        foregroundColor: Colors.white,
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back),
-          onPressed: () {
-            Navigator.pop(context);
-          },
+    return PopScope(
+      canPop: false, // Prevent default back button behavior
+      onPopInvoked: (didPop) async {
+        if (!didPop) {
+          await _onWillPop();
+        }
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('Question Page'),
+          backgroundColor: Colors.blue,
+          foregroundColor: Colors.white,
+          leading: IconButton(
+            icon: const Icon(Icons.arrow_back),
+            onPressed: () {
+              _onWillPop();
+            },
+          ),
         ),
-      ),
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -893,6 +1356,7 @@ class _QuestionPageState extends State<QuestionPage> {
           ],
         ),
       ),
+    ),
     );
   }
 }
