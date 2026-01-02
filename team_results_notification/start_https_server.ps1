@@ -80,6 +80,16 @@ class MyHTTPRequestHandler(SimpleHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
         super().end_headers()
+    
+    def log_message(self, format, *args):
+        """Override to suppress harmless 404 errors for common non-existent resources"""
+        harmless_404s = ['/apilog', '/favicon.ico', '/robots.txt', '/apple-touch-icon.png']
+        if len(args) >= 1:
+            request_line = args[0] if args else ''
+            for harmless_path in harmless_404s:
+                if harmless_path in request_line and '404' in str(args):
+                    return
+        super().log_message(format, *args)
 
 with socketserver.TCPServer(('', $Port), MyHTTPRequestHandler) as httpd:
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

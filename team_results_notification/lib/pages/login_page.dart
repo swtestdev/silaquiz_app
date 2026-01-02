@@ -7,6 +7,7 @@ import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../services/user_data_service.dart';
 import 'dart:html' as html;
+import 'question_page.dart' show initializeTimerStatus;
 
 // API service class for authentication operations
 class DatabaseService {
@@ -336,6 +337,52 @@ class DatabaseService {
       return {
         'success': false,
         'message': 'Logout failed: ${e.toString()}'
+      };
+    }
+  }
+
+  // Get last timer setting from server
+  static Future<Map<String, dynamic>> getLastTimerSetting() async {
+    try {
+      final result = await _makeApiCall('/timer/last-setting');
+      print('getLastTimerSetting: Raw result from _makeApiCall: $result');
+      
+      // _makeApiCall wraps the response in {"success": true, "data": <response>}
+      // The backend returns {"success": True, "data": <timer_setting>}
+      // So result['data'] contains the backend response
+      if (result['success'] == true && result['data'] != null) {
+        final backendResponse = result['data'] as Map<String, dynamic>;
+        print('getLastTimerSetting: Backend response: $backendResponse');
+        
+        // Check if backend response has success and data fields
+        if (backendResponse['success'] == true && backendResponse['data'] != null) {
+          print('Last timer data: ${backendResponse['data']}');
+          return {
+            'success': true,
+            'data': backendResponse['data']
+          };
+        } else {
+          print('getLastTimerSetting: Backend returned success=false or data=null');
+          return {
+            'success': false,
+            'message': backendResponse['message'] ?? 'No timer setting available',
+            'data': null
+          };
+        }
+      } else {
+        print('getLastTimerSetting: _makeApiCall returned success=false or data=null');
+        return {
+          'success': false,
+          'message': result['message'] ?? 'No timer setting available',
+          'data': null
+        };
+      }
+    } catch (e) {
+      print('getLastTimerSetting: Exception: $e');
+      return {
+        'success': false,
+        'message': 'Error getting last timer setting: ${e.toString()}',
+        'data': null
       };
     }
   }
@@ -1102,6 +1149,38 @@ class DatabaseService {
         'success': false,
         'message': 'Connection failed: ${e.toString()}'
       };
+    }
+  }
+
+  /// Get all distinct rounds for a game
+  /// Returns list of round names
+  static Future<List<String>> getGameRounds(String gameName) async {
+    try {
+      final userData = await UserDataService.getUserData();
+      if (userData == null || userData['access_token'] == null) {
+        return [];
+      }
+      
+      final encodedGameName = Uri.encodeComponent(gameName);
+      
+      final response = await http.get(
+        Uri.parse('$_baseUrl/games/$encodedGameName/rounds'),
+        headers: {
+          'Authorization': 'Bearer ${userData['access_token']}',
+          'Content-Type': 'application/json',
+        },
+      );
+      
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        if (data is List) {
+          return data.cast<String>();
+        }
+      }
+      return [];
+    } catch (e) {
+      print('Error fetching game rounds: $e');
+      return [];
     }
   }
 
@@ -2127,6 +2206,9 @@ class _LoginPageState extends State<LoginPage> {
             'session_token': result['session_token'],
           };
           await UserDataService.saveUserData(userDataToSave);
+          
+          // Initialize timer status to Idle on login
+          await initializeTimerStatus();
           
           // If user has a team, fetch and save team name
           final userData = result['user'];

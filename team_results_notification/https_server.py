@@ -20,6 +20,22 @@ class MyHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
         super().end_headers()
+    
+    def log_message(self, format, *args):
+        """Override to suppress harmless 404 errors for common non-existent resources"""
+        # List of paths that commonly cause harmless 404 errors
+        harmless_404s = ['/apilog', '/favicon.ico', '/robots.txt', '/apple-touch-icon.png']
+        
+        # Check if this is a harmless 404
+        if len(args) >= 1:
+            request_line = args[0] if args else ''
+            for harmless_path in harmless_404s:
+                if harmless_path in request_line and '404' in str(args):
+                    # Suppress this log message
+                    return
+        
+        # Log all other messages normally
+        super().log_message(format, *args)
 
 def main():
     # Change to the directory containing the built Flutter web app

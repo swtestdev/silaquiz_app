@@ -7,7 +7,7 @@ import 'dart:html' as html;
 import '../widgets/user_info_widget.dart';
 import '../services/user_data_service.dart';
 import 'login_page.dart'; // For DatabaseService
-import 'question_page.dart' as question_page; // For timer message forwarding
+import 'question_page.dart' as question_page; // For timer message forwarding and initializeTimerStatus
 
 class MainPage extends StatefulWidget {
   const MainPage({super.key});
@@ -174,6 +174,35 @@ class _MainPageState extends State<MainPage> {
       print('No user data available, redirecting to login');
       Navigator.pushReplacementNamed(context, '/login');
       return;
+    }
+    
+    // Initialize timer status to Idle (in case of refresh or re-login)
+    await question_page.initializeTimerStatus();
+    
+    // Retrieve last timer setting from server and activate if needed
+    try {
+      final timerSettingResult = await DatabaseService.getLastTimerSetting();
+      if (timerSettingResult['success'] == true && timerSettingResult['data'] != null) {
+        final timerData = timerSettingResult['data'] as Map<String, dynamic>;
+        // Convert to the format expected by _handleGlobalTimer
+        final timerMessage = {
+          'type': 'timer_trigger',
+          'timer_action': timerData['timer_action'],
+          'slide_number': timerData['slide_number'],
+          'round_name': timerData['round_name'],
+          'timer_start': timerData['timer_start'],
+          'question_id': timerData['question_id'],
+          'final_timer': timerData['final_timer'],
+          'question_timer': timerData['question_timer']
+        };
+        // Activate the timer with the retrieved data
+        question_page.forwardTimerMessage(timerMessage);
+        print('MainPage: Retrieved and activated last timer setting from server');
+      } else {
+        print('MainPage: No timer setting available from server');
+      }
+    } catch (e) {
+      print('MainPage: Error retrieving last timer setting: $e');
     }
     
     // Set loading to false to show the UI
@@ -596,6 +625,9 @@ class _MainPageState extends State<MainPage> {
               _channel?.sink.close();
               _echoTimer?.cancel();
               
+              // Clear timer status on logout
+              await question_page.initializeTimerStatus();
+              
               // Clear user data
               await UserDataService.clearUserData();
               Navigator.pushReplacementNamed(context, '/splash');
@@ -847,7 +879,7 @@ class _MainPageState extends State<MainPage> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      'View Summary',
+                      'View Results',
                       style: TextStyle(
                         fontSize: 18,
                         fontWeight: FontWeight.bold,
@@ -856,7 +888,7 @@ class _MainPageState extends State<MainPage> {
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      'View your quiz results and statistics',
+                      'View your quiz results',
                       style: TextStyle(
                         fontSize: 14,
                         color: Colors.grey.shade600,
@@ -1104,6 +1136,9 @@ class _MainPageState extends State<MainPage> {
       
       // Cancel timers
       _echoTimer?.cancel();
+      
+      // Clear timer status on logout
+      await question_page.initializeTimerStatus();
       
       // Clear user data
       await UserDataService.clearUserData();

@@ -1,4 +1,6 @@
 import 'package:flutter/material.dart';
+import '../services/user_data_service.dart';
+import 'login_page.dart'; // For DatabaseService
 
 class SummaryPage extends StatefulWidget {
   const SummaryPage({super.key});
@@ -8,51 +10,195 @@ class SummaryPage extends StatefulWidget {
 }
 
 class _SummaryPageState extends State<SummaryPage> {
-  int _score = 0;
-  int _totalQuestions = 5;
-  int _correctAnswers = 0;
-  double _percentage = 0.0;
-  String _grade = '';
-  String _message = '';
+  bool _isLoading = true;
+  String? _errorMessage;
+  String? _gameName;
+  String? _gameNameSafe;
+  int? _teamId;
+  List<String> _rounds = [];
+  Map<String, List<Map<String, dynamic>>> _roundQuestions = {};
+  Map<int, Map<String, dynamic>> _teamAnswers = {}; // Key: question_id, Value: answer data
 
   @override
-  void didChangeDependencies() {
-    super.didChangeDependencies();
-    // Get data passed from question page
-    final args = ModalRoute.of(context)?.settings.arguments as Map<String, dynamic>?;
-    if (args != null) {
-      _score = args['score'] ?? 0;
-      _totalQuestions = args['totalQuestions'] ?? 5;
-      _correctAnswers = args['correctAnswers'] ?? 0;
-      _percentage = (_correctAnswers / _totalQuestions) * 100;
-      _grade = _getGrade(_percentage);
-      _message = _getMessage(_percentage);
+  void initState() {
+    super.initState();
+    _loadSummaryData();
+  }
+
+  Future<void> _loadSummaryData() async {
+    setState(() {
+      _isLoading = true;
+      _errorMessage = null;
+    });
+
+    try {
+      // Get user data to find active game and team
+      final userData = await UserDataService.getUserData();
+      if (userData == null) {
+        setState(() {
+          _errorMessage = 'User data not found. Please login again.';
+          _isLoading = false;
+        });
+        return;
+      }
+
+      // Get team ID - it might be a numeric ID or a team code
+      final teamIdRaw = userData['playing_in_team_id'];
+      if (teamIdRaw == null) {
+        setState(() {
+          _errorMessage = 'No team assigned. Please join a team first.';
+          _isLoading = false;
+        });
+        return;
+      }
+
+      // Try to parse as int first (if it's a numeric team ID)
+      _teamId = int.tryParse(teamIdRaw.toString());
+      
+      // If parsing fails, it might be a team code - we'll need to handle this
+      // For now, we'll try to use it as-is and let the backend handle conversion
+      // The backend API should handle team code to ID conversion if needed
+      if (_teamId == null) {
+        // If it's not a numeric ID, we can't proceed with the current API
+        // The backend expects an int for team_id parameter
+        setState(() {
+          _errorMessage = 'Team ID format not supported. Please contact administrator.';
+          _isLoading = false;
+        });
+        return;
+      }
+
+      // Get active game info - we need to get it from the active games list
+      final activeGamesResult = await DatabaseService.getPlayerActiveGames(int.parse(userData['id'].toString()));
+      final success = activeGamesResult['success'] as bool? ?? false;
+      final activeGamesList = activeGamesResult['active_games'] as List?;
+      if (!success || activeGamesList == null || activeGamesList.isEmpty) {
+        setState(() {
+          _errorMessage = 'No active game found.';
+          _isLoading = false;
+        });
+        return;
+      }
+
+      // Get the first active/running game
+      final activeGame = activeGamesList.firstWhere(
+        (game) => game['status'] == 'active' || game['status'] == 'running',
+        orElse: () => activeGamesList.first,
+      ) as Map<String, dynamic>;
+
+      _gameName = activeGame['game_name'] as String?;
+      if (_gameName == null) {
+        setState(() {
+          _errorMessage = 'Game name not found in active game.';
+          _isLoading = false;
+        });
+        return;
+      }
+
+      // Create safe game name (for API calls)
+      _gameNameSafe = _gameName!.replaceAll(' ', '_').replaceAll('-', '_').toLowerCase();
+
+      // Load rounds for the game
+      final rounds = await DatabaseService.getGameRounds(_gameName!);
+      if (rounds.isEmpty) {
+        setState(() {
+          _errorMessage = 'No rounds found for this game.';
+          _isLoading = false;
+        });
+        return;
+      }
+
+      _rounds = rounds;
+
+      // Load questions for each round
+      for (final roundName in _rounds) {
+        final questions = await DatabaseService.getGameQuestionsByRound(_gameName!, roundName);
+        _roundQuestions[roundName] = questions;
+      }
+
+      // Load team answers
+      final answers = await DatabaseService.getTeamAnswersForGame(_gameNameSafe!, _teamId!);
+      for (final answer in answers) {
+        final questionId = answer['question_id'] as int?;
+        if (questionId != null) {
+          _teamAnswers[questionId] = answer;
+        }
+      }
+
+      setState(() {
+        _isLoading = false;
+      });
+    } catch (e) {
+      print('Error loading summary data: $e');
+      setState(() {
+        _errorMessage = 'Error loading summary: ${e.toString()}';
+        _isLoading = false;
+      });
     }
   }
 
-  String _getGrade(double percentage) {
-    if (percentage >= 90) return 'A+';
-    if (percentage >= 80) return 'A';
-    if (percentage >= 70) return 'B';
-    if (percentage >= 60) return 'C';
-    if (percentage >= 50) return 'D';
-    return 'F';
+  String _getResultStatus(Map<String, dynamic>? answer) {
+    if (answer == null) {
+      return 'no answer yet';
+    }
+
+    final isCorrect = answer['is_correct'];
+    if (isCorrect == null) {
+      return 'no answer yet';
+    }
+
+    if (isCorrect == 0) {
+      return 'no answer yet';
+    } else if (isCorrect == 1) {
+      final score = answer['correct_score'] ?? 0;
+      return 'correct (+$score)';
+    } else if (isCorrect == -1) {
+      final score = answer['wrong_score'] ?? 0;
+      return 'incorrect ($score)';
+    }
+
+    return 'unknown';
   }
 
-  String _getMessage(double percentage) {
-    if (percentage >= 90) return 'Outstanding! You\'re a quiz master!';
-    if (percentage >= 80) return 'Excellent work! You did great!';
-    if (percentage >= 70) return 'Good job! You\'re on the right track!';
-    if (percentage >= 60) return 'Not bad! Keep practicing!';
-    if (percentage >= 50) return 'You passed! Try to improve next time.';
-    return 'Don\'t give up! Practice makes perfect!';
+  Color _getResultColor(Map<String, dynamic>? answer) {
+    if (answer == null) {
+      return Colors.grey;
+    }
+
+    final isCorrect = answer['is_correct'];
+    if (isCorrect == null || isCorrect == 0) {
+      return Colors.grey;
+    } else if (isCorrect == 1) {
+      return Colors.green;
+    } else if (isCorrect == -1) {
+      return Colors.red;
+    }
+
+    return Colors.grey;
+  }
+
+  int _getResultScore(Map<String, dynamic>? answer) {
+    if (answer == null) {
+      return 0;
+    }
+
+    final isCorrect = answer['is_correct'];
+    if (isCorrect == null || isCorrect == 0) {
+      return 0;
+    } else if (isCorrect == 1) {
+      return answer['correct_score'] as int? ?? 0;
+    } else if (isCorrect == -1) {
+      return answer['wrong_score'] as int? ?? 0;
+    }
+
+    return 0;
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Quiz Summary'),
+        title: const Text('Game Summary'),
         backgroundColor: Colors.blue,
         foregroundColor: Colors.white,
         leading: IconButton(
@@ -62,282 +208,238 @@ class _SummaryPageState extends State<SummaryPage> {
           },
         ),
       ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            // Score Card
-            Card(
-              elevation: 8,
-              child: Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(24),
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    colors: _getGradientColors(_percentage),
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                  ),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Column(
-                  children: [
-                    const Icon(
-                      Icons.emoji_events,
-                      size: 64,
-                      color: Colors.white,
+      body: _isLoading
+          ? const Center(child: CircularProgressIndicator())
+          : _errorMessage != null
+              ? Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16.0),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(Icons.error_outline, size: 64, color: Colors.red[300]),
+                        const SizedBox(height: 16),
+                        Text(
+                          _errorMessage!,
+                          style: const TextStyle(fontSize: 16),
+                          textAlign: TextAlign.center,
+                        ),
+                        const SizedBox(height: 24),
+                        ElevatedButton(
+                          onPressed: () {
+                            Navigator.pop(context);
+                          },
+                          child: const Text('Go Back'),
+                        ),
+                      ],
                     ),
-                    const SizedBox(height: 16),
-                    Text(
-                      _grade,
-                      style: const TextStyle(
-                        fontSize: 48,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.white,
+                  ),
+                )
+              : _rounds.isEmpty
+                  ? const Center(child: Text('No rounds found'))
+                  : RefreshIndicator(
+                      onRefresh: _loadSummaryData,
+                      child: ListView.builder(
+                        padding: const EdgeInsets.all(16),
+                        itemCount: _rounds.length,
+                        itemBuilder: (context, index) {
+                          final roundName = _rounds[index];
+                          final questions = _roundQuestions[roundName] ?? [];
+                          
+                          return _buildRoundScorecard(roundName, questions);
+                        },
                       ),
                     ),
-                    const SizedBox(height: 8),
-                    Text(
-                      '${_percentage.toStringAsFixed(1)}%',
-                      style: const TextStyle(
-                        fontSize: 24,
-                        color: Colors.white70,
-                      ),
-                    ),
-                    const SizedBox(height: 16),
-                    Text(
-                      _message,
-                      style: const TextStyle(
-                        fontSize: 18,
-                        color: Colors.white,
-                        fontWeight: FontWeight.w500,
-                      ),
-                      textAlign: TextAlign.center,
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            
-            const SizedBox(height: 24),
-            
-            // Statistics
-            const Text(
-              'Quiz Statistics',
-              style: TextStyle(
-                fontSize: 24,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            const SizedBox(height: 16),
-            
-            Row(
-              children: [
-                Expanded(
-                  child: _buildStatCard(
-                    'Score',
-                    _score.toString(),
-                    Icons.star,
-                    Colors.amber,
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: _buildStatCard(
-                    'Correct',
-                    '$_correctAnswers/$_totalQuestions',
-                    Icons.check_circle,
-                    Colors.green,
-                  ),
-                ),
-              ],
-            ),
-            
-            const SizedBox(height: 12),
-            
-            Row(
-              children: [
-                Expanded(
-                  child: _buildStatCard(
-                    'Percentage',
-                    '${_percentage.toStringAsFixed(1)}%',
-                    Icons.percent,
-                    Colors.blue,
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: _buildStatCard(
-                    'Grade',
-                    _grade,
-                    Icons.school,
-                    Colors.purple,
-                  ),
-                ),
-              ],
-            ),
-            
-            const SizedBox(height: 24),
-            
-            // Performance Chart (Simple)
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'Performance Breakdown',
-                      style: TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    const SizedBox(height: 16),
-                    _buildPerformanceBar('Correct Answers', _correctAnswers, _totalQuestions, Colors.green),
-                    const SizedBox(height: 8),
-                    _buildPerformanceBar('Incorrect Answers', _totalQuestions - _correctAnswers, _totalQuestions, Colors.red),
-                  ],
-                ),
-              ),
-            ),
-            
-            const SizedBox(height: 24),
-            
-            // Action Buttons
-            Row(
-              children: [
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: () {
-                      Navigator.pushReplacementNamed(context, '/question');
-                    },
-                    icon: const Icon(Icons.refresh),
-                    label: const Text('Retake Quiz'),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: ElevatedButton.icon(
-                    onPressed: () {
-                      Navigator.pushReplacementNamed(context, '/main');
-                    },
-                    icon: const Icon(Icons.home),
-                    label: const Text('Back to Home'),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.blue,
-                      foregroundColor: Colors.white,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-            
-            const SizedBox(height: 16),
-            
-            // Share Button
-            SizedBox(
-              width: double.infinity,
-              child: OutlinedButton.icon(
-                onPressed: () {
-                  _showShareDialog();
-                },
-                icon: const Icon(Icons.share),
-                label: const Text('Share Results'),
-              ),
-            ),
-          ],
-        ),
-      ),
     );
   }
 
-  Widget _buildStatCard(String title, String value, IconData icon, Color color) {
+  Widget _buildRoundScorecard(String roundName, List<Map<String, dynamic>> questions) {
+    // Calculate round totals
+    int roundTotalScore = 0;
+    int roundCorrectCount = 0;
+    int roundIncorrectCount = 0;
+    int roundNoAnswerCount = 0;
+
+    for (final question in questions) {
+      final questionId = question['id'] as int?;
+      final answer = questionId != null ? _teamAnswers[questionId] : null;
+      final score = _getResultScore(answer);
+      roundTotalScore += score;
+
+      if (answer == null) {
+        roundNoAnswerCount++;
+      } else {
+        final isCorrect = answer['is_correct'];
+        if (isCorrect == 1) {
+          roundCorrectCount++;
+        } else if (isCorrect == -1) {
+          roundIncorrectCount++;
+        } else {
+          roundNoAnswerCount++;
+        }
+      }
+    }
+
     return Card(
-      elevation: 2,
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            Icon(icon, size: 32, color: color),
-            const SizedBox(height: 8),
-            Text(
-              value,
-              style: TextStyle(
-                fontSize: 20,
-                fontWeight: FontWeight.bold,
-                color: color,
+      margin: const EdgeInsets.only(bottom: 16),
+      elevation: 4,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Round Header
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.blue.shade700,
+              borderRadius: const BorderRadius.only(
+                topLeft: Radius.circular(12),
+                topRight: Radius.circular(12),
               ),
             ),
-            Text(
-              title,
-              style: const TextStyle(
-                fontSize: 14,
-                color: Colors.grey,
-              ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  roundName,
+                  style: const TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    _buildRoundStat('Total Score', roundTotalScore.toString(), Colors.white),
+                    const SizedBox(width: 16),
+                    _buildRoundStat('Correct', roundCorrectCount.toString(), Colors.green.shade300),
+                    const SizedBox(width: 16),
+                    _buildRoundStat('Incorrect', roundIncorrectCount.toString(), Colors.red.shade300),
+                    const SizedBox(width: 16),
+                    _buildRoundStat('No Answer', roundNoAnswerCount.toString(), Colors.grey.shade300),
+                  ],
+                ),
+              ],
             ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildPerformanceBar(String label, int value, int total, Color color) {
-    final percentage = total > 0 ? value / total : 0.0;
-    
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            Text(label),
-            Text('$value/$total'),
-          ],
-        ),
-        const SizedBox(height: 4),
-        LinearProgressIndicator(
-          value: percentage,
-          backgroundColor: Colors.grey[300],
-          valueColor: AlwaysStoppedAnimation<Color>(color),
-        ),
-      ],
-    );
-  }
-
-  List<Color> _getGradientColors(double percentage) {
-    if (percentage >= 90) return [Colors.green, Colors.green.shade700];
-    if (percentage >= 80) return [Colors.blue, Colors.blue.shade700];
-    if (percentage >= 70) return [Colors.orange, Colors.orange.shade700];
-    if (percentage >= 60) return [Colors.yellow, Colors.yellow.shade700];
-    return [Colors.red, Colors.red.shade700];
-  }
-
-  void _showShareDialog() {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Share Results'),
-        content: Text(
-          'I scored $_score points ($_percentage%) on the quiz and got a grade of $_grade! $_message',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
           ),
-          ElevatedButton(
-            onPressed: () {
-              Navigator.pop(context);
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Results copied to clipboard!')),
-              );
-            },
-            child: const Text('Copy'),
+          // Questions List
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Questions & Results:',
+                  style: TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                ...questions.map((question) => _buildQuestionRow(question)),
+              ],
+            ),
           ),
         ],
       ),
     );
   }
-}
 
+  Widget _buildRoundStat(String label, String value, Color color) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          value,
+          style: TextStyle(
+            fontSize: 18,
+            fontWeight: FontWeight.bold,
+            color: color,
+          ),
+        ),
+        Text(
+          label,
+          style: TextStyle(
+            fontSize: 12,
+            color: color.withOpacity(0.8),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildQuestionRow(Map<String, dynamic> question) {
+    final questionId = question['id'] as int?;
+    final questionNum = question['question_num']?.toString() ?? 'N/A';
+    final answer = questionId != null ? _teamAnswers[questionId] : null;
+    final answerText = answer?['answer']?.toString() ?? 'No answer';
+    final resultStatus = _getResultStatus(answer);
+    final resultColor = _getResultColor(answer);
+    final score = _getResultScore(answer);
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        border: Border.all(color: Colors.grey.shade300),
+        borderRadius: BorderRadius.circular(8),
+        color: Colors.grey.shade50,
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: Colors.blue.shade100,
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Text(
+                  'Q$questionNum',
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    color: Colors.blue.shade900,
+                  ),
+                ),
+              ),
+              const Spacer(),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: resultColor.withOpacity(0.2),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Text(
+                  resultStatus,
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    color: resultColor,
+                    fontSize: 12,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          if (answerText != 'No answer')
+            Text(
+              'Answer: $answerText',
+              style: const TextStyle(fontSize: 14),
+            ),
+          if (score != 0)
+            Text(
+              'Score: $score',
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.bold,
+                color: resultColor,
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}

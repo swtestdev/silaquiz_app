@@ -11,13 +11,419 @@ import 'login_page.dart'; // For DatabaseService
 // Global callback for timer messages from WebSocket
 Function(Map<String, dynamic>)? _globalTimerMessageHandler;
 
+// Global timer status variables
+String _startTimerStatus = 'Idle'; // Status for START_TIMER
+String _lastTimerStatus = 'Idle';  // Status for LAST_TIMER
+
+// Global timer data storage
+int? _startTimerDuration; // Duration in seconds
+int? _lastTimerDuration;  // Duration in seconds
+DateTime? _startTimerStartTime;
+DateTime? _lastTimerStartTime;
+Timer? _globalStartTimer;
+Timer? _globalLastTimer;
+
+// Global variable to store last timer action data payload
+Map<String, dynamic>? _lastTimerActionData;
+
 // Function to forward timer messages from main_page
 void forwardTimerMessage(Map<String, dynamic> message) {
+  // Handle timer in background regardless of page
+  _handleGlobalTimer(message);
+  
+  // Also forward to page handler if registered
   if (_globalTimerMessageHandler != null) {
     print('QuestionPage: Received timer message, forwarding to handler');
     _globalTimerMessageHandler!(message);
   } else {
     print('QuestionPage: Timer message received but no handler registered');
+  }
+}
+
+// Global timer handler - runs in background
+void _handleGlobalTimer(Map<String, dynamic> message) async {
+  final timerAction = message['timer_action'] as String?;
+  if (timerAction == null) return;
+  
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    
+    // Store the complete timer action data payload
+    _lastTimerActionData = Map<String, dynamic>.from(message);
+    await prefs.setString('last_timer_action_data', jsonEncode(message));
+    print('Global timer: Stored timer action data payload');
+    
+    switch (timerAction) {
+      case 'START_TIME':
+      case 'START_TIMER':
+        // When START_TIMER is set to Running, LAST_TIMER must be Idle
+        // If START_TIMER is already Running and LAST_TIMER is going to Running, START_TIMER becomes Stopped
+        // But for START_TIMER command, we always set START_TIMER to Running and LAST_TIMER to Idle
+        _globalLastTimer?.cancel();
+        _lastTimerStatus = 'Idle';
+        _lastTimerDuration = null;
+        _lastTimerStartTime = null;
+        await prefs.setString('last_timer_status', 'Idle');
+        
+        // Get timer value
+        dynamic questionTimerValue = message['question_timer'];
+        int questionTimer = 0;
+        if (questionTimerValue is int) {
+          questionTimer = questionTimerValue;
+        } else if (questionTimerValue is String) {
+          questionTimer = int.tryParse(questionTimerValue) ?? 0;
+        }
+        
+        // Calculate adjusted timer
+        final timerStartStr = message['timer_start'] as String?;
+        DateTime? timerStart;
+        if (timerStartStr != null) {
+          try {
+            // Parse as UTC - if no timezone indicator, assume UTC
+            timerStart = DateTime.parse(timerStartStr);
+            // Ensure it's in UTC
+            if (!timerStartStr.endsWith('Z') && !timerStartStr.contains('+') && !timerStartStr.contains('-', 10)) {
+              // No timezone info, treat as UTC
+              timerStart = DateTime.utc(
+                timerStart.year, timerStart.month, timerStart.day,
+                timerStart.hour, timerStart.minute, timerStart.second,
+                timerStart.millisecond, timerStart.microsecond
+              );
+            } else {
+              timerStart = timerStart.toUtc();
+            }
+          } catch (e) {
+            print('Error parsing timer_start: $e, using current time');
+            timerStart = DateTime.now().toUtc();
+          }
+        } else {
+          timerStart = DateTime.now().toUtc();
+        }
+        
+        final now = DateTime.now().toUtc();
+        final elapsed = now.difference(timerStart).inSeconds;
+        final adjustedTimer = (questionTimer - elapsed).clamp(0, questionTimer);
+        
+        print('Timer calculation: timerStart=$timerStart (UTC), now=$now (UTC), elapsed=$elapsed, adjustedTimer=$adjustedTimer');
+        
+        if (adjustedTimer > 0) {
+          _startTimerStatus = 'Running';
+          _startTimerDuration = adjustedTimer;
+          _startTimerStartTime = timerStart;
+          
+          // Save to SharedPreferences (store both remaining and original duration)
+          await prefs.setString('start_timer_status', 'Running');
+          await prefs.setInt('start_timer_duration', adjustedTimer);
+          await prefs.setInt('start_timer_original_duration', questionTimer); // Store original duration
+          await prefs.setString('start_timer_start_time', timerStart.toIso8601String());
+          
+          // Start background countdown
+          _globalStartTimer?.cancel();
+          final startTimeForTimer = timerStart; // Capture non-null value
+          final originalDurationForTimer = questionTimer; // Capture original duration
+          _globalStartTimer = Timer.periodic(const Duration(seconds: 1), (timer) async {
+            // Calculate remaining time based on elapsed time from start
+            final now = DateTime.now().toUtc();
+            final elapsed = now.difference(startTimeForTimer).inSeconds;
+            final remaining = (originalDurationForTimer - elapsed).clamp(0, originalDurationForTimer);
+            
+            // Update global state
+            _startTimerDuration = remaining;
+            await prefs.setInt('start_timer_duration', remaining);
+            
+            // Debug log every 5 seconds
+            if (remaining % 5 == 0 || remaining < 5) {
+              print('Global START_TIMER: Countdown - elapsed=$elapsed, remaining=$remaining, original=$originalDurationForTimer');
+            }
+            
+            if (remaining <= 0) {
+              _startTimerStatus = 'Idle';
+              _startTimerDuration = 0;
+              timer.cancel();
+              await prefs.setString('start_timer_status', 'Idle');
+              await prefs.setInt('start_timer_duration', 0);
+              print('Global START_TIMER: Timer expired, status set to Idle');
+            }
+          });
+          
+          print('Global START_TIMER: Started with original=$questionTimer seconds, adjusted=$adjustedTimer seconds, status: Running, startTime=$startTimeForTimer');
+        } else {
+          _startTimerStatus = 'Idle';
+          _startTimerDuration = 0;
+          await prefs.setString('start_timer_status', 'Idle');
+          await prefs.setInt('start_timer_duration', 0);
+          print('Global START_TIMER: Expired, status: Idle');
+        }
+        break;
+        
+      case 'LAST_TIMER':
+        // If START_TIMER is Running and LAST_TIMER is going to Running, set START_TIMER to Stopped
+        if (_startTimerStatus == 'Running') {
+          _globalStartTimer?.cancel();
+          _startTimerStatus = 'Stopped';
+          _startTimerDuration = null;
+          _startTimerStartTime = null;
+          await prefs.setString('start_timer_status', 'Stopped');
+          await prefs.setInt('start_timer_duration', 0);
+          print('Global LAST_TIMER: START_TIMER was Running, set to Stopped');
+        }
+        
+        // Get timer value
+        dynamic finalTimerValue = message['final_timer'];
+        int finalTimer = 0;
+        if (finalTimerValue is int) {
+          finalTimer = finalTimerValue;
+        } else if (finalTimerValue is String) {
+          finalTimer = int.tryParse(finalTimerValue) ?? 0;
+        }
+        
+        // Calculate adjusted timer
+        final timerStartStr = message['timer_start'] as String?;
+        DateTime? timerStart;
+        if (timerStartStr != null) {
+          try {
+            // Parse as UTC - if no timezone indicator, assume UTC
+            timerStart = DateTime.parse(timerStartStr);
+            // Ensure it's in UTC
+            if (!timerStartStr.endsWith('Z') && !timerStartStr.contains('+') && !timerStartStr.contains('-', 10)) {
+              // No timezone info, treat as UTC
+              timerStart = DateTime.utc(
+                timerStart.year, timerStart.month, timerStart.day,
+                timerStart.hour, timerStart.minute, timerStart.second,
+                timerStart.millisecond, timerStart.microsecond
+              );
+            } else {
+              timerStart = timerStart.toUtc();
+            }
+          } catch (e) {
+            print('Error parsing timer_start: $e, using current time');
+            timerStart = DateTime.now().toUtc();
+          }
+        } else {
+          timerStart = DateTime.now().toUtc();
+        }
+        
+        final now = DateTime.now().toUtc();
+        final elapsed = now.difference(timerStart).inSeconds;
+        final adjustedTimer = (finalTimer - elapsed).clamp(0, finalTimer);
+        
+        print('LAST_TIMER calculation: timerStart=$timerStart (UTC), now=$now (UTC), elapsed=$elapsed, adjustedTimer=$adjustedTimer');
+        
+        if (adjustedTimer > 0) {
+          _lastTimerStatus = 'Running';
+          _lastTimerDuration = adjustedTimer;
+          _lastTimerStartTime = timerStart;
+          
+          // Save to SharedPreferences (store both remaining and original duration)
+          await prefs.setString('last_timer_status', 'Running');
+          await prefs.setInt('last_timer_duration', adjustedTimer);
+          await prefs.setInt('last_timer_original_duration', finalTimer); // Store original duration
+          await prefs.setString('last_timer_start_time', timerStart.toIso8601String());
+          
+          // Start background countdown
+          _globalLastTimer?.cancel();
+          final startTimeForTimer = timerStart; // Capture non-null value
+          final originalDurationForTimer = finalTimer; // Capture original duration
+          _globalLastTimer = Timer.periodic(const Duration(seconds: 1), (timer) async {
+            // Calculate remaining time based on elapsed time from start
+            final now = DateTime.now().toUtc();
+            final elapsed = now.difference(startTimeForTimer).inSeconds;
+            final remaining = (originalDurationForTimer - elapsed).clamp(0, originalDurationForTimer);
+            
+            // Update global state
+            _lastTimerDuration = remaining;
+            await prefs.setInt('last_timer_duration', remaining);
+            
+            print('Global LAST_TIMER: Countdown - elapsed=$elapsed, remaining=$remaining, original=$originalDurationForTimer');
+            
+            if (remaining <= 0) {
+              _lastTimerStatus = 'Idle';
+              _lastTimerDuration = 0;
+              timer.cancel();
+              await prefs.setString('last_timer_status', 'Idle');
+              await prefs.setInt('last_timer_duration', 0);
+              print('Global LAST_TIMER: Timer expired, status set to Idle');
+            }
+          });
+          
+          print('Global LAST_TIMER: Started with original=$finalTimer seconds, adjusted=$adjustedTimer seconds, status: Running, startTime=$startTimeForTimer');
+        } else {
+          _lastTimerStatus = 'Idle';
+          _lastTimerDuration = 0;
+          await prefs.setString('last_timer_status', 'Idle');
+          await prefs.setInt('last_timer_duration', 0);
+          print('Global LAST_TIMER: Expired, status: Idle');
+        }
+        break;
+        
+      case 'STOP_TIMER':
+        // Stop both timers
+        _globalStartTimer?.cancel();
+        _globalLastTimer?.cancel();
+        _startTimerStatus = 'Idle';
+        _lastTimerStatus = 'Idle';
+        _startTimerDuration = 0;
+        _lastTimerDuration = 0;
+        await prefs.setString('start_timer_status', 'Idle');
+        await prefs.setString('last_timer_status', 'Idle');
+        await prefs.setInt('start_timer_duration', 0);
+        await prefs.setInt('last_timer_duration', 0);
+        print('Global STOP_TIMER: Both timers stopped, status: Idle');
+        break;
+    }
+  } catch (e) {
+    print('Error handling global timer: $e');
+  }
+}
+
+// Initialize timer status on login
+Future<void> initializeTimerStatus() async {
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    _startTimerStatus = 'Idle';
+    _lastTimerStatus = 'Idle';
+    _startTimerDuration = null;
+    _lastTimerDuration = null;
+    _startTimerStartTime = null;
+    _lastTimerStartTime = null;
+    _lastTimerActionData = null;
+    _globalStartTimer?.cancel();
+    _globalLastTimer?.cancel();
+    
+    await prefs.setString('start_timer_status', 'Idle');
+    await prefs.setString('last_timer_status', 'Idle');
+    await prefs.remove('start_timer_duration');
+    await prefs.remove('last_timer_duration');
+    await prefs.remove('start_timer_original_duration');
+    await prefs.remove('last_timer_original_duration');
+    await prefs.remove('start_timer_start_time');
+    await prefs.remove('last_timer_start_time');
+    await prefs.remove('last_timer_action_data');
+    
+    print('Timer status initialized to Idle on login, timer action data cleared');
+  } catch (e) {
+    print('Error initializing timer status: $e');
+  }
+}
+
+// Get current timer status and remaining time
+Future<Map<String, dynamic>> getCurrentTimerStatus() async {
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    
+    // Check if timers are running and calculate remaining time
+    String activeStatus = 'Idle';
+    int? remainingSeconds;
+    int? originalDuration;
+    DateTime? startTime;
+    
+    if (_startTimerStatus == 'Running' && _startTimerStartTime != null) {
+      // Get original duration from SharedPreferences
+      final origDuration = prefs.getInt('start_timer_original_duration') ?? 0;
+      if (origDuration > 0) {
+        final now = DateTime.now().toUtc();
+        final elapsed = now.difference(_startTimerStartTime!).inSeconds;
+        // Calculate remaining from original duration, not adjusted duration
+        remainingSeconds = (origDuration - elapsed).clamp(0, origDuration);
+        originalDuration = origDuration;
+        if (remainingSeconds > 0) {
+          activeStatus = 'START_TIMER';
+          startTime = _startTimerStartTime;
+          // Update _startTimerDuration to current remaining
+          _startTimerDuration = remainingSeconds;
+        } else {
+          _startTimerStatus = 'Idle';
+          _startTimerDuration = 0;
+          remainingSeconds = 0;
+        }
+      }
+    } else if (_lastTimerStatus == 'Running' && _lastTimerStartTime != null) {
+      // Get original duration from SharedPreferences
+      final origDuration = prefs.getInt('last_timer_original_duration') ?? 0;
+      if (origDuration > 0) {
+        final now = DateTime.now().toUtc();
+        final elapsed = now.difference(_lastTimerStartTime!).inSeconds;
+        // Calculate remaining from original duration, not adjusted duration
+        remainingSeconds = (origDuration - elapsed).clamp(0, origDuration);
+        originalDuration = origDuration;
+        if (remainingSeconds > 0) {
+          activeStatus = 'LAST_TIMER';
+          startTime = _lastTimerStartTime;
+          // Update _lastTimerDuration to current remaining
+          _lastTimerDuration = remainingSeconds;
+        } else {
+          _lastTimerStatus = 'Idle';
+          _lastTimerDuration = 0;
+          remainingSeconds = 0;
+        }
+      }
+    }
+    
+    // Try to load from SharedPreferences if not in memory
+    if (activeStatus == 'Idle') {
+      final startStatus = prefs.getString('start_timer_status');
+      final lastStatus = prefs.getString('last_timer_status');
+      
+      if (startStatus == 'Running') {
+        final startTimeStr = prefs.getString('start_timer_start_time');
+        final duration = prefs.getInt('start_timer_duration') ?? 0;
+        if (startTimeStr != null && duration > 0) {
+          try {
+            final savedStartTime = DateTime.parse(startTimeStr);
+            final now = DateTime.now().toUtc();
+            final elapsed = now.difference(savedStartTime).inSeconds;
+            remainingSeconds = (duration - elapsed).clamp(0, duration);
+            if (remainingSeconds! > 0) {
+              activeStatus = 'START_TIMER';
+              startTime = savedStartTime;
+              _startTimerStatus = 'Running';
+              _startTimerStartTime = savedStartTime;
+              _startTimerDuration = duration;
+              // Get original duration
+              originalDuration = prefs.getInt('start_timer_original_duration');
+            }
+          } catch (e) {
+            print('Error parsing start timer time: $e');
+          }
+        }
+      } else if (lastStatus == 'Running') {
+        final startTimeStr = prefs.getString('last_timer_start_time');
+        final duration = prefs.getInt('last_timer_duration') ?? 0;
+        if (startTimeStr != null && duration > 0) {
+          try {
+            final savedStartTime = DateTime.parse(startTimeStr);
+            final now = DateTime.now().toUtc();
+            final elapsed = now.difference(savedStartTime).inSeconds;
+            remainingSeconds = (duration - elapsed).clamp(0, duration);
+            if (remainingSeconds! > 0) {
+              activeStatus = 'LAST_TIMER';
+              startTime = savedStartTime;
+              _lastTimerStatus = 'Running';
+              _lastTimerStartTime = savedStartTime;
+              _lastTimerDuration = duration;
+              // Get original duration
+              originalDuration = prefs.getInt('last_timer_original_duration');
+            }
+          } catch (e) {
+            print('Error parsing last timer time: $e');
+          }
+        }
+      }
+    }
+    
+    return {
+      'active_timer': activeStatus,
+      'remaining_seconds': remainingSeconds ?? 0,
+      'original_duration': originalDuration,
+      'start_time': startTime?.toIso8601String(), // Return as ISO8601 string
+    };
+  } catch (e) {
+    print('Error getting timer status: $e');
+    return {
+      'active_timer': 'Idle',
+      'remaining_seconds': 0,
+      'start_time': null,
+    };
   }
 }
 
@@ -34,6 +440,10 @@ class _QuestionPageState extends State<QuestionPage> {
   Duration _totalTime = const Duration(minutes: 45);
   bool _isTimerRunning = false;
   bool _timerStarted = false; // Track if timer has been started
+  
+  // Store timer start time and original duration for direct calculation
+  DateTime? _uiTimerStartTime;
+  int? _uiTimerOriginalDuration;
   Timer? _tick;
   
   // Global timer counter down variable
@@ -85,8 +495,8 @@ class _QuestionPageState extends State<QuestionPage> {
       }
     });
     
-    // Initialize timer_counter_down to 0 when player enters question_page
-    timer_counter_down = 0;
+    // Load current timer status from global state (will set timer_counter_down based on actual remaining time)
+    _loadTimerStatus();
     _loadUserData();
     _initializeAnswers(1); // Default to 1 answer
     _startWriterStatusCheck();
@@ -94,10 +504,212 @@ class _QuestionPageState extends State<QuestionPage> {
     // Register this page to receive timer messages
     _globalTimerMessageHandler = _handleTimerTrigger;
     print('QuestionPage: Registered for timer messages');
+    
+    // Start periodic update to sync with global timer
+    _startTimerSync();
+  }
+  
+  // Load timer status from global state
+  Future<void> _loadTimerStatus() async {
+    try {
+      final status = await getCurrentTimerStatus();
+      final activeTimer = status['active_timer'] as String;
+      final remainingSeconds = status['remaining_seconds'] as int;
+      final originalDuration = status['original_duration'] as int?;
+      
+      print('_loadTimerStatus: activeTimer=$activeTimer, remainingSeconds=$remainingSeconds, originalDuration=$originalDuration');
+      
+      if (mounted) {
+        setState(() {
+          if (activeTimer == 'START_TIMER' || activeTimer == 'LAST_TIMER') {
+            timer_counter_down = remainingSeconds;
+            _remainingTime = Duration(seconds: remainingSeconds);
+            
+            // Always use original duration for total time when available
+            // This ensures progress bar shows correct countdown
+            if (originalDuration != null && originalDuration > 0) {
+              _totalTime = Duration(seconds: originalDuration);
+              print('_loadTimerStatus: Set _totalTime to originalDuration=$originalDuration (from timer status)');
+            } else {
+              // Fallback: use remaining if no original duration available
+              _totalTime = Duration(seconds: remainingSeconds);
+              print('_loadTimerStatus: Set _totalTime to remainingSeconds=$remainingSeconds (fallback, no original duration)');
+            }
+            
+            _timerStarted = true;
+            _isTimerRunning = remainingSeconds > 0;
+            
+            print('_loadTimerStatus: Final values - _totalTime=${_totalTime.inSeconds}s, _remainingTime=${_remainingTime.inSeconds}s, progress=${_totalTime.inSeconds > 0 ? (_remainingTime.inSeconds / _totalTime.inSeconds) : 0}');
+            
+            // Start local timer to update UI
+            if (remainingSeconds > 0) {
+              _startLocalTimer(remainingSeconds, _totalTime.inSeconds);
+            }
+          } else {
+            timer_counter_down = 0;
+            _remainingTime = Duration.zero;
+            _totalTime = Duration.zero;
+            _timerStarted = false;
+            _isTimerRunning = false;
+          }
+        });
+      }
+    } catch (e) {
+      print('Error loading timer status: $e');
+    }
+  }
+  
+  // Start local timer for UI updates (calculates based on real time difference)
+  void _startLocalTimer(int remainingSeconds, int originalDuration) async {
+    _tick?.cancel();
+    _blinkTimer?.cancel();
+    
+    // Get the most current status from global timer to get timer_start time
+    final currentStatus = await getCurrentTimerStatus();
+    final currentRemaining = currentStatus['remaining_seconds'] as int;
+    final currentOriginal = currentStatus['original_duration'] as int? ?? originalDuration;
+    final startTimeStr = currentStatus['start_time'] as String?;
+    DateTime? startTime;
+    if (startTimeStr != null) {
+      try {
+        startTime = DateTime.parse(startTimeStr).toUtc();
+      } catch (e) {
+        print('Error parsing start_time: $e');
+      }
+    }
+    
+    if (startTime == null || currentOriginal <= 0) {
+      setState(() {
+        timer_counter_down = 0;
+        _remainingTime = Duration.zero;
+        _isTimerRunning = false;
+        _uiTimerStartTime = null;
+        _uiTimerOriginalDuration = null;
+      });
+      return;
+    }
+    
+    // Store timer start time and original duration for direct calculation
+    _uiTimerStartTime = startTime;
+    _uiTimerOriginalDuration = currentOriginal;
+    
+    // Calculate remaining time directly from timer_start (accounts for any delay)
+    // This ensures the first display immediately accounts for the 2-3 second delay
+    final now = DateTime.now().toUtc();
+    final elapsed = now.difference(_uiTimerStartTime!).inSeconds;
+    final calculatedRemaining = (currentOriginal - elapsed).clamp(0, currentOriginal);
+    
+    // Set initial values immediately based on real time calculation
+    // This accounts for the delay by showing the correct remaining time right away
+    if (mounted) {
+      setState(() {
+        timer_counter_down = calculatedRemaining;
+        _totalTime = Duration(seconds: currentOriginal); // Use original duration for progress bar
+        _remainingTime = Duration(seconds: calculatedRemaining);
+        _isTimerRunning = calculatedRemaining > 0;
+        _isBlinking = false;
+      });
+    }
+    
+    print('_startLocalTimer: Starting UI timer with startTime=$startTime, original=$currentOriginal, elapsed=$elapsed, calculated remaining=$calculatedRemaining (accounts for delay)');
+    
+    // Start independent countdown timer that calculates based on real time difference
+    // Update immediately, then every second
+    _tick = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted || _uiTimerStartTime == null || _uiTimerOriginalDuration == null) {
+        timer.cancel();
+        return;
+      }
+      
+      // Calculate remaining time directly from timer_start and current time
+      // This ensures accuracy and accounts for any delays
+      final now = DateTime.now().toUtc();
+      final elapsed = now.difference(_uiTimerStartTime!).inSeconds;
+      final remaining = (_uiTimerOriginalDuration! - elapsed).clamp(0, _uiTimerOriginalDuration!);
+      
+      if (remaining <= 0) {
+        setState(() {
+          timer_counter_down = 0;
+          _remainingTime = Duration.zero;
+          _isTimerRunning = false;
+          _stopBlinking();
+          _uiTimerStartTime = null;
+          _uiTimerOriginalDuration = null;
+        });
+        timer.cancel();
+      } else {
+        setState(() {
+          timer_counter_down = remaining;
+          _remainingTime = Duration(seconds: remaining);
+          _totalTime = Duration(seconds: _uiTimerOriginalDuration!);
+          
+          // Start blinking when timer reaches 5 seconds
+          if (remaining == 5 && _uiTimerOriginalDuration! > 2) {
+            _startBlinking();
+          }
+          
+          // Stop blinking when timer reaches 0
+          if (remaining == 0) {
+            _stopBlinking();
+            _isTimerRunning = false;
+          }
+        });
+      }
+    });
+  }
+  
+  // Start periodic sync with global timer
+  void _startTimerSync() {
+    Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) {
+        timer.cancel();
+        return;
+      }
+      
+      getCurrentTimerStatus().then((status) {
+        final activeTimer = status['active_timer'] as String;
+        final remainingSeconds = status['remaining_seconds'] as int;
+        final originalDuration = status['original_duration'] as int?;
+        
+        if (mounted) {
+          setState(() {
+            if (activeTimer == 'START_TIMER' || activeTimer == 'LAST_TIMER') {
+              // Always update if values changed
+              if (remainingSeconds != timer_counter_down || 
+                  (originalDuration != null && _totalTime.inSeconds != originalDuration)) {
+                timer_counter_down = remainingSeconds;
+                _remainingTime = Duration(seconds: remainingSeconds);
+                // Always use original duration for total time when available
+                if (originalDuration != null && originalDuration > 0) {
+                  _totalTime = Duration(seconds: originalDuration);
+                }
+                _isTimerRunning = remainingSeconds > 0;
+                _timerStarted = true;
+                
+                // Debug log occasionally
+                if (remainingSeconds % 5 == 0 || remainingSeconds < 5) {
+                  print('_startTimerSync: Updated - remaining=$remainingSeconds, total=${_totalTime.inSeconds}, progress=${_totalTime.inSeconds > 0 ? (remainingSeconds / _totalTime.inSeconds) : 0}');
+                }
+              }
+            } else {
+              if (_isTimerRunning || _timerStarted) {
+                timer_counter_down = 0;
+                _remainingTime = Duration.zero;
+                _totalTime = Duration.zero;
+                _isTimerRunning = false;
+                _timerStarted = false;
+                _tick?.cancel();
+              }
+            }
+          });
+        }
+      });
+    });
   }
 
   @override
   void dispose() {
+    // Cancel local UI timers (but NOT global timers - they continue in background)
     _tick?.cancel();
     _writerStatusCheckTimer?.cancel();
     _blinkTimer?.cancel();
@@ -112,6 +724,10 @@ class _QuestionPageState extends State<QuestionPage> {
       _globalTimerMessageHandler = null;
       print('QuestionPage: Unregistered from timer messages');
     }
+    
+    // Note: Global timers continue running in background even after page disposal
+    print('QuestionPage: Disposed, but global timers continue running');
+    
     super.dispose();
   }
   
@@ -322,18 +938,30 @@ class _QuestionPageState extends State<QuestionPage> {
         final questionNumer = question['question_num'] as int? ?? qId;
         final bonusScore = question['bonus_score'] as String? ?? '0;0';
         
-        // Determine input type
+        // Determine input type based on prefix
+        // Format: "Radio:Option A;Option B" or "List:Option A;Option B" or null/""/"=" for text
         String inputType = 'text';
         List<String> options = [];
         
         if (answersForSelection != null && 
             answersForSelection.isNotEmpty && 
             answersForSelection != '=') {
-          options = answersForSelection.split(',').map((e) => e.trim()).toList();
-          if (options.length == 1) {
+          
+          // Check if it starts with "Radio:" or "List:"
+          if (answersForSelection.startsWith('Radio:')) {
             inputType = 'radio';
-          } else if (options.length > 1) {
+            // Extract options after "Radio:" and split by ';'
+            final optionsString = answersForSelection.substring(6); // Remove "Radio:" prefix
+            options = optionsString.split(';').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+          } else if (answersForSelection.startsWith('List:')) {
             inputType = 'list';
+            // Extract options after "List:" and split by ';'
+            final optionsString = answersForSelection.substring(5); // Remove "List:" prefix
+            options = optionsString.split(';').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+          } else {
+            // No prefix or unknown format, default to text
+            inputType = 'text';
+            options = [];
           }
         }
         
@@ -558,49 +1186,9 @@ class _QuestionPageState extends State<QuestionPage> {
   }
 
   void _startTimer(int durationInSeconds) {
-    // Cancel any existing timers
-    _tick?.cancel();
-    _blinkTimer?.cancel();
-    _stopCountdownTimer?.cancel();
-    
-    // Set timer counter down to the duration
-    timer_counter_down = durationInSeconds;
-    
-    // Set total time and remaining time
-    _totalTime = Duration(seconds: durationInSeconds);
-    _remainingTime = Duration(seconds: durationInSeconds);
-    _timerStarted = true;
-    _isTimerRunning = true;
-    _isBlinking = false;
-    _stopCountdown = 0;
-    
-    // Don't start blinking immediately - will start when timer reaches 5 seconds
-    
-    // Start countdown timer
-    _tick = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (!mounted) return;
-      
-      if (timer_counter_down > 0) {
-        setState(() {
-          timer_counter_down--;
-          _remainingTime = Duration(seconds: timer_counter_down);
-          
-          // Start blinking when timer reaches 5 seconds
-          if (timer_counter_down == 5 && durationInSeconds > 2) {
-            _startBlinking();
-          }
-          
-          // Stop blinking when timer reaches 0
-          if (timer_counter_down == 0) {
-            _stopBlinking();
-            _isTimerRunning = false;
-          }
-        });
-      } else {
-        _isTimerRunning = false;
-        _tick?.cancel();
-      }
-    });
+    // This method is now deprecated - timers are managed globally
+    // Just sync with global timer status instead of starting a new timer
+    _loadTimerStatus();
   }
   
   void _startBlinking() {
@@ -682,7 +1270,7 @@ class _QuestionPageState extends State<QuestionPage> {
   }
 
   void _handleTimerTrigger(Map<String, dynamic> message) {
-    // Only handle if player is on question_page (this method is only called when on the page)
+    // Timer is already handled globally, just sync UI and handle question board
     final timerAction = message['timer_action'] as String?;
     
     if (timerAction == null) {
@@ -691,64 +1279,89 @@ class _QuestionPageState extends State<QuestionPage> {
     
     switch (timerAction) {
       case 'START_TIME':
-        // Handle both string and int types for question_timer
+      case 'START_TIMER':
+        // Extract original timer duration from message
         dynamic questionTimerValue = message['question_timer'];
-        int questionTimer = 0;
+        int originalDuration = 0;
         if (questionTimerValue is int) {
-          questionTimer = questionTimerValue;
+          originalDuration = questionTimerValue;
         } else if (questionTimerValue is String) {
-          questionTimer = int.tryParse(questionTimerValue) ?? 0;
+          originalDuration = int.tryParse(questionTimerValue) ?? 0;
         }
         
-        // Adjust timer based on UTC time difference to account for network latency
-        int adjustedTimer = _calculateAdjustedTimer(
-          questionTimer,
-          message['timer_start'],
-        );
+        print('QuestionPage: START_TIMER received, originalDuration=$originalDuration');
         
-        print('QuestionPage: START_TIME received, question_timer: $questionTimer, adjusted: $adjustedTimer');
-        
-        if (adjustedTimer > 0) {
-          _startTimer(adjustedTimer);
-        } else {
-          // Timer expired, set to 0
-          print('QuestionPage: Timer expired (adjusted value: $adjustedTimer), setting to 0');
-          _startTimer(0);
+        // Set total time immediately from message (before loading status)
+        if (mounted && originalDuration > 0) {
+          setState(() {
+            _totalTime = Duration(seconds: originalDuration);
+            print('QuestionPage: Set _totalTime to $originalDuration seconds immediately');
+          });
         }
         
+        // Sync with global timer status (this will get remaining time)
+        _loadTimerStatus().then((_) {
+          // Ensure total time is set correctly after loading
+          if (mounted && originalDuration > 0) {
+            setState(() {
+              if (_totalTime.inSeconds != originalDuration) {
+                _totalTime = Duration(seconds: originalDuration);
+                print('QuestionPage: Corrected _totalTime to $originalDuration seconds after loading');
+              }
+              print('QuestionPage: Final - _totalTime=${_totalTime.inSeconds}s, _remainingTime=${_remainingTime.inSeconds}s, progress=${_remainingTime.inSeconds / _totalTime.inSeconds}');
+            });
+          }
+        });
+        
+        // Timer already started globally, just build question board
         build_question_board(message);
         break;
         
       case 'STOP_TIMER':
         print('QuestionPage: STOP_TIMER received');
-        _stopTimer();
+        // Timer already stopped globally, just update UI
+        setState(() {
+          timer_counter_down = 0;
+          _remainingTime = Duration.zero;
+          _isTimerRunning = false;
+          _timerStarted = false;
+        });
+        _tick?.cancel();
         break;
         
       case 'LAST_TIMER':
-        // Handle both string and int types for final_timer
+        // Extract original timer duration from message
         dynamic finalTimerValue = message['final_timer'];
-        int finalTimer = 0;
+        int originalDuration = 0;
         if (finalTimerValue is int) {
-          finalTimer = finalTimerValue;
+          originalDuration = finalTimerValue;
         } else if (finalTimerValue is String) {
-          finalTimer = int.tryParse(finalTimerValue) ?? 0;
+          originalDuration = int.tryParse(finalTimerValue) ?? 0;
         }
         
-        // Adjust timer based on UTC time difference to account for network latency
-        int adjustedTimer = _calculateAdjustedTimer(
-          finalTimer,
-          message['timer_start'],
-        );
+        print('QuestionPage: LAST_TIMER received, originalDuration=$originalDuration');
         
-        print('QuestionPage: LAST_TIMER received, final_timer: $finalTimer, adjusted: $adjustedTimer');
-        
-        if (adjustedTimer > 0) {
-          _startTimer(adjustedTimer);
-        } else {
-          // Timer expired, set to 0
-          print('QuestionPage: Timer expired (adjusted value: $adjustedTimer), setting to 0');
-          _startTimer(0);
+        // Set total time immediately from message (before loading status)
+        if (mounted && originalDuration > 0) {
+          setState(() {
+            _totalTime = Duration(seconds: originalDuration);
+            print('QuestionPage: Set _totalTime to $originalDuration seconds immediately (LAST_TIMER)');
+          });
         }
+        
+        // Sync with global timer status (this will get remaining time)
+        _loadTimerStatus().then((_) {
+          // Ensure total time is set correctly after loading
+          if (mounted && originalDuration > 0) {
+            setState(() {
+              if (_totalTime.inSeconds != originalDuration) {
+                _totalTime = Duration(seconds: originalDuration);
+                print('QuestionPage: Corrected _totalTime to $originalDuration seconds after loading (LAST_TIMER)');
+              }
+              print('QuestionPage: Final - _totalTime=${_totalTime.inSeconds}s, _remainingTime=${_remainingTime.inSeconds}s, progress=${_remainingTime.inSeconds / _totalTime.inSeconds}');
+            });
+          }
+        });
         break;
         
       default:
@@ -831,8 +1444,13 @@ class _QuestionPageState extends State<QuestionPage> {
   Widget _buildTimer() {
     // Progress calculation: show remaining/total, default (not started) shows full bar
     final progress = _totalTime.inSeconds > 0 
-        ? _remainingTime.inSeconds / _totalTime.inSeconds 
+        ? (_remainingTime.inSeconds / _totalTime.inSeconds).clamp(0.0, 1.0)
         : 1.0;
+    
+    // Debug logging (only log occasionally to avoid spam)
+    if (_timerStarted && _totalTime.inSeconds > 0 && timer_counter_down % 5 == 0) {
+      print('_buildTimer: _totalTime=${_totalTime.inSeconds}s, _remainingTime=${_remainingTime.inSeconds}s, progress=$progress, timer_counter_down=$timer_counter_down');
+    }
     
     // Display "0" when timer hasn't started, otherwise show remaining time
     final displayTime = !_timerStarted ? '0' : _formatDuration(_remainingTime);

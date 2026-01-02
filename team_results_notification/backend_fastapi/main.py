@@ -29,6 +29,163 @@ last_timer_setting = None
 for i in range(1, 21):  # rounds 1-20
     rounds_info[f"round_{i}"] = {"Name": None, "Slide": None, "time_now": None}
 
+# Internal functions to save/retrieve backup data from database
+def _get_backup_table_name(active_game_id: int, db: Session) -> Optional[str]:
+    """Get the backup table name for an active game"""
+    try:
+        active_game = db.query(ActiveGame).filter(ActiveGame.id == active_game_id).first()
+        if not active_game:
+            return None
+        game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
+        if not game:
+            return None
+        game_name = game.game_name.replace(' ', '_').replace('-', '_').lower()
+        return f"backup_data_{game_name}"
+    except Exception as e:
+        logger.error(f"Error getting backup table name: {e}")
+        return None
+
+def _save_rounds_info_to_db(active_game_id: int, db: Session) -> None:
+    """Save rounds_info to database"""
+    try:
+        table_name = _get_backup_table_name(active_game_id, db)
+        if not table_name:
+            logger.warning(f"Cannot save rounds_info: backup table not found for active_game_id {active_game_id}")
+            return
+        
+        # Convert rounds_info to JSON string
+        rounds_info_json = json.dumps(rounds_info, default=str)
+        
+        # Insert or update
+        upsert_sql = text(f"""
+            INSERT INTO `{table_name}` (data_key, data_value, updated_at)
+            VALUES ('rounds_info', :data_value, NOW())
+            ON DUPLICATE KEY UPDATE
+                data_value = :data_value,
+                updated_at = NOW()
+        """)
+        db.execute(upsert_sql, {"data_value": rounds_info_json})
+        db.commit()
+        logger.info(f"Saved rounds_info to {table_name}")
+    except Exception as e:
+        logger.error(f"Error saving rounds_info to database: {e}")
+        db.rollback()
+
+def _save_last_timer_setting_to_db(active_game_id: int, db: Session) -> None:
+    """Save last_timer_setting to database"""
+    try:
+        table_name = _get_backup_table_name(active_game_id, db)
+        if not table_name:
+            logger.warning(f"Cannot save last_timer_setting: backup table not found for active_game_id {active_game_id}")
+            return
+        
+        if last_timer_setting is None:
+            # Delete the entry if setting is None
+            delete_sql = text(f"DELETE FROM `{table_name}` WHERE data_key = 'last_timer_setting'")
+            db.execute(delete_sql)
+            db.commit()
+            logger.info(f"Removed last_timer_setting from {table_name} (value is None)")
+            return
+        
+        # Convert last_timer_setting to JSON string
+        timer_setting_json = json.dumps(last_timer_setting, default=str)
+        
+        # Insert or update
+        upsert_sql = text(f"""
+            INSERT INTO `{table_name}` (data_key, data_value, updated_at)
+            VALUES ('last_timer_setting', :data_value, NOW())
+            ON DUPLICATE KEY UPDATE
+                data_value = :data_value,
+                updated_at = NOW()
+        """)
+        db.execute(upsert_sql, {"data_value": timer_setting_json})
+        db.commit()
+        logger.info(f"Saved last_timer_setting to {table_name}")
+    except Exception as e:
+        logger.error(f"Error saving last_timer_setting to database: {e}")
+        db.rollback()
+
+def _retrieve_rounds_info_from_db(db: Session) -> None:
+    """Retrieve rounds_info from database for the first running active game"""
+    global rounds_info
+    try:
+        # Find first running active game
+        active_game = db.query(ActiveGame).filter(ActiveGame.is_started == 'running').first()
+        if not active_game:
+            logger.info("No running active game found, skipping rounds_info retrieval")
+            return
+        
+        table_name = _get_backup_table_name(active_game.id, db)
+        if not table_name:
+            logger.warning(f"Cannot retrieve rounds_info: backup table not found for active_game_id {active_game.id}")
+            return
+        
+        # Check if table exists
+        check_table_sql = text(f"SHOW TABLES LIKE '{table_name}'")
+        result = db.execute(check_table_sql)
+        if not result.fetchone():
+            logger.info(f"Backup table {table_name} does not exist yet, skipping retrieval")
+            return
+        
+        # Retrieve rounds_info
+        select_sql = text(f"SELECT data_value FROM `{table_name}` WHERE data_key = 'rounds_info'")
+        result = db.execute(select_sql)
+        row = result.fetchone()
+        
+        if row and row[0]:
+            try:
+                retrieved_rounds_info = json.loads(row[0])
+                # Merge with existing structure (preserve all round_1 to round_20 keys)
+                for i in range(1, 21):
+                    round_key = f"round_{i}"
+                    if round_key in retrieved_rounds_info:
+                        rounds_info[round_key] = retrieved_rounds_info[round_key]
+                logger.info(f"Retrieved rounds_info from {table_name}")
+            except json.JSONDecodeError as e:
+                logger.error(f"Error parsing rounds_info JSON: {e}")
+        else:
+            logger.info(f"No rounds_info found in {table_name}")
+    except Exception as e:
+        logger.error(f"Error retrieving rounds_info from database: {e}")
+
+def _retrieve_last_timer_setting_from_db(db: Session) -> None:
+    """Retrieve last_timer_setting from database for the first running active game"""
+    global last_timer_setting
+    try:
+        # Find first running active game
+        active_game = db.query(ActiveGame).filter(ActiveGame.is_started == 'running').first()
+        if not active_game:
+            logger.info("No running active game found, skipping last_timer_setting retrieval")
+            return
+        
+        table_name = _get_backup_table_name(active_game.id, db)
+        if not table_name:
+            logger.warning(f"Cannot retrieve last_timer_setting: backup table not found for active_game_id {active_game.id}")
+            return
+        
+        # Check if table exists
+        check_table_sql = text(f"SHOW TABLES LIKE '{table_name}'")
+        result = db.execute(check_table_sql)
+        if not result.fetchone():
+            logger.info(f"Backup table {table_name} does not exist yet, skipping retrieval")
+            return
+        
+        # Retrieve last_timer_setting
+        select_sql = text(f"SELECT data_value FROM `{table_name}` WHERE data_key = 'last_timer_setting'")
+        result = db.execute(select_sql)
+        row = result.fetchone()
+        
+        if row and row[0]:
+            try:
+                last_timer_setting = json.loads(row[0])
+                logger.info(f"Retrieved last_timer_setting from {table_name}: {last_timer_setting}")
+            except json.JSONDecodeError as e:
+                logger.error(f"Error parsing last_timer_setting JSON: {e}")
+        else:
+            logger.info(f"No last_timer_setting found in {table_name}")
+    except Exception as e:
+        logger.error(f"Error retrieving last_timer_setting from database: {e}")
+
 def create_action_game_control_table(active_game_id: int, db: Session) -> None:
     """
     Create per-game control table action_game_control_<game_name> if it doesn't exist.
@@ -112,6 +269,9 @@ def populate_rounds_info(active_game_id: int, db: Session):
                     "time_now": None
                 }
                 logger.info(f"Set round_{i} to: {round_name}")
+            
+            # Save rounds_info to database
+            _save_rounds_info_to_db(active_game_id, db)
             
         except Exception as e:
             logger.error(f"Error querying game table {game.game_name}: {e}")
@@ -286,6 +446,16 @@ Teams.metadata.create_all(bind=engine)
 ActiveGame.metadata.create_all(bind=engine)
 GamesList.metadata.create_all(bind=engine)
 
+# Retrieve backup data on startup (if there's a running active game)
+try:
+    temp_db = SessionLocal()
+    _retrieve_rounds_info_from_db(temp_db)
+    _retrieve_last_timer_setting_from_db(temp_db)
+    temp_db.close()
+    logger.info("Retrieved backup data from database on startup")
+except Exception as e:
+    logger.warning(f"Could not retrieve backup data on startup (this is normal if no active game exists): {e}")
+
 # Pydantic models
 class UserCreate(BaseModel):
     email: EmailStr
@@ -357,13 +527,13 @@ class UserProfileUpdate(BaseModel):
 class ActiveGameResponse(BaseModel):
     id: int
     game_id: int
-    teams_ids: str  # Comma-separated team IDs
+    teams_ids: Optional[str] = None  # Comma-separated team IDs (can be None)
     question_id: int
     round_id: int
     is_started: str
     timer_on_at: datetime
     timer_off_at: datetime
-    team_ids_finished: str  # Comma-separated team IDs
+    team_ids_finished: Optional[str] = None  # Comma-separated team IDs (can be None)
 
 class Token(BaseModel):
     access_token: str
@@ -1553,8 +1723,8 @@ async def _create_temp_tables_for_active_game(db: Session, active_game: ActiveGa
             id INT AUTO_INCREMENT PRIMARY KEY,
             team_id INT NOT NULL,
             question_id INT,
-            correct_score INT DEFAULT 1,
-            wrong_score INT DEFAULT 0,
+            correct_score FLOAT DEFAULT 1,
+            wrong_score FLOAT DEFAULT 0,
             option_name VARCHAR(255),
             player_approved INT DEFAULT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -1569,11 +1739,11 @@ async def _create_temp_tables_for_active_game(db: Session, active_game: ActiveGa
             id INT AUTO_INCREMENT PRIMARY KEY,
             team_id INT NOT NULL,
             question_id INT NOT NULL,
-            correct_score INT DEFAULT 0,
-            wrong_score INT DEFAULT 0, 
+            correct_score FLOAT DEFAULT 0,
+            wrong_score FLOAT DEFAULT 0, 
             slide_id INT DEFAULT NULL,
             answer TEXT,
-            is_correct INT DEFAULT -1,
+            is_correct INT DEFAULT 0,
             answered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             player_id INT DEFAULT NULL
         )
@@ -1590,7 +1760,7 @@ async def _create_temp_tables_for_active_game(db: Session, active_game: ActiveGa
         CREATE TABLE `{results_table_name}` (
             id INT AUTO_INCREMENT PRIMARY KEY,
             team_id INT NOT NULL,
-            total_score INT DEFAULT 0,
+            total_score FLOAT DEFAULT 0,
             correct_answers INT DEFAULT 0,
             wrong_answers INT DEFAULT 0,
             total_questions INT DEFAULT 0,
@@ -1634,6 +1804,18 @@ async def _create_temp_tables_for_active_game(db: Session, active_game: ActiveGa
                         VALUES ({team_id}, {question_id}, {option.get('correct_score', 1)}, {option.get('wrong_score', 0)}, '{option.get('name', '')}')
                         """
                         db.execute(text(scores_insert_sql))
+        
+        # Table 4: backup_data_<game_name> - for storing rounds_info and last_timer_setting
+        backup_table_name = f"backup_data_{game_name}"
+        backup_table_sql = f"""
+        CREATE TABLE `{backup_table_name}` (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            data_key VARCHAR(255) UNIQUE NOT NULL,
+            data_value TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        )
+        """
+        db.execute(text(backup_table_sql))
         
         db.commit()
         logger.info(f"Created temporary tables for active game: {game_name}")
@@ -2575,8 +2757,13 @@ async def _delete_temp_tables_for_active_game(db: Session, active_game: ActiveGa
         drop_control_sql = f"DROP TABLE IF EXISTS `{action_control_table}`"
         db.execute(text(drop_control_sql))
         
+        # Drop the backup_data table
+        backup_table = f"backup_data_{game_name}"
+        drop_backup_sql = f"DROP TABLE IF EXISTS `{backup_table}`"
+        db.execute(text(drop_backup_sql))
+        
         db.commit()
-        logger.info(f"Deleted temporary tables and action_game_control table for active game: {game_name}")
+        logger.info(f"Deleted temporary tables, action_game_control table, and backup_data table for active game: {game_name}")
         
     except Exception as e:
         logger.error(f"Error deleting temporary tables: {e}")
@@ -3081,6 +3268,8 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
          "Slide#164#START_TIMER#round_7#at#2025-10-29 10:16:49 PM#time#1 min_black"
          "Slide#159#STOP_TIMER##at#2025-10-29 10:14:19 PM"
     """
+    global last_timer_setting  # Declare global to modify the global variable
+    logger.info(f">>>>>>> DATA in BEGGINIG >>>>>>> - rounds_info value: {rounds_info}")
     try:
         timer_start = datetime.utcnow()
         trigger_data = request.trigger_data.strip()
@@ -3332,9 +3521,16 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
             "round_name": round_name,
             "timer_start": timer_start_str,
             "question_id": _id,
-            "final_timer": _timer-2 if _timer > 0 else 0,
-            "question_timer": question_timer-2 if question_timer > 0 else 0
+            "final_timer": _timer,
+            "question_timer": question_timer
         }
+        logger.info(f">>>>>>> SET >>>>>>> - last_timer_setting value: {last_timer_setting}") #
+        logger.info(f">>>>>>> DATA in END >>>>>>> - rounds_info value: {rounds_info}")
+        
+        # Save both to database
+        _save_last_timer_setting_to_db(active_game.id, db)
+        _save_rounds_info_to_db(active_game.id, db)
+        
         return TimerTriggerResponse(
             success=True,
             message=f"Timer {timer_action} triggered successfully",
@@ -3459,44 +3655,27 @@ async def _update_teams_answers_table(active_game: ActiveGame, db: Session):
         
         logger.info(f"Updating teams answers table for game {game.game_name}, teams: {team_ids}")
         
-        # Get all question IDs from the game table
+        # Get all questions from the game table with id and reg_score
+        # question_id in answers table uses id from game table (as before)
+        # but correct_score and wrong_score come from each question's reg_score
+        questions_data = {}  # {question_id: reg_score}
         try:
-            result = db.execute(text(f"SELECT id FROM `{game_table_name}` ORDER BY id"))
+            result = db.execute(text(f"SELECT id, reg_score FROM `{game_table_name}` ORDER BY id"))
             question_rows = result.fetchall()
-            question_ids = [row[0] for row in question_rows]
-            logger.info(f"Found {len(question_ids)} questions in game table: {question_ids}")
+            for row in question_rows:
+                question_id = row[0]  # id from game table (used as question_id in answers table)
+                reg_score = row[1]  # reg_score from game table
+                
+                questions_data[question_id] = reg_score
+            
+            logger.info(f"Found {len(questions_data)} questions in game table")
         except Exception as e:
             logger.error(f"Error getting questions from game table {game_table_name}: {e}")
             return
         
-        if not question_ids:
+        if not questions_data:
             logger.warning(f"No questions found in game table {game_table_name}")
             return
-        
-        # Get reg_score from game table (try to find it, default to "1;0")
-        reg_score_str = "1;0"  # Default
-        try:
-            # Try to get reg_score from first row of game table
-            result = db.execute(text(f"SELECT reg_score FROM `{game_table_name}` LIMIT 1"))
-            row = result.fetchone()
-            if row and row[0]:
-                reg_score_str = str(row[0])
-                logger.info(f"Found reg_score in game table: {reg_score_str}")
-        except Exception as e:
-            # reg_score column might not exist, use default
-            logger.info(f"reg_score column not found or error reading it, using default '1;0': {e}")
-        
-        # Parse reg_score (format: "correct;wrong", e.g., "1;0")
-        try:
-            reg_score_parts = reg_score_str.split(';')
-            default_correct_score = int(reg_score_parts[0]) if len(reg_score_parts) > 0 else 1
-            default_wrong_score = int(reg_score_parts[1]) if len(reg_score_parts) > 1 else 0
-        except Exception as e:
-            logger.warning(f"Error parsing reg_score '{reg_score_str}', using defaults 1;0: {e}")
-            default_correct_score = 1
-            default_wrong_score = 0
-        
-        logger.info(f"Using default scores - correct: {default_correct_score}, wrong: {default_wrong_score}")
         
         # Get scores from active_new_scores table (if they exist)
         scores_override = {}  # {(team_id, question_id): (correct_score, wrong_score)}
@@ -3528,7 +3707,7 @@ async def _update_teams_answers_table(active_game: ActiveGame, db: Session):
                 logger.warning(f"Invalid team ID: {team_id_str}")
                 continue
             
-            for question_id in question_ids:
+            for question_id, reg_score in questions_data.items():
                 # Check if record already exists
                 try:
                     check_result = db.execute(text(f"""
@@ -3545,19 +3724,36 @@ async def _update_teams_answers_table(active_game: ActiveGame, db: Session):
                     logger.warning(f"Error checking existing record: {e}")
                     # Continue anyway, try to insert
                 
-                # Get scores (use override if available, otherwise use defaults)
+                # Get scores for this question
+                # First check for override, then parse reg_score, then use defaults
                 if (team_id, question_id) in scores_override:
                     correct_score, wrong_score = scores_override[(team_id, question_id)]
+                    logger.debug(f"Using override scores for team {team_id}, question {question_id}: {correct_score}/{wrong_score}")
                 else:
-                    correct_score = default_correct_score
-                    wrong_score = default_wrong_score
+                    # Parse reg_score from game table (format: "correct;wrong", e.g., "1;0")
+                    if reg_score:
+                        try:
+                            reg_score_str = str(reg_score)
+                            reg_score_parts = reg_score_str.split(';')
+                            correct_score = float(reg_score_parts[0]) if len(reg_score_parts) > 0 and reg_score_parts[0] else 1
+                            wrong_score = float(reg_score_parts[1]) if len(reg_score_parts) > 1 and reg_score_parts[1] else 0
+                            logger.debug(f"Using reg_score for question {question_id}: {correct_score}/{wrong_score} (from '{reg_score_str}')")
+                        except Exception as e:
+                            logger.warning(f"Error parsing reg_score '{reg_score}' for question {question_id}, using defaults 1;0: {e}")
+                            correct_score = 1
+                            wrong_score = 0
+                    else:
+                        # No reg_score, use defaults
+                        correct_score = 1
+                        wrong_score = 0
+                        logger.debug(f"No reg_score for question {question_id}, using defaults: {correct_score}/{wrong_score}")
                 
                 # Insert new record with default values
                 try:
                     db.execute(text(f"""
                         INSERT INTO `{answers_table_name}` 
                         (team_id, question_id, correct_score, wrong_score, slide_id, answer, is_correct, answered_at, player_id)
-                        VALUES (:team_id, :question_id, :correct_score, :wrong_score, NULL, NULL, FALSE, NULL, NULL)
+                        VALUES (:team_id, :question_id, :correct_score, :wrong_score, NULL, NULL, 0, NULL, NULL)
                     """), {
                         'team_id': team_id,
                         'question_id': question_id,
@@ -3665,6 +3861,9 @@ async def be_ready_to_start(
             rounds_info[round_number] = round_data
             logger.info(f"Cleared rounds_info, keeping only {round_number}")
             logger.info(f"{rounds_info}")
+            
+            # Save rounds_info to database
+            _save_rounds_info_to_db(active_game.id, db)
             
             # Update active_teams_answers table with all questions for each team
             try:
@@ -3830,6 +4029,43 @@ async def get_game_questions_by_round(
         logger.error(f"Error getting game questions by round: {e}")
         raise HTTPException(status_code=500, detail=f"Error retrieving questions: {str(e)}")
 
+@app.get("/api/games/{game_name}/rounds")
+async def get_game_rounds(
+    game_name: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Get all distinct round names for a game
+    Returns list of unique round names
+    """
+    try:
+        # Get game from GamesList
+        game = db.query(GamesList).filter(GamesList.game_name == game_name).first()
+        if not game:
+            raise HTTPException(status_code=404, detail=f"Game '{game_name}' not found")
+        
+        # Query the game table for distinct round names
+        game_table_name = game.game_name
+        query_sql = text(f"""
+            SELECT DISTINCT round_name 
+            FROM `{game_table_name}`
+            WHERE round_name IS NOT NULL AND round_name != ''
+            ORDER BY id
+        """)
+        
+        result = db.execute(query_sql)
+        rows = result.fetchall()
+        
+        # Convert to list of round names
+        rounds = [row[0] for row in rows]
+        
+        return rounds
+        
+    except Exception as e:
+        logger.error(f"Error getting game rounds: {e}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving rounds: {str(e)}")
+
 @app.get("/api/active-games/team-answers/{game_name_safe}/{team_id}")
 async def get_team_answers_for_game(
     game_name_safe: str,
@@ -3894,6 +4130,28 @@ async def get_team_answers_for_game(
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.utcnow()}
 
+@app.get("/api/timer/last-setting")
+async def get_last_timer_setting(current_user: User = Depends(get_current_user)):
+    """
+    Get the last timer setting/command that was sent from the server.
+    This is used to restore timer state when a player logs in or refreshes the page.
+    """
+    try:
+        logger.info(f"GET - rounds_info value: {rounds_info}")
+        logger.info(f"GET /api/timer/last-setting - last_timer_setting value: {last_timer_setting}")
+        if last_timer_setting is None:
+            logger.info("No timer setting available (last_timer_setting is None)")
+            return {"success": False, "message": "No timer setting available", "data": None}
+
+        logger.info(f"Returning last timer setting: {last_timer_setting}")
+        return {
+            "success": True,
+            "data": last_timer_setting
+        }
+    except Exception as e:
+        logger.error(f"Error getting last timer setting: {e}")
+        return {"success": False, "message": f"Error getting last timer setting: {str(e)}", "data": None}
+
 @app.get("/api/app/version")
 async def get_app_version():
     """
@@ -3923,6 +4181,10 @@ async def echo_session(
         db: Session = Depends(get_db)
 ):
     """Echo call for session validation with app visibility status"""
+    logger.info("#########################################################################")
+    logger.info(f">>>>>>> CHECK_IN_ECHO >>>>>>> - last_timer_setting value: {last_timer_setting}")
+    logger.info("#########################################################################")
+    logger.info(f">>>>>>> CHECK_IN_ECHO >>>>>>> - rounds_info value: {rounds_info}")
     try:
         # Extract data from request
         session_token = echo_data.get('session_token')
