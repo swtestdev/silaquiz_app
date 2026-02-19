@@ -18,121 +18,21 @@
 
   <meta charset="UTF-8">
   <meta content="IE=Edge" http-equiv="X-UA-Compatible">
-  <meta name="description" content="A Progressive Web App for interactive quizzes with multiple pages">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-
-  <!-- PWA meta tags -->
-  <meta name="mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="default">
-  <meta name="apple-mobile-web-app-title" content="Quiz PWA">
-  <meta name="msapplication-TileColor" content="#2196F3">
-  <meta name="theme-color" content="#2196F3">
+  <meta name="description" content="A new Flutter project.">
 
   <!-- iOS meta tags & icons -->
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <meta name="apple-mobile-web-app-title" content="pwa_app">
   <link rel="apple-touch-icon" href="icons/Icon-192.png">
-  <link rel="apple-touch-icon" sizes="192x192" href="icons/Icon-192.png">
-  <link rel="apple-touch-icon" sizes="512x512" href="icons/Icon-512.png">
 
   <!-- Favicon -->
   <link rel="icon" type="image/png" href="favicon.png"/>
-  <link rel="shortcut icon" href="favicon.png"/>
 
-  <title>Quiz PWA</title>
+  <title>pwa_app</title>
   <link rel="manifest" href="manifest.json">
-  <style>
-    /* Show loading spinner while app initializes */
-    .loading {
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      height: 100vh;
-      flex-direction: column;
-      gap: 20px;
-    }
-    .spinner {
-      width: 50px;
-      height: 50px;
-      border: 5px solid #f3f3f3;
-      border-top: 5px solid #3498db;
-      border-radius: 50%;
-      animation: spin 1s linear infinite;
-    }
-    @keyframes spin {
-      0% { transform: rotate(0deg); }
-      100% { transform: rotate(360deg); }
-    }
-  </style>
 </head>
 <body>
-  <div id="loading" class="loading">
-    <div class="spinner"></div>
-    <div>Loading Quiz App...</div>
-  </div>
-  <script>
-    // Debug logging for app loading
-    console.log('App protocol:', window.location.protocol);
-    console.log('App URL:', window.location.href);
-  </script>
   <script src="flutter_bootstrap.js" async></script>
-  <script>
-    // Mobile console for debugging (Eruda)
-    // Add ?debug=true to URL to enable console on mobile
-    (function() {
-      const urlParams = new URLSearchParams(window.location.search);
-      if (urlParams.get('debug') === 'true') {
-        var script = document.createElement('script');
-        script.src = 'https://cdn.jsdelivr.net/npm/eruda';
-        script.onload = function() {
-          eruda.init();
-          console.log('Eruda console enabled - add ?debug=true to URL to enable');
-        };
-        document.head.appendChild(script);
-      }
-    })();
-    
-    // Register service worker for PWA functionality with update checking
-    if ('serviceWorker' in navigator) {
-      window.addEventListener('flutter-first-frame', function () {
-        navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' })
-          .then(function(registration) {
-            console.log('Service Worker registered:', registration);
-            
-            // Check for updates periodically
-            setInterval(function() {
-              registration.update();
-            }, 60000); // Check every minute
-            
-            // Listen for service worker updates
-            registration.addEventListener('updatefound', function() {
-              console.log('Service Worker update found');
-              const newWorker = registration.installing;
-              newWorker.addEventListener('statechange', function() {
-                if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
-                  // New service worker is ready, notify the app
-                  console.log('New Service Worker installed, reloading...');
-                  // Force reload to activate new service worker
-                  window.location.reload();
-                }
-              });
-            });
-          })
-          .catch(function(error) {
-            console.error('Service Worker registration failed:', error);
-          });
-        
-        // Hide loading spinner when app loads
-        document.getElementById('loading').style.display = 'none';
-      });
-    }
-    
-    // Hide loading spinner after timeout (if app fails to load)
-    setTimeout(function() {
-      var loading = document.getElementById('loading');
-      if (loading) {
-        loading.style.display = 'none';
-      }
-    }, 30000); // Hide after 30 seconds
-  </script>
 </body>
 </html>

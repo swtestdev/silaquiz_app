@@ -56,29 +56,18 @@ ip addr show
 
 ## Flutter App Configuration
 
-### 1. Update Server URL in login_page.dart
+### 1. Server URL (Runtime Config)
 
-```dart
-// In lib/pages/login_page.dart
-class DatabaseService {
-  // Change this to your server's IP address
-  static String _baseUrl = 'http://YOUR_SERVER_IP:8000/api';
-  
-  // Examples:
-  // static String _baseUrl = 'http://192.168.1.100:8000/api';
-  // static String _baseUrl = 'http://DESKTOP-638BFEB:8000/api';
-  // static String _baseUrl = 'http://10.0.0.50:8000/api';
-}
-```
+The Quze app loads the API base URL from local storage. On first launch, the default is `http://localhost:8000/api`.
 
 ### 2. Dynamic Server Configuration
 
-The app supports dynamic server configuration through the settings dialog:
+Configure the server URL via the **Database Info** dialog on the login screen:
 
-1. Open the app
-2. Go to Settings (if available)
-3. Enter your server's IP address
-4. The WebSocket connection will automatically use the new URL
+1. Open the app and go to the login screen
+2. Tap **Database Info** (below the Sign In / Sign Up buttons)
+3. Select a preset (Local PC, Cloud) or enter a custom URL (e.g. `http://192.168.1.100:8000/api`)
+4. The URL is saved and used for all API and WebSocket connections
 
 ## Testing Tools Configuration
 

@@ -6,16 +6,14 @@ import 'dart:async';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../services/user_data_service.dart';
+import '../services/api_config_service.dart';
 import 'dart:html' as html;
 import 'question_page.dart' show initializeTimerStatus;
 
 // API service class for authentication operations
 class DatabaseService {
-  // FastAPI backend endpoint (mutable at runtime) 
-  // static String _baseUrl = 'http://localhost:8000/api';
-  // static String _baseUrl = 'http://192.168.2.14:8000/api';
-  // static String _baseUrl = 'http://192.168.0.101:8000/api';
-  static String _baseUrl = 'http://DESKTOP-638BFEB:8000/api';
+  // FastAPI backend endpoint - loaded from ApiConfigService at startup, mutable at runtime
+  static String _baseUrl = ApiConfigService.defaultBaseUrl;
 
   static String get baseUrl => _baseUrl;
   static void setBaseUrl(String url) {
@@ -1248,8 +1246,41 @@ class DatabaseService {
       }
       return [];
     } catch (e) {
-      print('Error fetching team answers: $e');
+      print('Error getting team answers: $e');
       return [];
+    }
+  }
+
+  /// Get action_game_control data for a specific round_name
+  /// Returns the last question_id entry for the given round_name
+  static Future<Map<String, dynamic>?> getActionGameControlByRound(String gameNameSafe, String roundName) async {
+    try {
+      final userData = await UserDataService.getUserData();
+      if (userData == null || userData['access_token'] == null) {
+        return null;
+      }
+      
+      final encodedGameName = Uri.encodeComponent(gameNameSafe);
+      final encodedRoundName = Uri.encodeComponent(roundName);
+      
+      final response = await http.get(
+        Uri.parse('$_baseUrl/action-game-control/$encodedGameName/round/$encodedRoundName'),
+        headers: {
+          'Authorization': 'Bearer ${userData['access_token']}',
+          'Content-Type': 'application/json',
+        },
+      );
+      
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        if (data['success'] == true && data['data'] != null) {
+          return data['data'] as Map<String, dynamic>;
+        }
+      }
+      return null;
+    } catch (e) {
+      print('Error getting action_game_control data: $e');
+      return null;
     }
   }
 
@@ -1410,11 +1441,19 @@ class _LoginPageState extends State<LoginPage> {
   // Update this whenever you update pubspec.yaml version
   // Current: version: 1.0.0+2
   static const String _fallbackVersion = '1.0.0';
-  static const String _fallbackBuild = '1';
+  static const String _fallbackBuild = '2';
 
   @override
   void initState() {
     super.initState();
+    // Re-read API URL as safety net (fixes web storage timing on refresh)
+    ApiConfigService.getApiBaseUrl().then((apiUrl) {
+      DatabaseService.setBaseUrl(apiUrl);
+      if (mounted) {
+        setState(() {});
+        _maybeShowVersionUpgradeSnackBar();
+      }
+    });
     if (!_databaseInitialized) {
       // Don't await this - let it run in background
       _initializeDatabase();
@@ -2093,9 +2132,24 @@ class _LoginPageState extends State<LoginPage> {
   }
 
   // Show database configuration information
+  void _maybeShowVersionUpgradeSnackBar() {
+    if (ApiConfigService.wasConfigVersionUpgraded && mounted) {
+      ApiConfigService.clearConfigVersionUpgradedFlag();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'New version installed. Check server URL in Database Info if something doesn\'t work.',
+          ),
+          duration: Duration(seconds: 5),
+        ),
+      );
+    }
+  }
+
   void _showDatabaseInfo() {
     final screenWidth = MediaQuery.of(context).size.width;
     final isSmallScreen = screenWidth < 600;
+    final scrollController = ScrollController();
     
     showDialog(
       context: context,
@@ -2104,13 +2158,24 @@ class _LoginPageState extends State<LoginPage> {
           'Authentication Info',
           style: TextStyle(fontSize: isSmallScreen ? 18 : 20),
         ),
-        content: SingleChildScrollView(
-          child: Column(
+        contentPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
+        content: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxHeight: MediaQuery.of(context).size.height * 0.6,
+            minHeight: 200,
+          ),
+          child: Scrollbar(
+            controller: scrollController,
+            thumbVisibility: true,
+            child: SingleChildScrollView(
+            controller: scrollController,
+            keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+            child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                'Current API Settings:', 
+                'Current API Settings:',
                 style: TextStyle(
                   fontWeight: FontWeight.bold,
                   fontSize: isSmallScreen ? 14 : 16,
@@ -2122,9 +2187,8 @@ class _LoginPageState extends State<LoginPage> {
                 style: TextStyle(fontSize: isSmallScreen ? 12 : 14),
               ),
               const SizedBox(height: 16),
-
               Text(
-                'Switch Environment:', 
+                'Switch Game Server:',
                 style: TextStyle(
                   fontWeight: FontWeight.bold,
                   fontSize: isSmallScreen ? 14 : 16,
@@ -2133,10 +2197,16 @@ class _LoginPageState extends State<LoginPage> {
               const SizedBox(height: 8),
               _EnvSelector(
                 current: DatabaseService.baseUrl,
-                onChanged: (value) {
-                  setState(() {
-                    DatabaseService.setBaseUrl(value);
-                  });
+                scrollController: scrollController,
+                onChanged: (value) async {
+                  DatabaseService.setBaseUrl(value);
+                  await ApiConfigService.setApiBaseUrl(value);
+                  if (mounted) setState(() {});
+                  final isCustomUrl = !value.contains('localhost:8000') &&
+                      !value.contains('pythonanywhere.com');
+                  if (isCustomUrl && context.mounted) {
+                    Navigator.of(context).pop();
+                  }
                 },
               ),
               const SizedBox(height: 16),
@@ -2167,7 +2237,9 @@ class _LoginPageState extends State<LoginPage> {
                 ),
               ),
             ],
+            ),
           ),
+        ),
         ),
         actions: [
           TextButton(
@@ -2237,13 +2309,23 @@ class _LoginPageState extends State<LoginPage> {
             Navigator.pushReplacementNamed(context, '/main');
           }
         } else {
+          final msg = result['message'] ?? 'Login failed';
+          final isConnectionError = msg.toString().contains('Connection') || msg.toString().contains('Failed to fetch');
+          final hint = (kIsWeb && DatabaseService.baseUrl.contains('localhost') && isConnectionError)
+              ? '\n\nOn mobile: use Database Info to set your server IP (e.g. http://192.168.0.1:8000/api).'
+              : '';
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text(result['message'] ?? 'Login failed')),
+            SnackBar(content: Text('$msg$hint'), duration: const Duration(seconds: 8)),
           );
         }
       } catch (e) {
+        final errMsg = e.toString();
+        final isConnectionError = errMsg.contains('Connection') || errMsg.contains('Failed to fetch');
+        final hint = (kIsWeb && DatabaseService.baseUrl.contains('localhost') && isConnectionError)
+            ? '\n\nOn mobile: use Database Info to set your server IP (e.g. http://192.168.0.1:8000/api).'
+            : '';
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error: ${e.toString()}')),
+          SnackBar(content: Text('Error: $errMsg$hint'), duration: const Duration(seconds: 8)),
         );
       } finally {
         setState(() {
@@ -2640,10 +2722,12 @@ class _LoginPageState extends State<LoginPage> {
 
 class _EnvSelector extends StatefulWidget {
   final String current;
+  final ScrollController scrollController;
   final ValueChanged<String> onChanged;
 
   const _EnvSelector({
     required this.current,
+    required this.scrollController,
     required this.onChanged,
   });
 
@@ -2654,12 +2738,47 @@ class _EnvSelector extends StatefulWidget {
 class _EnvSelectorState extends State<_EnvSelector> {
   late String _selected;
   final _customController = TextEditingController();
+  final _customFieldKey = GlobalKey();
+  final FocusNode _customFocusNode = FocusNode();
+  final FocusNode _localFocusNode = FocusNode();
+  final FocusNode _cloudFocusNode = FocusNode();
+  final FocusNode _customRadioFocusNode = FocusNode();
+  bool _showCustomExample = false;
 
   @override
   void initState() {
     super.initState();
     _selected = _inferPreset(widget.current);
     _customController.text = widget.current;
+    _showCustomExample = _selected == 'custom';
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _focusSelectedOption();
+    });
+  }
+
+  @override
+  void didUpdateWidget(_EnvSelector oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.current != oldWidget.current) {
+      _selected = _inferPreset(widget.current);
+      _customController.text = widget.current;
+      _showCustomExample = _selected == 'custom';
+      // Defer setState to next frame to avoid "RenderBox was not laid out" during build
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) setState(() {});
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _customController.dispose();
+    _customFocusNode.dispose();
+    _localFocusNode.dispose();
+    _cloudFocusNode.dispose();
+    _customRadioFocusNode.dispose();
+    super.dispose();
   }
 
   String _inferPreset(String url) {
@@ -2673,20 +2792,118 @@ class _EnvSelectorState extends State<_EnvSelector> {
     setState(() {
       _selected = _inferPreset(value);
       _customController.text = value;
+      _showCustomExample = _selected == 'custom';
     });
+    _focusSelectedOption();
+  }
+
+  void _focusSelectedOption() {
+    switch (_selected) {
+      case 'local':
+        _localFocusNode.requestFocus();
+        break;
+      case 'cloud':
+        _cloudFocusNode.requestFocus();
+        break;
+      case 'custom':
+      default:
+        _focusCustomField();
+        break;
+    }
+  }
+
+  void _focusCustomField() {
+    void doFocus() {
+      if (!mounted) return;
+      _customRadioFocusNode.unfocus();
+      _customFocusNode.requestFocus();
+      _customController.selection = const TextSelection.collapsed(offset: 0);
+    }
+    void scheduleFocus() {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        doFocus();
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          doFocus();
+          Future.delayed(const Duration(milliseconds: 150), doFocus);
+          Future.delayed(const Duration(milliseconds: 400), doFocus);
+        });
+      });
+    }
+    scheduleFocus();
+  }
+
+  Widget _buildCustomField(bool isSmallScreen) {
+    return RepaintBoundary(
+      key: _customFieldKey,
+      child: TextField(
+        controller: _customController,
+        focusNode: _customFocusNode,
+        autofocus: true,
+        keyboardType: TextInputType.url,
+        decoration: InputDecoration(
+          hintText: isSmallScreen
+              ? 'e.g. http://localhost:8000/api'
+              : 'e.g. http://DESKTOP-638BFEB:8000/api or http://192.168.2.14:8000/api',
+          helperText: _showCustomExample
+              ? (isSmallScreen
+                  ? 'Example: http://localhost:8000/api'
+                  : 'Example: http://DESKTOP-638BFEB:8000/api')
+              : null,
+          isDense: true,
+          border: const OutlineInputBorder(),
+          contentPadding: EdgeInsets.symmetric(
+            horizontal: isSmallScreen ? 8 : 12,
+            vertical: isSmallScreen ? 8 : 12,
+          ),
+        ),
+        style: TextStyle(fontSize: isSmallScreen ? 12 : 14),
+        onChanged: (_) {
+          if (_showCustomExample) {
+            setState(() {
+              _showCustomExample = false;
+            });
+          }
+        },
+      ),
+    );
+  }
+
+  Widget _buildApplyButton(bool isSmallScreen) {
+    return Align(
+      alignment: Alignment.centerRight,
+      child: ElevatedButton(
+        onPressed: () {
+          final value = _customController.text.trim();
+          if (value.isNotEmpty) {
+            _apply(value);
+          }
+        },
+        style: ElevatedButton.styleFrom(
+          padding: EdgeInsets.symmetric(
+            horizontal: isSmallScreen ? 12 : 16,
+            vertical: isSmallScreen ? 8 : 12,
+          ),
+        ),
+        child: Text(
+          'Apply',
+          style: TextStyle(fontSize: isSmallScreen ? 12 : 14),
+        ),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     final screenWidth = MediaQuery.of(context).size.width;
     final isSmallScreen = screenWidth < 600;
-    
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         RadioListTile<String>(
           dense: true,
           contentPadding: EdgeInsets.zero,
+          focusNode: _localFocusNode,
           title: Text(
             'Local PC (example: DESKTOP-638BFEB / 192.168.2.14)',
             style: TextStyle(fontSize: isSmallScreen ? 12 : 14),
@@ -2705,6 +2922,7 @@ class _EnvSelectorState extends State<_EnvSelector> {
         RadioListTile<String>(
           dense: true,
           contentPadding: EdgeInsets.zero,
+          focusNode: _cloudFocusNode,
           title: Text(
             'Cloud (PythonAnywhere)',
             style: TextStyle(fontSize: isSmallScreen ? 12 : 14),
@@ -2723,6 +2941,7 @@ class _EnvSelectorState extends State<_EnvSelector> {
         RadioListTile<String>(
           dense: true,
           contentPadding: EdgeInsets.zero,
+          focusNode: _customRadioFocusNode,
           title: Text(
             'Custom',
             style: TextStyle(fontSize: isSmallScreen ? 12 : 14),
@@ -2731,47 +2950,17 @@ class _EnvSelectorState extends State<_EnvSelector> {
           groupValue: _selected,
           onChanged: (v) {
             if (v == null) return;
-            setState(() { _selected = 'custom'; });
+            setState(() {
+              _selected = 'custom';
+              _showCustomExample = true;
+            });
+            _focusCustomField();
           },
         ),
         if (_selected == 'custom') ...[
-          TextField(
-            controller: _customController,
-            decoration: InputDecoration(
-              hintText: isSmallScreen 
-                  ? 'e.g. http://localhost:8000/api'
-                  : 'e.g. http://DESKTOP-638BFEB:8000/api or http://192.168.2.14:8000/api',
-              isDense: true,
-              border: const OutlineInputBorder(),
-              contentPadding: EdgeInsets.symmetric(
-                horizontal: isSmallScreen ? 8 : 12,
-                vertical: isSmallScreen ? 8 : 12,
-              ),
-            ),
-            style: TextStyle(fontSize: isSmallScreen ? 12 : 14),
-          ),
+          _buildCustomField(isSmallScreen),
           const SizedBox(height: 8),
-          Align(
-            alignment: Alignment.centerRight,
-            child: ElevatedButton(
-              onPressed: () {
-                final value = _customController.text.trim();
-                if (value.isNotEmpty) {
-                  _apply(value);
-                }
-              },
-              style: ElevatedButton.styleFrom(
-                padding: EdgeInsets.symmetric(
-                  horizontal: isSmallScreen ? 12 : 16,
-                  vertical: isSmallScreen ? 8 : 12,
-                ),
-              ),
-              child: Text(
-                'Apply',
-                style: TextStyle(fontSize: isSmallScreen ? 12 : 14),
-              ),
-            ),
-          ),
+          _buildApplyButton(isSmallScreen),
         ],
       ],
     );

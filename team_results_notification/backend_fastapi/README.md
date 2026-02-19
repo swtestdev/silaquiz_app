@@ -33,15 +33,18 @@ CREATE DATABASE IF NOT EXISTS game_sila_misly;
 
 ## Configuration
 
-Update the database connection in `main.py`:
-```python
-DATABASE_URL = "mysql+pymysql://root:19761982@localhost/game_sila_misly"
-```
+Configuration is loaded from environment variables. Copy `.env.example` to `.env` and set:
 
-For production, update:
-- `SECRET_KEY` for JWT tokens
-- CORS origins in `allow_origins`
-- SSL certificates for HTTPS
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `DATABASE_URL` | MySQL connection string | `mysql+pymysql://root:19761982@localhost:3306/game_sila_misly` |
+| `SECRET_KEY` | JWT signing key | (dev default - **must** set in production) |
+| `CORS_ORIGINS` | Comma-separated allowed origins, or `*` for allow-all | `*` |
+
+For production:
+- Set `SECRET_KEY` to a strong random value
+- Set `CORS_ORIGINS` to your PWA domain(s)
+- Use SSL certificates for HTTPS
 
 ## Running the Server
 

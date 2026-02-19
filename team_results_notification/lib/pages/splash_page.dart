@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import '../services/user_data_service.dart';
+import '../services/api_config_service.dart';
+import 'login_page.dart' show DatabaseService;
 
 class SplashPage extends StatefulWidget {
   const SplashPage({super.key});
@@ -17,6 +19,10 @@ class _SplashPageState extends State<SplashPage> {
 
   Future<void> _checkLoginStatus() async {
     print('=== SPLASH PAGE _checkLoginStatus START ===');
+    // Load API config and apply to DatabaseService
+    final apiUrl = await ApiConfigService.getApiBaseUrl();
+    DatabaseService.setBaseUrl(apiUrl);
+    print('API base URL loaded: $apiUrl');
     // Add a minimal delay for splash screen effect (reduced from 2 seconds)
     print('Waiting 0.5 seconds for splash screen effect...');
     await Future.delayed(const Duration(milliseconds: 500));
@@ -60,7 +66,7 @@ class _SplashPageState extends State<SplashPage> {
               ),
               SizedBox(height: 24),
               Text(
-                'Quiz Сила Мысли',
+                'Quze',
                 style: TextStyle(
                   fontSize: 28,
                   fontWeight: FontWeight.bold,

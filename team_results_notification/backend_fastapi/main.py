@@ -14,6 +14,9 @@ import jwt
 import uvicorn
 import os
 import logging
+from dotenv import load_dotenv
+
+load_dotenv()
 import json
 import asyncio
 from typing import Optional, List, Dict, Any, Union
@@ -53,8 +56,8 @@ def _save_rounds_info_to_db(active_game_id: int, db: Session) -> None:
             logger.warning(f"Cannot save rounds_info: backup table not found for active_game_id {active_game_id}")
             return
         
-        # Convert rounds_info to JSON string
-        rounds_info_json = json.dumps(rounds_info, default=str)
+        # Convert rounds_info to JSON string with proper Unicode encoding
+        rounds_info_json = json.dumps(rounds_info, default=str, ensure_ascii=False)
         
         # Insert or update
         upsert_sql = text(f"""
@@ -87,8 +90,8 @@ def _save_last_timer_setting_to_db(active_game_id: int, db: Session) -> None:
             logger.info(f"Removed last_timer_setting from {table_name} (value is None)")
             return
         
-        # Convert last_timer_setting to JSON string
-        timer_setting_json = json.dumps(last_timer_setting, default=str)
+        # Convert last_timer_setting to JSON string with proper Unicode encoding
+        timer_setting_json = json.dumps(last_timer_setting, default=str, ensure_ascii=False)
         
         # Insert or update
         upsert_sql = text(f"""
@@ -134,6 +137,8 @@ def _retrieve_rounds_info_from_db(db: Session) -> None:
         
         if row and row[0]:
             try:
+                # Decode JSON with proper Unicode handling
+                # json.loads automatically decodes Unicode escape sequences like \u0412
                 retrieved_rounds_info = json.loads(row[0])
                 # Merge with existing structure (preserve all round_1 to round_20 keys)
                 for i in range(1, 21):
@@ -177,6 +182,8 @@ def _retrieve_last_timer_setting_from_db(db: Session) -> None:
         
         if row and row[0]:
             try:
+                # Decode JSON with proper Unicode handling
+                # json.loads automatically decodes Unicode escape sequences like \u0412
                 last_timer_setting = json.loads(row[0])
                 logger.info(f"Retrieved last_timer_setting from {table_name}: {last_timer_setting}")
             except json.JSONDecodeError as e:
@@ -303,8 +310,11 @@ def add_seconds_to_datetime(datetime_str: str, seconds_to_add: int) -> str:
     # Keep the same format for output
     return new_dt.strftime(input_format)
 
-# Database configuration
-DATABASE_URL = "mysql+pymysql://root:19761982@localhost:3306/game_sila_misly"
+# Database configuration (from env or default for local dev)
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "mysql+pymysql://root:19761982@localhost:3306/game_sila_misly"
+)
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -317,18 +327,20 @@ except Exception as e:
     logger.warning(f"Bcrypt not available, using pbkdf2_sha256: {e}")
     pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
-# JWT settings
-SECRET_KEY = "your-secret-key-change-this-in-production"
+# JWT settings (SECRET_KEY from env in production)
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 # FastAPI app
-app = FastAPI(title="Team Results Notification API", version="1.0.0")
+app = FastAPI(title="Quze Game API", version="1.0.0")
 
-# CORS middleware
+# CORS middleware (CORS_ORIGINS env: comma-separated, or "*" for allow-all)
+_cors_origins = os.getenv("CORS_ORIGINS", "*")
+CORS_ORIGINS = [o.strip() for o in _cors_origins.split(",")] if _cors_origins != "*" else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure this properly for production
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -4151,6 +4163,66 @@ async def get_last_timer_setting(current_user: User = Depends(get_current_user))
     except Exception as e:
         logger.error(f"Error getting last timer setting: {e}")
         return {"success": False, "message": f"Error getting last timer setting: {str(e)}", "data": None}
+
+@app.get("/api/action-game-control/{game_name_safe}/round/{round_name}")
+async def get_action_game_control_by_round(
+    game_name_safe: str,
+    round_name: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Get action_game_control data for a specific round_name.
+    Returns the last question_id entry for the given round_name.
+    """
+    try:
+        # Find the active game
+        active_game = db.query(ActiveGame).filter(ActiveGame.is_started == 'running').first()
+        if not active_game:
+            return {"success": False, "message": "No active game found", "data": None}
+        
+        # Get game info
+        game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
+        if not game:
+            return {"success": False, "message": "Game not found", "data": None}
+        
+        # Normalize game name for table identifier
+        game_name_normalized = str(game.game_name).strip().lower().replace(' ', '_').replace('-', '_')
+        table_name = f"action_game_control_{game_name_normalized}"
+        
+        # Check if table exists
+        check_table_sql = text(f"SHOW TABLES LIKE '{table_name}'")
+        result = db.execute(check_table_sql)
+        if not result.fetchone():
+            return {"success": False, "message": f"Control table {table_name} does not exist", "data": None}
+        
+        # Get the last entry for this round_name (by question_id DESC)
+        select_sql = text(f"""
+            SELECT question_id, slide_number, round_name, timer_start 
+            FROM `{table_name}` 
+            WHERE round_name = :round_name 
+            ORDER BY question_id DESC 
+            LIMIT 1
+        """)
+        result = db.execute(select_sql, {"round_name": round_name})
+        row = result.fetchone()
+        
+        if row:
+            return {
+                "success": True,
+                "data": {
+                    "question_id": row[0],
+                    "slide_number": row[1],
+                    "round_name": row[2],
+                    "timer_start": row[3].isoformat() if row[3] else None
+                }
+            }
+        else:
+            return {"success": False, "message": f"No data found for round_name: {round_name}", "data": None}
+            
+    except Exception as e:
+        logger.error(f"Error getting action_game_control data: {e}")
+        return {"success": False, "message": f"Error: {str(e)}", "data": None}
 
 @app.get("/api/app/version")
 async def get_app_version():

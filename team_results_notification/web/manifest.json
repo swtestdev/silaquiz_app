@@ -1,16 +1,13 @@
 {
-    "name": "Quiz PWA",
-    "short_name": "Quiz PWA",
+    "name": "pwa_app",
+    "short_name": "pwa_app",
     "start_url": ".",
-    "display": "fullscreen",
-    "background_color": "#2196F3",
-    "theme_color": "#2196F3",
-    "description": "A Progressive Web App for interactive quizzes with multiple pages",
+    "display": "standalone",
+    "background_color": "#0175C2",
+    "theme_color": "#0175C2",
+    "description": "A new Flutter project.",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
-    "categories": ["education", "entertainment"],
-    "lang": "en",
-    "scope": "/",
     "icons": [
         {
             "src": "icons/Icon-192.png",

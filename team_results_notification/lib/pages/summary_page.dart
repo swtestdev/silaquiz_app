@@ -22,6 +22,13 @@ class _SummaryPageState extends State<SummaryPage> {
   @override
   void initState() {
     super.initState();
+    // Check if page was refreshed (no navigation history) - redirect to main page (same as Question page)
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && !Navigator.canPop(context)) {
+        Navigator.pushReplacementNamed(context, '/main');
+        return;
+      }
+    });
     _loadSummaryData();
   }
 
@@ -204,7 +211,11 @@ class _SummaryPageState extends State<SummaryPage> {
         leading: IconButton(
           icon: const Icon(Icons.arrow_back),
           onPressed: () {
-            Navigator.pop(context);
+            if (Navigator.canPop(context)) {
+              Navigator.pop(context);
+            } else {
+              Navigator.pushReplacementNamed(context, '/main');
+            }
           },
         ),
       ),
@@ -227,7 +238,11 @@ class _SummaryPageState extends State<SummaryPage> {
                         const SizedBox(height: 24),
                         ElevatedButton(
                           onPressed: () {
-                            Navigator.pop(context);
+                            if (Navigator.canPop(context)) {
+                              Navigator.pop(context);
+                            } else {
+                              Navigator.pushReplacementNamed(context, '/main');
+                            }
                           },
                           child: const Text('Go Back'),
                         ),

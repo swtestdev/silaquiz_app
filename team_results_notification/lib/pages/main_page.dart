@@ -1,10 +1,11 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart';
+import 'package:flutter/foundation.dart' show kDebugMode, kIsWeb;
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'dart:convert';
 import 'dart:async';
 import 'dart:html' as html;
 import '../widgets/user_info_widget.dart';
+import '../services/api_config_service.dart';
 import '../services/user_data_service.dart';
 import 'login_page.dart'; // For DatabaseService
 import 'question_page.dart' as question_page; // For timer message forwarding and initializeTimerStatus
@@ -40,11 +41,14 @@ class _MainPageState extends State<MainPage> {
   
   // WebSocket state
   WebSocketChannel? _channel;
+  bool _hasShownLocalhostHint = false;
+  int _webSocketReconnectAttempts = 0;
 
   @override
   void initState() {
     super.initState();
-    _checkLoginStatus();
+    // Re-read API config before any API/WebSocket calls (fixes web localStorage timing on refresh)
+    _loadConfigAndCheckLogin();
     
     // Track app visibility changes
     WidgetsBinding.instance.addObserver(_AppLifecycleObserver(
@@ -64,6 +68,29 @@ class _MainPageState extends State<MainPage> {
     
     // Track browser tab visibility for web
     _setupBrowserVisibilityDetection();
+
+    // Show version upgrade message if config was from older app
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (ApiConfigService.wasConfigVersionUpgraded) {
+        ApiConfigService.clearConfigVersionUpgradedFlag();
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'New version installed. Check server URL in Database Info if something doesn\'t work.',
+            ),
+            duration: Duration(seconds: 5),
+          ),
+        );
+      }
+    });
+  }
+
+  Future<void> _loadConfigAndCheckLogin() async {
+    final apiUrl = await ApiConfigService.getApiBaseUrl();
+    DatabaseService.setBaseUrl(apiUrl);
+    if (!mounted) return;
+    await _checkLoginStatus();
   }
 
   Future<void> _checkLoginStatus() async {
@@ -934,6 +961,7 @@ class _MainPageState extends State<MainPage> {
       );
       
       // Set visible connected status when WebSocket connects
+      _webSocketReconnectAttempts = 0; // Reset backoff on success
       setState(() {
         _visibleConnected = 1;
       });
@@ -969,6 +997,7 @@ class _MainPageState extends State<MainPage> {
               _visibleConnected = 0;
             });
             print('WebSocket error, setting visible_connected = 0');
+            _maybeShowLocalhostMobileHint();
           }
           // WebSocket error might indicate connection issues, check if we should logout
           _handleWebSocketDisconnection();
@@ -1007,8 +1036,25 @@ class _MainPageState extends State<MainPage> {
         setState(() {
           _visibleConnected = 0;
         });
+        _maybeShowLocalhostMobileHint();
       }
     }
+  }
+
+  void _maybeShowLocalhostMobileHint() {
+    if (_hasShownLocalhostHint || !mounted) return;
+    final baseUrl = DatabaseService.baseUrl;
+    if (!kIsWeb || !baseUrl.contains('localhost')) return;
+    _hasShownLocalhostHint = true;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: const Text(
+          'On mobile, localhost does not work. Log out, then tap Database Info on the login screen to set your server IP (e.g. http://192.168.0.1:8000/api).',
+        ),
+        duration: const Duration(seconds: 8),
+        backgroundColor: Colors.orange.shade800,
+      ),
+    );
   }
 
   // Ensure WebSocket is connected, reconnect if needed
@@ -1053,10 +1099,16 @@ class _MainPageState extends State<MainPage> {
     }
     
     _disconnectionHandlerRunning = true;
-    print('WebSocket disconnected, attempting to reconnect...');
+    // Backoff: 1s, 2s, 4s, 8s, 16s, 30s... to avoid reconnect spam when URL is wrong
+    final baseUrl = DatabaseService.baseUrl;
+    final useBackoff = kIsWeb && baseUrl.contains('localhost');
+    final delaySeconds = useBackoff
+        ? (1 << _webSocketReconnectAttempts.clamp(0, 5)).clamp(1, 30)
+        : 1;
+    _webSocketReconnectAttempts = (_webSocketReconnectAttempts + 1).clamp(0, 10);
+    print('WebSocket disconnected, reconnecting in ${delaySeconds}s (attempt $_webSocketReconnectAttempts)...');
     
-    // Try to reconnect immediately if user is still logged in
-    Future.delayed(const Duration(seconds: 1), () async {
+    Future.delayed(Duration(seconds: delaySeconds), () async {
       if (!mounted) {
         _disconnectionHandlerRunning = false;
         return;
