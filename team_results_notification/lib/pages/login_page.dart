@@ -156,7 +156,11 @@ class DatabaseService {
   }
 
   // Method to send ECHO call for session validation
-  static Future<Map<String, dynamic>> sendEchoCall(bool appVisible) async {
+  static Future<Map<String, dynamic>> sendEchoCall(
+    bool appVisible, {
+    String source = 'periodic',
+    String? visibilityReason,
+  }) async {
     try {
       final userData = await UserDataService.getUserData();
       if (userData == null || userData['access_token'] == null || userData['session_token'] == null) {
@@ -167,16 +171,22 @@ class DatabaseService {
         };
       }
 
+      final body = <String, dynamic>{
+        'session_token': userData['session_token'],
+        'app_visible': appVisible,
+        'source': source,
+      };
+      if (visibilityReason != null && visibilityReason.isNotEmpty) {
+        body['visibility_reason'] = visibilityReason;
+      }
+
       final response = await http.post(
         Uri.parse('$_baseUrl/auth/echo'),
         headers: {
           'Content-Type': 'application/json',
           'Authorization': 'Bearer ${userData['access_token']}',
         },
-        body: jsonEncode({
-          'session_token': userData['session_token'],
-          'app_visible': appVisible,
-        }),
+        body: jsonEncode(body),
       ).timeout(const Duration(seconds: 5));
 
       if (response.statusCode == 200) {
@@ -1217,6 +1227,37 @@ class DatabaseService {
     }
   }
 
+  /// Single question by game table primary key (when round-filtered list is empty).
+  static Future<Map<String, dynamic>?> getGameQuestionById(String gameName, int questionId) async {
+    try {
+      final userData = await UserDataService.getUserData();
+      if (userData == null || userData['access_token'] == null) {
+        return null;
+      }
+
+      final encodedGameName = Uri.encodeComponent(gameName);
+
+      final response = await http.get(
+        Uri.parse('$_baseUrl/games/$encodedGameName/question-by-id/$questionId'),
+        headers: {
+          'Authorization': 'Bearer ${userData['access_token']}',
+          'Content-Type': 'application/json',
+        },
+      );
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        if (data is Map) {
+          return Map<String, dynamic>.from(data);
+        }
+      }
+      return null;
+    } catch (e) {
+      print('Error fetching game question by id: $e');
+      return null;
+    }
+  }
+
   /// Get team answers for a specific game
   /// Returns list of answers keyed by question_id
   static Future<List<Map<String, dynamic>>> getTeamAnswersForGame(String gameNameSafe, int teamId) async {
@@ -1248,6 +1289,90 @@ class DatabaseService {
     } catch (e) {
       print('Error getting team answers: $e');
       return [];
+    }
+  }
+
+  /// Batch upsert team answer text in active_teams_answers_{game} (writer-only; server enforces).
+  static Future<Map<String, dynamic>> putTeamAnswersBatch(
+    String gameNameSafe,
+    int teamId,
+    List<Map<String, dynamic>> answers, {
+    String? roundName,
+    int? roundTimer,
+    Object? clientRevision,
+  }) async {
+    try {
+      final userData = await UserDataService.getUserData();
+      if (userData == null || userData['access_token'] == null) {
+        return {
+          'success': false,
+          'error': 'not_authenticated',
+          'message': 'No user session',
+        };
+      }
+      final encodedGameName = Uri.encodeComponent(gameNameSafe);
+      final body = <String, dynamic>{
+        'answers': answers
+            .map(
+              (a) {
+                final m = <String, dynamic>{
+                  'question_id': a['question_id'],
+                  'answer': a['answer'] ?? '',
+                };
+                if (a['correct_score'] != null) {
+                  m['correct_score'] = a['correct_score'];
+                }
+                if (a['wrong_score'] != null) {
+                  m['wrong_score'] = a['wrong_score'];
+                }
+                return m;
+              },
+            )
+            .toList(),
+      };
+      if (roundName != null && roundName.isNotEmpty) {
+        body['round_name'] = roundName;
+      }
+      if (roundTimer != null) {
+        body['round_timer'] = roundTimer;
+      }
+      if (clientRevision != null) {
+        body['client_revision'] = clientRevision;
+      }
+      final response = await http.put(
+        Uri.parse('$_baseUrl/active-games/team-answers/$encodedGameName/$teamId'),
+        headers: {
+          'Authorization': 'Bearer ${userData['access_token']}',
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode(body),
+      );
+      final dynamic decoded = response.body.isNotEmpty ? jsonDecode(response.body) : null;
+      if (response.statusCode == 200) {
+        if (decoded is Map) {
+          return Map<String, dynamic>.from(decoded);
+        }
+        return {'success': true, 'updated': 0, 'conflicts': []};
+      }
+      if (response.statusCode == 409) {
+        return {
+          'success': false,
+          'statusCode': 409,
+          'raw': decoded,
+        };
+      }
+      return {
+        'success': false,
+        'statusCode': response.statusCode,
+        'message': decoded is Map ? (decoded['detail']?.toString() ?? response.body) : response.body,
+      };
+    } catch (e) {
+      print('Error putTeamAnswersBatch: $e');
+      return {
+        'success': false,
+        'error': 'network',
+        'message': e.toString(),
+      };
     }
   }
 
@@ -1431,8 +1556,8 @@ class _LoginPageState extends State<LoginPage> {
   // Version info
   String _appVersion = 'Loading...';
   String _buildNumber = '';
-  bool _updateAvailable = false;
-  String? _latestVersion;
+  /// Avoid showing the native update dialog on every periodic version check.
+  bool _didPromptNativeUpdateThisSession = false;
   
   // Periodic update check timer
   Timer? _updateCheckTimer;
@@ -1503,11 +1628,6 @@ class _LoginPageState extends State<LoginPage> {
       if (updatingApp && updateStartedAt != null) {
         print('This is an update reload, will verify version after short delay');
         
-        // Suppress update notifications during the update process
-        setState(() {
-          _updateAvailable = false;
-        });
-        
         // After a short delay, check if version updated and clear flags
         // Reduced delay for faster update verification
         Future.delayed(const Duration(seconds: 2), () async {
@@ -1571,13 +1691,7 @@ class _LoginPageState extends State<LoginPage> {
                   await prefs.remove('update_started_at');
                   await prefs.remove('last_update_version');
                   
-                  // Update UI
-                  if (mounted) {
-                    setState(() {
-                      _updateAvailable = false;
-                      _latestVersion = null;
-                    });
-                  }
+                  if (mounted) await _loadVersionInfo();
                   print('Update flags cleared - version matches');
                 } else {
                   print('Version still doesn\'t match. Current: $currentVersion, Latest: $latestVersion');
@@ -1791,14 +1905,17 @@ class _LoginPageState extends State<LoginPage> {
             if (latestFullVersion != currentVersion && !isUpdating) {
               print('>>> UPDATE AVAILABLE! <<<');
               print('Latest: $latestFullVersion, Current: $currentVersion');
-              print('Auto-updating silently (no notification)...');
               
-              // Save that we're updating
               await prefs.setString('last_update_version', latestFullVersion);
               
-              // Automatically trigger update without showing notification
-              // Update happens immediately without delay
-              _handleUpdateSilently();
+              if (kIsWeb) {
+                print('Web: auto-updating silently (cache clear + reload)...');
+                await _handleUpdateSilently();
+              } else if (!_didPromptNativeUpdateThisSession) {
+                _didPromptNativeUpdateThisSession = true;
+                print('Native: showing update instructions (once this session)...');
+                await _handleUpdate();
+              }
             } else if (latestFullVersion == currentVersion) {
               // Version matches - we're up to date!
               print('>>> VERSION IS UP TO DATE <<<');
@@ -1808,13 +1925,6 @@ class _LoginPageState extends State<LoginPage> {
               // Clear any stored update notification flag
               await prefs.remove('last_update_version');
               
-              // Clear update available flag
-              setState(() {
-                _updateAvailable = false;
-                _latestVersion = null;
-              });
-              
-              // Reload version info to ensure UI shows correct version
               _loadVersionInfo();
             } else {
               print('>>> UNEXPECTED STATE <<<');
@@ -1830,91 +1940,6 @@ class _LoginPageState extends State<LoginPage> {
     } catch (e) {
       print('Error checking for updates: $e');
     }
-  }
-  
-  // Show update notification dialog
-  void _showUpdateNotification() {
-    print('=== _showUpdateNotification() called ===');
-    print('_updateAvailable: $_updateAvailable');
-    print('_latestVersion: $_latestVersion');
-    print('mounted: $mounted');
-    
-    final screenWidth = MediaQuery.of(context).size.width;
-    final isSmallScreen = screenWidth < 600;
-    
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        title: Row(
-          children: [
-            Icon(Icons.system_update, color: Colors.orange, size: isSmallScreen ? 24 : 28),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                'Update Available',
-                style: TextStyle(fontSize: isSmallScreen ? 18 : 20),
-              ),
-            ),
-          ],
-        ),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'A new version of the app is available!',
-              style: TextStyle(fontSize: isSmallScreen ? 14 : 16),
-            ),
-            const SizedBox(height: 12),
-            Text(
-              'Current Version: $_appVersion+$_buildNumber',
-              style: TextStyle(
-                fontSize: isSmallScreen ? 12 : 14,
-                color: Colors.grey[600],
-              ),
-            ),
-            Text(
-              'Latest Version: $_latestVersion',
-              style: TextStyle(
-                fontSize: isSmallScreen ? 12 : 14,
-                color: Colors.grey[600],
-              ),
-            ),
-            const SizedBox(height: 16),
-            Text(
-              'Would you like to update now?',
-              style: TextStyle(fontSize: isSmallScreen ? 14 : 16),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () {
-              Navigator.of(context).pop();
-            },
-            child: Text(
-              'Later',
-              style: TextStyle(fontSize: isSmallScreen ? 14 : 16),
-            ),
-          ),
-          ElevatedButton(
-            onPressed: () {
-              Navigator.of(context).pop();
-              _handleUpdate();
-            },
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.blue,
-              foregroundColor: Colors.white,
-            ),
-            child: Text(
-              'Update Now',
-              style: TextStyle(fontSize: isSmallScreen ? 14 : 16),
-            ),
-          ),
-        ],
-      ),
-    );
   }
   
   // Handle app update silently - no UI, automatic update
@@ -2415,7 +2440,6 @@ class _LoginPageState extends State<LoginPage> {
   @override
   Widget build(BuildContext context) {
     final screenWidth = MediaQuery.of(context).size.width;
-    final screenHeight = MediaQuery.of(context).size.height;
     final keyboardHeight = MediaQuery.of(context).viewInsets.bottom;
     final isSmallScreen = screenWidth < 600;
     final isVerySmallScreen = screenWidth < 400;

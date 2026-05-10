@@ -3,10 +3,10 @@ import 'package:flutter/foundation.dart' show kDebugMode, kIsWeb;
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'dart:convert';
 import 'dart:async';
-import 'dart:html' as html;
 import '../widgets/user_info_widget.dart';
 import '../services/api_config_service.dart';
 import '../services/user_data_service.dart';
+import '../services/strict_visibility_service.dart';
 import 'login_page.dart'; // For DatabaseService
 import 'question_page.dart' as question_page; // For timer message forwarding and initializeTimerStatus
 
@@ -28,7 +28,6 @@ class _MainPageState extends State<MainPage> {
   bool _sessionValidationInProgress = false;
   bool _disconnectionHandlerRunning = false;
   Timer? _echoTimer;
-  bool _isAppVisible = true;
   bool _hasShownNotification = false;
   
   // Writer status tracking
@@ -49,25 +48,17 @@ class _MainPageState extends State<MainPage> {
     super.initState();
     // Re-read API config before any API/WebSocket calls (fixes web localStorage timing on refresh)
     _loadConfigAndCheckLogin();
-    
-    // Track app visibility changes
-    WidgetsBinding.instance.addObserver(_AppLifecycleObserver(
-      onResumed: () {
-        _isAppVisible = true;
-        print('App became visible - checking WebSocket connection');
-        // Reconnect WebSocket if needed when app becomes visible
-        if (_userRole == 'player') {
-          _ensureWebSocketConnected();
-        }
+
+    StrictVisibilityService.instance.init(
+      onImmediateAuditPing: (reason, vis) {
+        DatabaseService.sendEchoCall(
+          vis,
+          source: 'immediate',
+          visibilityReason: reason,
+        ).catchError((e) => print('Immediate echo ($reason): $e'));
       },
-      onPaused: () {
-        _isAppVisible = false;
-        print('App became hidden');
-      },
-    ));
-    
-    // Track browser tab visibility for web
-    _setupBrowserVisibilityDetection();
+    );
+    StrictVisibilityService.instance.strictVisible.addListener(_onStrictVisibleChanged);
 
     // Show version upgrade message if config was from older app
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -700,11 +691,14 @@ class _MainPageState extends State<MainPage> {
               const SizedBox(height: 8),
               ElevatedButton(
                 onPressed: () {
-                  print('Current visibility status: $_isAppVisible');
+                  print('Current visibility status: ${StrictVisibilityService.instance.isStrictVisible}');
                   ScaffoldMessenger.of(context).showSnackBar(
                     SnackBar(
-                      content: Text('App visible: $_isAppVisible'),
-                      backgroundColor: _isAppVisible ? Colors.green : Colors.orange,
+                      content: Text(
+                          'App visible: ${StrictVisibilityService.instance.isStrictVisible}'),
+                      backgroundColor: StrictVisibilityService.instance.isStrictVisible
+                          ? Colors.green
+                          : Colors.orange,
                     ),
                   );
                 },
@@ -1011,21 +1005,7 @@ class _MainPageState extends State<MainPage> {
             });
             print('WebSocket disconnected, setting visible_connected = 0');
           }
-          // WebSocket connection closed, this might be due to new device login
-          // Show immediate warning to user
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text('Connection lost - attempting to reconnect.\n'
-                'Retry is not successful\n'
-                'Please refrash the page manaully...',
-                softWrap: true, // ensures wrapping
-                ),
-                backgroundColor: Colors.orange,
-                duration: Duration(seconds: 2),
-              ),
-            );
-          }
+          // Reconnect without SnackBar noise; Online/Offline indicator reflects _visibleConnected
           _handleWebSocketDisconnection();
         },
       );
@@ -1046,14 +1026,9 @@ class _MainPageState extends State<MainPage> {
     final baseUrl = DatabaseService.baseUrl;
     if (!kIsWeb || !baseUrl.contains('localhost')) return;
     _hasShownLocalhostHint = true;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: const Text(
-          'On mobile, localhost does not work. Log out, then tap Database Info on the login screen to set your server IP (e.g. http://192.168.0.1:8000/api).',
-        ),
-        duration: const Duration(seconds: 8),
-        backgroundColor: Colors.orange.shade800,
-      ),
+    print(
+      'Localhost hint: on mobile, set server URL via Database Info on the login screen '
+      '(e.g. http://192.168.0.1:8000/api).',
     );
   }
 
@@ -1217,58 +1192,12 @@ class _MainPageState extends State<MainPage> {
     }
   }
 
-  // Setup browser visibility detection for web
-  void _setupBrowserVisibilityDetection() {
-    if (kIsWeb) {
-      // Listen for browser tab visibility changes
-      // This will detect when user switches to other tabs or applications
-      _setupWebVisibilityListener();
+  void _onStrictVisibleChanged() {
+    if (!mounted) return;
+    if (StrictVisibilityService.instance.isStrictVisible && _userRole == 'player') {
+      _ensureWebSocketConnected();
     }
-  }
-  
-  // Setup web visibility listener
-  void _setupWebVisibilityListener() {
-    if (kIsWeb) {
-      // Listen for browser tab visibility changes
-      html.document.addEventListener('visibilitychange', (event) {
-        if (html.document.hidden == true) {
-          // Tab is hidden (user switched to another tab/app)
-          _isAppVisible = false;
-          print('Browser tab became hidden - user switched to another tab/app');
-        } else {
-          // Tab is visible (user returned to this tab)
-          _isAppVisible = true;
-          print('Browser tab became visible - user returned to this tab');
-          // Reconnect WebSocket if needed when tab becomes visible
-          if (_userRole == 'player') {
-            _ensureWebSocketConnected();
-          }
-        }
-      });
-      
-      // Listen for window focus/blur events
-      html.window.addEventListener('blur', (event) {
-        _isAppVisible = false;
-        print('Browser window lost focus - user switched to another application');
-      });
-      
-      html.window.addEventListener('focus', (event) {
-        _isAppVisible = true;
-        print('Browser window gained focus - user returned to this application');
-        // Reconnect WebSocket if needed when window gains focus
-        if (_userRole == 'player') {
-          _ensureWebSocketConnected();
-        }
-      });
-      
-      // Listen for page unload (user closes tab/window)
-      html.window.addEventListener('beforeunload', (event) {
-        _isAppVisible = false;
-        print('Page is about to unload - user is closing the tab/window');
-      });
-      
-      print('Web visibility detection setup complete');
-    }
+    setState(() {});
   }
 
   void _handleWriterStatusChange(Map<String, dynamic> writerStatus) {
@@ -1460,7 +1389,11 @@ class _MainPageState extends State<MainPage> {
       
       try {
         print('Sending ECHO call...');
-        final echoResult = await DatabaseService.sendEchoCall(_isAppVisible).timeout(
+        final vis = StrictVisibilityService.instance.isStrictVisible;
+        final echoResult = await DatabaseService.sendEchoCall(
+          vis,
+          source: 'periodic',
+        ).timeout(
           const Duration(seconds: 5),
           onTimeout: () {
             print('ECHO call timed out');
@@ -1473,7 +1406,7 @@ class _MainPageState extends State<MainPage> {
             return {'success': false, 'should_logout': false};
           },
         );
-        print('ECHO call result: visible=$_isAppVisible, success=${echoResult['success']}, should_logout=${echoResult['should_logout']}, visible_connected=${echoResult['visible_connected']}');
+        print('ECHO call result: visible=$vis, success=${echoResult['success']}, should_logout=${echoResult['should_logout']}, visible_connected=${echoResult['visible_connected']}');
         
         if (echoResult['should_logout'] == true) {
           print('ECHO call indicates session invalid, logging out user');
@@ -1552,12 +1485,9 @@ class _MainPageState extends State<MainPage> {
 
   @override
   void dispose() {
+    StrictVisibilityService.instance.strictVisible.removeListener(_onStrictVisibleChanged);
     _echoTimer?.cancel();
     _channel?.sink.close();
-    WidgetsBinding.instance.removeObserver(_AppLifecycleObserver(
-      onResumed: () {},
-      onPaused: () {},
-    ));
     super.dispose();
   }
 }
@@ -1821,30 +1751,3 @@ class _BonusOptionSelectionDialogState extends State<BonusOptionSelectionDialog>
     }
   }
 }
-
-// App lifecycle observer for tracking visibility
-class _AppLifecycleObserver extends WidgetsBindingObserver {
-  final VoidCallback onResumed;
-  final VoidCallback onPaused;
-
-  _AppLifecycleObserver({
-    required this.onResumed,
-    required this.onPaused,
-  });
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    switch (state) {
-      case AppLifecycleState.resumed:
-        onResumed();
-        break;
-      case AppLifecycleState.paused:
-        onPaused();
-        break;
-      default:
-        break;
-    }
-  }
-}
-
-

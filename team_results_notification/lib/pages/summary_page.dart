@@ -144,27 +144,43 @@ class _SummaryPageState extends State<SummaryPage> {
     }
   }
 
-  String _getResultStatus(Map<String, dynamic>? answer) {
+  /// Non-empty only when a graded result exists (hides the old "no answer yet" when answer text is present).
+  String? _getResultPillText(Map<String, dynamic>? answer) {
     if (answer == null) {
-      return 'no answer yet';
+      return null;
     }
-
     final isCorrect = answer['is_correct'];
-    if (isCorrect == null) {
-      return 'no answer yet';
-    }
-
-    if (isCorrect == 0) {
-      return 'no answer yet';
-    } else if (isCorrect == 1) {
+    if (isCorrect == 1) {
       final score = answer['correct_score'] ?? 0;
       return 'correct (+$score)';
-    } else if (isCorrect == -1) {
+    }
+    if (isCorrect == -1) {
       final score = answer['wrong_score'] ?? 0;
       return 'incorrect ($score)';
     }
+    return null;
+  }
 
-    return 'unknown';
+  /// Shown when bonus scores are stored for this row; empty for regular (reg) score.
+  String? _bonusNoteForQuestion(
+    Map<String, dynamic> question,
+    Map<String, dynamic>? answer,
+  ) {
+    if (answer == null) {
+      return null;
+    }
+    final bStr = (question['bonus_score'] as String? ?? '0;0').split(';');
+    final bCr = double.tryParse(bStr[0].trim()) ?? 0.0;
+    final bW = double.tryParse(bStr.length > 1 ? bStr[1].trim() : '0') ?? 0.0;
+    if (bCr == 0 && bW == 0) {
+      return null;
+    }
+    final cs = (answer['correct_score'] is num) ? (answer['correct_score'] as num).toDouble() : double.tryParse('${answer['correct_score'] ?? 0}') ?? 0.0;
+    final ws = (answer['wrong_score'] is num) ? (answer['wrong_score'] as num).toDouble() : double.tryParse('${answer['wrong_score'] ?? 0}') ?? 0.0;
+    if (cs == bCr && ws == bW) {
+      return 'Bonus';
+    }
+    return null;
   }
 
   Color _getResultColor(Map<String, dynamic>? answer) {
@@ -388,10 +404,11 @@ class _SummaryPageState extends State<SummaryPage> {
     final questionId = question['id'] as int?;
     final questionNum = question['question_num']?.toString() ?? 'N/A';
     final answer = questionId != null ? _teamAnswers[questionId] : null;
-    final answerText = answer?['answer']?.toString() ?? 'No answer';
-    final resultStatus = _getResultStatus(answer);
+    final rawAnswer = answer?['answer']?.toString().trim() ?? '';
+    final resultPill = _getResultPillText(answer);
     final resultColor = _getResultColor(answer);
     final score = _getResultScore(answer);
+    final bonusNote = _bonusNoteForQuestion(question, answer);
 
     return Container(
       margin: const EdgeInsets.only(bottom: 12),
@@ -405,52 +422,75 @@ class _SummaryPageState extends State<SummaryPage> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                decoration: BoxDecoration(
-                  color: Colors.blue.shade100,
-                  borderRadius: BorderRadius.circular(4),
-                ),
-                child: Text(
-                  'Q$questionNum',
-                  style: TextStyle(
-                    fontWeight: FontWeight.bold,
-                    color: Colors.blue.shade900,
-                  ),
+              Expanded(
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: Colors.blue.shade100,
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Text(
+                        'Q$questionNum',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          color: Colors.blue.shade900,
+                        ),
+                      ),
+                    ),
+                    if (rawAnswer.isNotEmpty && bonusNote != null) ...[
+                      const SizedBox(width: 8),
+                      Text(
+                        '($bonusNote)',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: Colors.amber.shade900,
+                          fontStyle: FontStyle.italic,
+                        ),
+                      ),
+                    ],
+                  ],
                 ),
               ),
-              const Spacer(),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                decoration: BoxDecoration(
-                  color: resultColor.withOpacity(0.2),
-                  borderRadius: BorderRadius.circular(4),
-                ),
-                child: Text(
-                  resultStatus,
-                  style: TextStyle(
-                    fontWeight: FontWeight.bold,
-                    color: resultColor,
-                    fontSize: 12,
+              if (resultPill != null && resultPill.isNotEmpty)
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: resultColor.withOpacity(0.2),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Text(
+                    resultPill,
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: resultColor,
+                      fontSize: 12,
+                    ),
                   ),
                 ),
-              ),
             ],
           ),
-          const SizedBox(height: 8),
-          if (answerText != 'No answer')
+          if (rawAnswer.isNotEmpty) ...[
+            const SizedBox(height: 8),
             Text(
-              'Answer: $answerText',
+              'Answer: $rawAnswer',
               style: const TextStyle(fontSize: 14),
             ),
+          ],
           if (score != 0)
-            Text(
-              'Score: $score',
-              style: TextStyle(
-                fontSize: 14,
-                fontWeight: FontWeight.bold,
-                color: resultColor,
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(
+                'Score: $score',
+                style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.bold,
+                  color: resultColor,
+                ),
               ),
             ),
         ],

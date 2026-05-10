@@ -11,6 +11,14 @@ class GameManagementPage extends StatefulWidget {
 }
 
 class _GameManagementPageState extends State<GameManagementPage> {
+  final ScrollController _scrollController = ScrollController();
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -19,9 +27,13 @@ class _GameManagementPageState extends State<GameManagementPage> {
         backgroundColor: Colors.blue,
         foregroundColor: Colors.white,
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
+      body: Scrollbar(
+        controller: _scrollController,
+        thumbVisibility: true,
+        child: SingleChildScrollView(
+          controller: _scrollController,
+          padding: const EdgeInsets.all(16),
+          child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             // Header
@@ -178,10 +190,11 @@ class _GameManagementPageState extends State<GameManagementPage> {
               ),
             ),
             const SizedBox(height: 8),
-            Expanded(
-              child: ListView.builder(
-                itemCount: 3, // Mock data
-                itemBuilder: (context, index) {
+            ListView.builder(
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              itemCount: 3, // Mock data
+              itemBuilder: (context, index) {
                   return Card(
                     child: ListTile(
                       leading: CircleAvatar(
@@ -207,8 +220,8 @@ class _GameManagementPageState extends State<GameManagementPage> {
                   );
                 },
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );

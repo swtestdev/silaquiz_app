@@ -1,4 +1,6 @@
-from fastapi import FastAPI, HTTPException, Depends, Request, WebSocket, WebSocketDisconnect
+from __future__ import annotations
+
+from fastapi import FastAPI, HTTPException, Depends, Request, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr, constr
@@ -6,7 +8,7 @@ from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, 
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, validates
 from passlib.context import CryptContext
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from sqlalchemy import Enum
 import random
 import string
@@ -19,11 +21,47 @@ from dotenv import load_dotenv
 load_dotenv()
 import json
 import asyncio
-from typing import Optional, List, Dict, Any, Union
+import re
+import uuid
+from typing import Optional, List, Dict, Any, Union, Set, Tuple, FrozenSet
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _parse_trigger_time_segment(raw: Optional[str]) -> int:
+    """Parse VBA #time# segment (e.g. '20', '1 min_black', '90 sec') into seconds."""
+    if raw is None:
+        return 0
+    s = str(raw).strip().lower()
+    if not s:
+        return 0
+    if s.isdigit():
+        return int(s)
+    m = re.match(r"^(\d+)\s*min", s)
+    if m:
+        return int(m.group(1)) * 60
+    m = re.match(r"^(\d+)\s*sec", s)
+    if m:
+        return int(m.group(1))
+    m = re.match(r"^(\d+)", s)
+    if m:
+        return int(m.group(1))
+    return 0
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _format_utc_iso_z(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.replace(microsecond=(dt.microsecond // 1000) * 1000).isoformat().replace("+00:00", "Z")
+
 
 # Global dictionary to track round information for active games
 # Format: {"round_1": {"Name": None, "Slide": None, "time_now": None}, ...}
@@ -31,6 +69,409 @@ rounds_info = {}
 last_timer_setting = None
 for i in range(1, 21):  # rounds 1-20
     rounds_info[f"round_{i}"] = {"Name": None, "Slide": None, "time_now": None}
+
+# Server-side per-question answer timer window (UTC) — writer answer deadline + player tracking
+_server_answer_window_end: Optional[datetime] = None
+_server_answer_window_question_id: int = 0
+# Echo visibility: transition tracking and last known visible flag (for WS disconnect rules)
+_echo_app_visible: Dict[int, bool] = {}
+_prev_echo_app_visible: Dict[int, Optional[bool]] = {}
+_pending_server_stop_task: Optional[asyncio.Task] = None
+_server_fired_stop_ids: Set[str] = set()
+
+# Per-question player-event tracking window (type_game == 0); set with server answer window
+_question_track_window_id: str = ""
+_question_track_round_name: str = ""
+
+# Round-scoped player-event window (type_game != 0): from first question START in round until STOP or LAST end
+_round_track_active: bool = False
+_round_track_active_game_id: int = 0
+_round_track_round_name: str = ""
+_round_track_window_id: str = ""
+_round_track_ends_at: Optional[datetime] = None
+
+# Player state for transition-only + 3s cooldown (keys: user_id)
+_last_player_track_ws_connected: Dict[int, bool] = {}
+_last_player_track_visible: Dict[int, bool] = {}
+# Cooldown: (user_id, team_id, window_id, reason) -> last insert UTC (same reason only; distinct reasons not collapsed)
+_player_tracking_cooldown: Dict[Tuple[int, int, str, str], datetime] = {}
+PLAYER_TRACKING_COOLDOWN_SEC: float = 3.0
+_last_conn_track_ts: Dict[Tuple[int, int, str], datetime] = {}
+PLAYER_CONN_FLIP_DEBOUNCE_SEC: float = 1.0
+
+TRACKING_REASONS_ALL: FrozenSet[str] = frozenset(
+    {
+        "connection",
+        "disconnection",
+        "visible",
+        "invisible",
+        "visibility_hidden",
+        "visibility_visible",
+        "blur",
+        "focus",
+        "lifecycle_paused",
+        "lifecycle_resumed",
+        "lifecycle_hidden",
+        "lifecycle_inactive",
+        "lifecycle_detached",
+        "beforeunload",
+        "pagehide",
+    }
+)
+TRACKING_ATTENTION_VISIBLE: FrozenSet[str] = frozenset(
+    {"visible", "visibility_visible", "focus", "lifecycle_resumed"}
+)
+TRACKING_ATTENTION_INVISIBLE: FrozenSet[str] = frozenset(
+    {
+        "invisible",
+        "visibility_hidden",
+        "blur",
+        "lifecycle_paused",
+        "lifecycle_hidden",
+        "lifecycle_inactive",
+        "lifecycle_detached",
+        "beforeunload",
+        "pagehide",
+    }
+)
+
+# Serialize echo-based visibility tracking per user (avoids parallel requests double-counting)
+_echo_tracking_locks: Dict[int, asyncio.Lock] = {}
+
+
+def _echo_tracking_lock_for(user_id: int) -> asyncio.Lock:
+    lk = _echo_tracking_locks.get(user_id)
+    if lk is None:
+        lk = asyncio.Lock()
+        _echo_tracking_locks[user_id] = lk
+    return lk
+
+
+def _clear_round_track_window() -> None:
+    global _round_track_active, _round_track_active_game_id, _round_track_round_name, _round_track_window_id, _round_track_ends_at
+    _round_track_active = False
+    _round_track_active_game_id = 0
+    _round_track_round_name = ""
+    _round_track_window_id = ""
+    _round_track_ends_at = None
+
+
+def _is_round_tracking_window_active() -> bool:
+    if not _round_track_active or not _round_track_window_id:
+        return False
+    if _round_track_ends_at is not None and _utc_now() >= _round_track_ends_at:
+        return False
+    return True
+
+
+def _user_team_id_int(user: User) -> Optional[int]:
+    if not user.playing_in_team_id:
+        return None
+    try:
+        return int(user.playing_in_team_id) if isinstance(user.playing_in_team_id, str) else user.playing_in_team_id
+    except (ValueError, TypeError):
+        return None
+
+
+def _user_in_active_game_teams(user: User, ag: ActiveGame) -> bool:
+    tid = _user_team_id_int(user)
+    if not tid or not ag.teams_ids:
+        return False
+    team_ids = [x.strip() for x in str(ag.teams_ids).split(",") if x.strip()]
+    return str(tid) in team_ids
+
+
+def _get_player_tracking_context(db: Session, user: User) -> Optional[Dict[str, Any]]:
+    ag = db.query(ActiveGame).filter(ActiveGame.is_started == "running").first()
+    if not ag or not _user_in_active_game_teams(user, ag):
+        return None
+    g = db.query(GamesList).filter(GamesList.id == ag.game_id).first()
+    if not g:
+        return None
+    game_safe = str(g.game_name).strip().lower().replace(" ", "_").replace("-", "_")
+    tid = _user_team_id_int(user)
+    if not tid:
+        return None
+    if _is_round_tracking_window_active() and _round_track_window_id:
+        qid: Optional[int] = None
+        if last_timer_setting:
+            try:
+                raw = last_timer_setting.get("question_id")
+                if raw is not None:
+                    qid = int(raw)
+            except (TypeError, ValueError):
+                qid = None
+        if qid is not None and qid <= 0:
+            qid = None
+        return {
+            "active_game_id": ag.id,
+            "game_name_safe": game_safe,
+            "team_id": tid,
+            "window_scope": "round",
+            "window_id": _round_track_window_id,
+            "round_name": _round_track_round_name or None,
+            "question_id": qid,
+        }
+    if (
+        _is_server_answer_window_active()
+        and _question_track_window_id
+        and _server_answer_window_question_id > 0
+    ):
+        return {
+            "active_game_id": ag.id,
+            "game_name_safe": game_safe,
+            "team_id": tid,
+            "window_scope": "question",
+            "window_id": _question_track_window_id,
+            "round_name": _question_track_round_name or None,
+            "question_id": _server_answer_window_question_id,
+        }
+    return None
+
+
+def _try_record_player_tracking_event(
+    db: Session,
+    user: User,
+    reason: str,
+) -> None:
+    """
+    Insert one row into active_round_tracking_<game> during a valid timer window.
+    - connection/disconnection: transition-gated + 3s same-reason cooldown.
+    - attention / audit reasons: 3s same-reason cooldown only (distinct reasons preserved).
+    Timestamp is DB-authoritative (DEFAULT CURRENT_TIMESTAMP).
+    """
+    if not user or user.role != "player" or not user.playing_in_team_id:
+        return
+    if reason not in TRACKING_REASONS_ALL:
+        return
+    ctx = _get_player_tracking_context(db, user)
+    if not ctx:
+        return
+    team_id = int(ctx["team_id"])
+    user_id = int(user.id)
+    window_id = str(ctx["window_id"])
+    win_scope = str(ctx["window_scope"])
+    round_name = ctx.get("round_name")
+    question_id = ctx.get("question_id")
+    now = _utc_now()
+
+    if reason == "connection":
+        if _last_player_track_ws_connected.get(user_id) is True:
+            return
+    elif reason == "disconnection":
+        if _last_player_track_ws_connected.get(user_id) is False:
+            return
+    elif reason in TRACKING_ATTENTION_VISIBLE:
+        pass
+    elif reason in TRACKING_ATTENTION_INVISIBLE:
+        pass
+    else:
+        return
+
+    flip_key = (user_id, team_id, window_id)
+    if reason in ("connection", "disconnection"):
+        lc = _last_conn_track_ts.get(flip_key)
+        if lc is not None and (now - lc).total_seconds() < PLAYER_CONN_FLIP_DEBOUNCE_SEC:
+            if reason == "connection":
+                _last_player_track_ws_connected[user_id] = True
+            else:
+                _last_player_track_ws_connected[user_id] = False
+            return
+
+    key = (user_id, team_id, window_id, reason)
+    last_ins = _player_tracking_cooldown.get(key)
+    if last_ins is not None and (now - last_ins).total_seconds() < PLAYER_TRACKING_COOLDOWN_SEC:
+        return
+
+    table = f"active_round_tracking_{ctx['game_name_safe']}"
+    try:
+        db.execute(
+            text(
+                f"""
+                INSERT INTO `{table}`
+                    (team_id, user_id, round_name, question_id, reason, window_scope, window_id)
+                VALUES
+                    (:team_id, :user_id, :round_name, :question_id, :reason, :window_scope, :window_id)
+                """
+            ),
+            {
+                "team_id": team_id,
+                "user_id": user_id,
+                "round_name": round_name,
+                "question_id": question_id,
+                "reason": reason,
+                "window_scope": win_scope,
+                "window_id": window_id,
+            },
+        )
+        if reason == "connection":
+            _last_player_track_ws_connected[user_id] = True
+        elif reason == "disconnection":
+            _last_player_track_ws_connected[user_id] = False
+        elif reason in TRACKING_ATTENTION_VISIBLE:
+            _last_player_track_visible[user_id] = True
+        elif reason in TRACKING_ATTENTION_INVISIBLE:
+            _last_player_track_visible[user_id] = False
+        if reason in ("connection", "disconnection"):
+            _last_conn_track_ts[flip_key] = now
+        _player_tracking_cooldown[key] = now
+        db.commit()
+    except Exception as e:
+        logger.warning("round tracking insert failed: %s", e)
+        try:
+            db.rollback()
+        except Exception:  # noqa: S110
+            pass
+
+
+def _upgrade_round_tracking_reason_to_varchar_if_needed(db: Session, table_name: str) -> None:
+    """Widen reason from legacy ENUM to VARCHAR for audit reason strings."""
+    try:
+        row = db.execute(
+            text(
+                "SELECT DATA_TYPE FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :tn AND COLUMN_NAME = 'reason'"
+            ),
+            {"tn": table_name},
+        ).fetchone()
+        if not row:
+            return
+        if str(row[0]).lower() != "enum":
+            return
+        db.execute(
+            text(f"ALTER TABLE `{table_name}` MODIFY COLUMN reason VARCHAR(64) NOT NULL")
+        )
+        db.commit()
+        logger.info("Upgraded %s.reason to VARCHAR(64)", table_name)
+    except Exception as e:
+        logger.warning("upgrade reason column %s: %s", table_name, e)
+        try:
+            db.rollback()
+        except Exception:  # noqa: S110
+            pass
+
+
+def ensure_active_round_tracking_table(db: Session, game_name_safe: str) -> None:
+    t = f"active_round_tracking_{game_name_safe}"
+    try:
+        db.execute(
+            text(
+                f"""
+                CREATE TABLE IF NOT EXISTS `{t}` (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    team_id INT NOT NULL,
+                    user_id INT NOT NULL,
+                    round_name VARCHAR(255) NULL,
+                    question_id INT NULL,
+                    reason VARCHAR(64) NOT NULL,
+                    `timestamp` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    window_scope ENUM('question','round') NOT NULL,
+                    window_id VARCHAR(64) NOT NULL,
+                    INDEX idx_tr_team_user_ts (team_id, user_id, `timestamp`),
+                    INDEX idx_tr_wid_ts (window_id, `timestamp`),
+                    INDEX idx_tr_reason_ts (reason, `timestamp`),
+                    INDEX idx_tr_round_q_ts (round_name, question_id, `timestamp`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+        )
+        db.commit()
+        _upgrade_round_tracking_reason_to_varchar_if_needed(db, t)
+        logger.info("Ensured table %s", t)
+    except Exception as e:
+        logger.warning("ensure %s: %s", t, e)
+        try:
+            db.rollback()
+        except Exception:  # noqa: S110
+            pass
+
+
+def migrate_ensure_active_round_tracking_tables_for_running_games(db: Session) -> None:
+    try:
+        ags = (
+            db.query(ActiveGame)
+            .filter(ActiveGame.is_started == "running")
+            .all()
+        )
+    except Exception as e:
+        logger.warning("migrate round tracking: list active games: %s", e)
+        return
+    for ag in ags:
+        g = db.query(GamesList).filter(GamesList.id == ag.game_id).first()
+        if not g:
+            continue
+        game_safe = str(g.game_name).strip().lower().replace(" ", "_").replace("-", "_")
+        ensure_active_round_tracking_table(db, game_safe)
+
+
+def _cancel_pending_server_stop() -> None:
+    global _pending_server_stop_task
+    t = _pending_server_stop_task
+    _pending_server_stop_task = None
+    if t is not None and not t.done():
+        t.cancel()
+
+
+def _clear_server_answer_window() -> None:
+    global _server_answer_window_end, _server_answer_window_question_id, _question_track_window_id, _question_track_round_name
+    _server_answer_window_end = None
+    _server_answer_window_question_id = 0
+    _question_track_window_id = ""
+    _question_track_round_name = ""
+
+
+def _set_server_answer_window(end_utc: datetime, question_id: int) -> None:
+    global _server_answer_window_end, _server_answer_window_question_id
+    _server_answer_window_end = end_utc
+    _server_answer_window_question_id = question_id
+
+
+def _is_server_answer_window_active() -> bool:
+    if _server_answer_window_end is None or _server_answer_window_question_id <= 0:
+        return False
+    return _utc_now() < _server_answer_window_end
+
+
+async def _emit_server_stop_timer(
+    delay_sec: float,
+    source_event_id: str,
+    round_name: str,
+    slide_number: int,
+) -> None:
+    try:
+        await asyncio.sleep(delay_sec)
+        if source_event_id in _server_fired_stop_ids:
+            return
+        _server_fired_stop_ids.add(source_event_id)
+        if len(_server_fired_stop_ids) > 400:
+            _server_fired_stop_ids.clear()
+
+        _clear_server_answer_window()
+        _clear_round_track_window()
+        now = _utc_now()
+        stop_event_id = str(uuid.uuid4())
+        payload = {
+            "type": "timer_trigger",
+            "timer_action": "STOP_TIMER",
+            "slide_number": slide_number,
+            "round_name": round_name,
+            "timer_start": _format_utc_iso_z(now),
+            "question_id": 0,
+            "final_timer": 0,
+            "question_timer": 0,
+            "event_id": stop_event_id,
+            "server_stop": True,
+            "stops_event_id": source_event_id,
+            "timer_end": _format_utc_iso_z(now),
+            "duration_seconds": 0,
+        }
+        await manager.broadcast_to_all_players(json.dumps(payload))
+        logger.info("Server STOP_TIMER broadcast (stops_event_id=%s)", source_event_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.error("Server STOP_TIMER task failed: %s", e)
+
 
 # Internal functions to save/retrieve backup data from database
 def _get_backup_table_name(active_game_id: int, db: Session) -> Optional[str]:
@@ -468,6 +909,13 @@ try:
 except Exception as e:
     logger.warning(f"Could not retrieve backup data on startup (this is normal if no active game exists): {e}")
 
+try:
+    _mig = SessionLocal()
+    migrate_ensure_active_round_tracking_tables_for_running_games(_mig)
+    _mig.close()
+except Exception as e:
+    logger.warning("Could not migrate round tracking tables: %s", e)
+
 # Pydantic models
 class UserCreate(BaseModel):
     email: EmailStr
@@ -553,6 +1001,21 @@ class Token(BaseModel):
 
 class TokenData(BaseModel):
     email: Optional[str] = None
+
+
+class TeamAnswerItem(BaseModel):
+    question_id: int
+    answer: str
+    correct_score: Optional[float] = None
+    wrong_score: Optional[float] = None
+
+
+class TeamAnswersBatchRequest(BaseModel):
+    answers: List[TeamAnswerItem]
+    client_revision: Optional[Union[str, int]] = None
+    round_name: Optional[str] = None
+    round_timer: Optional[int] = None
+
 
 # Utility functions
 def verify_password(plain_password: str, hashed_password: str) -> bool:
@@ -640,6 +1103,77 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         # raise session_invalid_exception
     
     return user
+
+
+def _game_name_to_safe(s: str) -> str:
+    return str(s).strip().lower().replace(" ", "_").replace("-", "_")
+
+
+def _find_games_list_by_safe(db: Session, game_name_safe: str) -> Optional[GamesList]:
+    for g in db.query(GamesList).all():
+        if _game_name_to_safe(g.game_name) == game_name_safe:
+            return g
+    return None
+
+
+def _resolve_user_team_id_int(user: User, db: Session) -> Optional[int]:
+    if not user.playing_in_team_id:
+        return None
+    s = str(user.playing_in_team_id).strip()
+    if s.isdigit():
+        return int(s)
+    team = db.query(Teams).filter(Teams.team_code == s).first()
+    return team.id if team else None
+
+
+def _parse_answers_for_selection(raw) -> tuple:
+    """Return ('text'|'radio'|'list', options list)."""
+    if raw is None:
+        return "text", []
+    t = str(raw).strip()
+    if not t or t == "=":
+        return "text", []
+    if t.startswith("Radio:"):
+        opts = [x.strip() for x in t[6:].split(";") if x.strip()]
+        return "radio", opts
+    if t.startswith("List:"):
+        opts = [x.strip() for x in t[5:].split(";") if x.strip()]
+        return "list", opts
+    return "text", []
+
+
+def _list_exclusivity_conflicts(
+    list_question_ids: List[int], merged_answers: Dict[int, str]
+) -> List[dict]:
+    owner: Dict[str, int] = {}
+    conflicts: List[dict] = []
+    for qid in sorted(list_question_ids):
+        s = (merged_answers.get(qid) or "").strip()
+        if not s:
+            continue
+        for opt in [x.strip() for x in s.split(",") if x.strip()]:
+            if opt in owner and owner[opt] != qid:
+                conflicts.append(
+                    {
+                        "option": opt,
+                        "question_id_a": owner[opt],
+                        "question_id_b": qid,
+                    }
+                )
+            else:
+                owner[opt] = qid
+    return conflicts
+
+
+def _canonical_list_options_first_in_round(round_rows) -> List[str]:
+    """Options from the first List: question in round (rows sorted by question_num, id)."""
+    for row in round_rows:
+        afs = row[2]
+        kind, opts = _parse_answers_for_selection(afs)
+        if kind == "list" and opts:
+            return list(opts)
+    return []
+
 
 # API Routes
 @app.get("/")
@@ -1753,7 +2287,6 @@ async def _create_temp_tables_for_active_game(db: Session, active_game: ActiveGa
             question_id INT NOT NULL,
             correct_score FLOAT DEFAULT 0,
             wrong_score FLOAT DEFAULT 0, 
-            slide_id INT DEFAULT NULL,
             answer TEXT,
             is_correct INT DEFAULT 0,
             answered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -1828,6 +2361,7 @@ async def _create_temp_tables_for_active_game(db: Session, active_game: ActiveGa
         )
         """
         db.execute(text(backup_table_sql))
+        ensure_active_round_tracking_table(db, game_name)
         
         db.commit()
         logger.info(f"Created temporary tables for active game: {game_name}")
@@ -2096,6 +2630,90 @@ async def get_active_game_bonus_options(active_game_id: int, db: Session = Depen
         logger.error(f"Error getting bonus options: {e}")
         return {"success": False, "message": f"Error getting bonus options: {str(e)}"}
 
+
+@app.get("/api/admin/active-games/{active_game_id}/round-tracking", response_model=dict)
+async def get_active_game_round_tracking(
+    active_game_id: int,
+    team_id: Optional[int] = None,
+    user_id: Optional[int] = None,
+    round_name: Optional[str] = None,
+    reason: Optional[str] = None,
+    time_from: Optional[datetime] = Query(
+        None, alias="from", description="Filter rows with timestamp >= this (inclusive)"
+    ),
+    time_to: Optional[datetime] = Query(
+        None, alias="to", description="Filter rows with timestamp <= this (inclusive)"
+    ),
+    db: Session = Depends(get_db),
+):
+    """
+    List player connection/visibility tracking rows for a game (from active_round_tracking_<game_name>).
+    """
+    try:
+        ag = db.query(ActiveGame).filter(ActiveGame.id == active_game_id).first()
+        if not ag:
+            return {"success": False, "message": "Active game not found", "data": []}
+        g = db.query(GamesList).filter(GamesList.id == ag.game_id).first()
+        if not g:
+            return {"success": False, "message": "Game not found", "data": []}
+        gsafe = str(g.game_name).strip().lower().replace(" ", "_").replace("-", "_")
+        tname = f"active_round_tracking_{gsafe}"
+        exists = db.execute(
+            text(
+                "SELECT COUNT(*) FROM information_schema.TABLES "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :tn"
+            ),
+            {"tn": tname},
+        ).scalar()
+        if not exists:
+            return {"success": True, "message": f"Table {tname} not created yet", "data": []}
+        wheres = ["1=1"]
+        params: Dict[str, Any] = {}
+        if team_id is not None:
+            wheres.append("team_id = :team_id")
+            params["team_id"] = int(team_id)
+        if user_id is not None:
+            wheres.append("user_id = :user_id")
+            params["user_id"] = int(user_id)
+        if round_name is not None:
+            wheres.append("round_name = :round_name")
+            params["round_name"] = round_name
+        if reason is not None:
+            wheres.append("reason = :reason")
+            params["reason"] = reason
+        if time_from is not None:
+            wheres.append("`timestamp` >= :time_from")
+            params["time_from"] = time_from
+        if time_to is not None:
+            wheres.append("`timestamp` <= :time_to")
+            params["time_to"] = time_to
+        sql = (
+            f"SELECT id, team_id, user_id, round_name, question_id, reason, `timestamp`, window_scope, window_id "
+            f"FROM `{tname}` WHERE "
+            + " AND ".join(wheres)
+            + " ORDER BY `timestamp` ASC"
+        )
+        r = db.execute(text(sql), params)
+        data = [
+            {
+                "id": row[0],
+                "team_id": row[1],
+                "user_id": row[2],
+                "round_name": row[3],
+                "question_id": row[4],
+                "reason": row[5],
+                "timestamp": row[6].isoformat() if row[6] is not None else None,
+                "window_scope": row[7],
+                "window_id": row[8],
+            }
+            for row in r.fetchall()
+        ]
+        return {"success": True, "data": data}
+    except Exception as e:
+        logger.error("round-tracking: %s", e)
+        return {"success": False, "message": str(e), "data": []}
+
+
 @app.post("/api/admin/active-games/{active_game_id}/start", response_model=dict)
 async def start_active_game(active_game_id: int, db: Session = Depends(get_db)):
     """
@@ -2144,6 +2762,8 @@ async def pause_active_game(active_game_id: int, db: Session = Depends(get_db)):
         if active_game.is_started != 'running':
             return {"success": False, "message": f"Game is not running (current status: {active_game.is_started})"}
         
+        _clear_server_answer_window()
+        _clear_round_track_window()
         # Update game status to idle (paused)
         active_game.is_started = 'idle'
         active_game.timer_off_at = datetime.utcnow()
@@ -2179,6 +2799,12 @@ async def resume_active_game(active_game_id: int, db: Session = Depends(get_db))
         if active_game.is_started != 'idle':
             return {"success": False, "message": f"Game is not paused (current status: {active_game.is_started})"}
         
+        _clear_server_answer_window()
+        _clear_round_track_window()
+        game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
+        if game:
+            gname = str(game.game_name).replace(" ", "_").replace("-", "_").lower()
+            ensure_active_round_tracking_table(db, gname)
         # Update game status to running
         active_game.is_started = 'running'
         active_game.timer_on_at = datetime.utcnow()
@@ -2252,6 +2878,8 @@ async def run_active_game(active_game_id: int, db: Session = Depends(get_db)):
     Run an active game (change status from 'active' to 'running')
     """
     try:
+        _clear_server_answer_window()
+        _clear_round_track_window()
         active_game = db.query(ActiveGame).filter(ActiveGame.id == active_game_id).first()
         if not active_game:
             return {"success": False, "message": "Active game not found"}
@@ -2268,6 +2896,7 @@ async def run_active_game(active_game_id: int, db: Session = Depends(get_db)):
         game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
         if game:
             game_name = game.game_name.replace(' ', '_').replace('-', '_').lower()
+            ensure_active_round_tracking_table(db, game_name)
             scores_table_name = f"active_new_scores_{game_name}"
             
             # Remove all unselected bonus options (where player_approved IS NULL)
@@ -2757,7 +3386,8 @@ async def _delete_temp_tables_for_active_game(db: Session, active_game: ActiveGa
         tables_to_drop = [
             f"active_new_scores_{game_name}",
             f"active_teams_answers_{game_name}",
-            f"active_teams_results_{game_name}"
+            f"active_teams_results_{game_name}",
+            f"active_round_tracking_{game_name}",
         ]
         
         for table_name in tables_to_drop:
@@ -2822,10 +3452,16 @@ class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
         self.user_connections: Dict[int, str] = {}  # user_id -> connection_id
+        # Same user opened a new WS before old one finished teardown — skip one disconnection analytics event
+        self.skip_disconnect_tracking_once: Set[int] = set()
 
-    async def connect(self, websocket: WebSocket, connection_id: str, user_id: int):
+    async def connect(self, websocket: WebSocket, connection_id: str, user_id: int) -> bool:
+        """Returns True if an existing connection was replaced (reconnect / refresh), else False."""
+        replaced_existing = False
         # Check if user already has an active connection
         if user_id in self.user_connections:
+            replaced_existing = True
+            self.skip_disconnect_tracking_once.add(user_id)
             old_connection_id = self.user_connections[user_id]
             logger.info(f"User {user_id} already has connection {old_connection_id}, closing it")
             
@@ -2858,6 +3494,7 @@ class ConnectionManager:
         
         logger.info(f"User {user_id} connected with new connection {connection_id}")
         logger.info(f"Active connections: {len(self.active_connections)}, User connections: {len(self.user_connections)}")
+        return replaced_existing
 
     def disconnect(self, connection_id: str, user_id: int):
         logger.info(f"Disconnecting user {user_id} from connection {connection_id}")
@@ -3186,6 +3823,26 @@ async def update_user_admin(user_id: int, user_data: AdminUserUpdate, db: Sessio
         db.rollback()
         return {"success": False, "message": f"Error updating user: {str(e)}"}
 
+
+def _apply_ws_disconnect_and_track(user_id: int, db: Session) -> None:
+    """Mark user offline; record disconnection in round tracking when in a valid timer window."""
+    u = db.query(User).filter(User.id == user_id).first()
+    if not u:
+        return
+    try:
+        skip_disconn_event = False
+        if user_id in manager.skip_disconnect_tracking_once:
+            manager.skip_disconnect_tracking_once.discard(user_id)
+            skip_disconn_event = True
+        if not skip_disconn_event:
+            _try_record_player_tracking_event(db, u, "disconnection")
+        u.visible_connected = 0
+        db.commit()
+    except Exception as e:
+        logger.warning("ws disconnect handler: %s", e)
+        db.rollback()
+
+
 # WebSocket endpoint for real-time timer updates
 @app.websocket("/ws/timer/{user_id}")
 async def websocket_endpoint(websocket: WebSocket, user_id: int):
@@ -3218,13 +3875,17 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
         if manager.is_user_connected(user_id):
             logger.info(f"User {user_id} already connected, closing previous connection")
         
-        await manager.connect(websocket, connection_id, user_id)
+        replaced_ws = await manager.connect(websocket, connection_id, user_id)
         logger.info(f"WebSocket connected for user {user_id} with valid session")
         
         # Set user as visible and connected
         user.visible_connected = 1
+        _echo_app_visible[user_id] = True
+        _prev_echo_app_visible[user_id] = True
         db.commit()
         logger.info(f"User {user_id} marked as visible and connected")
+        if not replaced_ws:
+            _try_record_player_tracking_event(db, user, "connection")
         
         while True:
             # Keep connection alive and listen for any incoming messages
@@ -3237,34 +3898,19 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
     except WebSocketDisconnect:
         manager.disconnect(connection_id, user_id)
         logger.info(f"WebSocket disconnected for user {user_id}")
-        
-        # Set user as not visible and disconnected
-        user = db.query(User).filter(User.id == user_id).first()
-        if user:
-            user.visible_connected = 0
-            db.commit()
-            logger.info(f"User {user_id} marked as not visible and disconnected")
+        _apply_ws_disconnect_and_track(user_id, db)
+        logger.info(f"User {user_id} marked as not visible and disconnected")
     except (ConnectionResetError, BrokenPipeError, OSError) as e:
         # Client disconnected abruptly - this is normal and not an error
         logger.debug(f"WebSocket connection reset for user {user_id}: {type(e).__name__}")
         manager.disconnect(connection_id, user_id)
-        
-        # Set user as not visible and disconnected
-        user = db.query(User).filter(User.id == user_id).first()
-        if user:
-            user.visible_connected = 0
-            db.commit()
-            logger.debug(f"User {user_id} marked as not visible and disconnected due to connection reset")
+        _apply_ws_disconnect_and_track(user_id, db)
+        logger.debug(f"User {user_id} marked as not visible and disconnected due to connection reset")
     except Exception as e:
         logger.error(f"WebSocket error for user {user_id}: {e}")
         manager.disconnect(connection_id, user_id)
-        
-        # Set user as not visible and disconnected on error
-        user = db.query(User).filter(User.id == user_id).first()
-        if user:
-            user.visible_connected = 0
-            db.commit()
-            logger.info(f"User {user_id} marked as not visible and disconnected due to error")
+        _apply_ws_disconnect_and_track(user_id, db)
+        logger.info(f"User {user_id} marked as not visible and disconnected due to error")
     finally:
         db.close()
 
@@ -3280,10 +3926,13 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
          "Slide#164#START_TIMER#round_7#at#2025-10-29 10:16:49 PM#time#1 min_black"
          "Slide#159#STOP_TIMER##at#2025-10-29 10:14:19 PM"
     """
-    global last_timer_setting  # Declare global to modify the global variable
+    global last_timer_setting, _pending_server_stop_task
+    global _question_track_window_id, _question_track_round_name
+    global _round_track_active, _round_track_active_game_id, _round_track_round_name, _round_track_window_id, _round_track_ends_at
     logger.info(f">>>>>>> DATA in BEGGINIG >>>>>>> - rounds_info value: {rounds_info}")
     try:
-        timer_start = datetime.utcnow()
+        ts_utc = _utc_now()
+        timer_start = ts_utc.replace(tzinfo=None)  # naive UTC for MySQL datetime columns
         trigger_data = request.trigger_data.strip()
         logger.info(f"Received timer trigger: {trigger_data}")
 
@@ -3460,6 +4109,13 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
                         db.execute(delete_sql, {"slide_num": slide_number})
                         db.commit()
 
+            # If DB left question_timer at 0, use optional VBA "#time#" segment from trigger string
+            if question_timer == 0:
+                tt_seg = _parse_trigger_time_segment(parts.get("time"))
+                if tt_seg > 0:
+                    question_timer = tt_seg
+                    logger.info("START_TIME: question_timer=%s from trigger #time# segment", question_timer)
+
         elif timer_action == "LAST_TIMER":
             """
             Uses type_game from game table to define the final timer:
@@ -3506,10 +4162,50 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
             question_timer = 0
             pass
 
-        # Create broadcast message
-        # Convert timer_start to ISO format string for JSON serialization
-        timer_start_str = timer_start.isoformat() if isinstance(timer_start, datetime) else str(timer_start)
-        broadcast_message = json.dumps({
+        # Server timer: cancel previous auto-STOP, update per-question answer window (START only)
+        _cancel_pending_server_stop()
+        if timer_action == "START_TIME" and question_timer > 0 and _id > 0:
+            _set_server_answer_window(ts_utc + timedelta(seconds=question_timer), _id)
+            _question_track_window_id = f"{active_game.id}:{round_name}:q{_id}:{int(ts_utc.timestamp())}"
+            _question_track_round_name = round_name
+        elif timer_action in ("STOP_TIMER", "PAUSE_TIMER"):
+            _clear_server_answer_window()
+            _clear_round_track_window()
+        elif timer_action == "LAST_TIMER":
+            _clear_server_answer_window()
+
+        event_id = str(uuid.uuid4())
+        duration_seconds = 0
+        timer_end_utc = None
+        if timer_action == "START_TIME" and question_timer > 0:
+            duration_seconds = int(question_timer)
+            timer_end_utc = ts_utc + timedelta(seconds=duration_seconds)
+        elif timer_action == "LAST_TIMER" and _timer != 0:
+            duration_seconds = abs(int(_timer))
+            timer_end_utc = ts_utc + timedelta(seconds=duration_seconds)
+
+        # Round-scoped player tracking (type_game != 0): window_id fixed for the round until STOP / LAST end
+        if timer_action == "START_TIME" and _id > 0 and _timer != 0:
+            if (
+                (not _round_track_active)
+                or (_round_track_active_game_id != active_game.id)
+                or (_round_track_round_name != round_name)
+            ):
+                _round_track_active = True
+                _round_track_active_game_id = active_game.id
+                _round_track_round_name = round_name
+                _round_track_window_id = f"{active_game.id}:{round_name}:r:{int(ts_utc.timestamp())}"
+                _round_track_ends_at = None
+        if timer_action == "LAST_TIMER":
+            if _timer != 0 and timer_end_utc is not None:
+                _round_track_ends_at = timer_end_utc
+            else:
+                _clear_round_track_window()
+
+        timer_start_str = _format_utc_iso_z(ts_utc)
+        timer_end_str = _format_utc_iso_z(timer_end_utc) if timer_end_utc else None
+
+        broadcast_obj: Dict[str, Any] = {
             "type": "timer_trigger",
             "timer_action": timer_action,
             "slide_number": slide_number,
@@ -3517,15 +4213,29 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
             "timer_start": timer_start_str,
             "question_id": _id,
             "final_timer": _timer,
-            "question_timer": question_timer
-        })
-        # Broadcast to all connected players only if message was created
+            "question_timer": question_timer,
+            "event_id": event_id,
+            "duration_seconds": duration_seconds,
+        }
+        if timer_end_str is not None:
+            broadcast_obj["timer_end"] = timer_end_str
+        broadcast_message = json.dumps(broadcast_obj)
+
         if broadcast_message:
             await manager.broadcast_to_all_players(broadcast_message)
             logger.info(f"Timer '{timer_action}' triggered for slide {slide_number} and round: {round_name},"
                         f" broadcasted to {len(manager.active_connections)} connections")
         else:
             logger.warning(f"Timer '{timer_action}' triggered but no broadcast message was sent")
+
+        if duration_seconds > 0 and timer_end_utc is not None:
+            delay = max(0.0, (timer_end_utc - _utc_now()).total_seconds())
+            if delay > 0:
+                _pending_server_stop_task = asyncio.create_task(
+                    _emit_server_stop_timer(
+                        float(delay), event_id, round_name, slide_number
+                    )
+                )
 
         last_timer_setting = {
             "timer_action": timer_action,
@@ -3534,7 +4244,10 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
             "timer_start": timer_start_str,
             "question_id": _id,
             "final_timer": _timer,
-            "question_timer": question_timer
+            "question_timer": question_timer,
+            "event_id": event_id,
+            "duration_seconds": duration_seconds,
+            "timer_end": timer_end_str,
         }
         logger.info(f">>>>>>> SET >>>>>>> - last_timer_setting value: {last_timer_setting}") #
         logger.info(f">>>>>>> DATA in END >>>>>>> - rounds_info value: {rounds_info}")
@@ -3639,7 +4352,7 @@ async def _update_teams_answers_table(active_game: ActiveGame, db: Session):
     - Gets all question IDs from the game table (id column)
     - Gets correct/wrong scores from reg_score (splitting "1;0" format)
     - Overrides scores from active_new_scores_<game_name> if they exist
-    - Sets default values for slide_id, answer, is_correct, answered_at, player_id
+    - Sets default values for answer, is_correct, answered_at, player_id
     - Only inserts if record doesn't exist (doesn't update existing records)
     """
     try:
@@ -3764,8 +4477,8 @@ async def _update_teams_answers_table(active_game: ActiveGame, db: Session):
                 try:
                     db.execute(text(f"""
                         INSERT INTO `{answers_table_name}` 
-                        (team_id, question_id, correct_score, wrong_score, slide_id, answer, is_correct, answered_at, player_id)
-                        VALUES (:team_id, :question_id, :correct_score, :wrong_score, NULL, NULL, 0, NULL, NULL)
+                        (team_id, question_id, correct_score, wrong_score, answer, is_correct, answered_at, player_id)
+                        VALUES (:team_id, :question_id, :correct_score, :wrong_score, NULL, 0, NULL, NULL)
                     """), {
                         'team_id': team_id,
                         'question_id': question_id,
@@ -4041,6 +4754,59 @@ async def get_game_questions_by_round(
         logger.error(f"Error getting game questions by round: {e}")
         raise HTTPException(status_code=500, detail=f"Error retrieving questions: {str(e)}")
 
+
+@app.get("/api/games/{game_name}/question-by-id/{question_id}")
+async def get_game_question_by_id(
+    game_name: str,
+    question_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Single question row by primary key id (bypasses round_name filter).
+    Used when round-scoped list is empty due to name mismatch but timer already has question_id.
+    """
+    try:
+        game = db.query(GamesList).filter(GamesList.game_name == game_name).first()
+        if not game:
+            raise HTTPException(status_code=404, detail=f"Game '{game_name}' not found")
+
+        game_table_name = game.game_name
+        query_sql = text(f"""
+            SELECT id, round_name, reg_score, bonus_score, answers_for_selection,
+                   question_num, question, answer1, answer2, answer3, comments,
+                   type_game, time_to_get_answer
+            FROM `{game_table_name}`
+            WHERE id = :qid
+            LIMIT 1
+        """)
+        result = db.execute(query_sql, {"qid": question_id})
+        row = result.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Question not found")
+
+        return {
+            "id": row[0],
+            "round_name": row[1],
+            "reg_score": row[2],
+            "bonus_score": row[3],
+            "answers_for_selection": row[4],
+            "question_num": row[5],
+            "question": row[6],
+            "answer1": row[7],
+            "answer2": row[8],
+            "answer3": row[9],
+            "comments": row[10],
+            "type_game": row[11],
+            "time_to_get_answer": row[12],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting game question by id: {e}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving question: {str(e)}")
+
+
 @app.get("/api/games/{game_name}/rounds")
 async def get_game_rounds(
     game_name: str,
@@ -4105,7 +4871,7 @@ async def get_team_answers_for_game(
         # Query answers table
         query_sql = text(f"""
             SELECT id, team_id, question_id, correct_score, wrong_score, 
-                   slide_id, answer, is_correct, answered_at, player_id
+                   answer, is_correct, answered_at, player_id
             FROM `{answers_table_name}`
             WHERE team_id = :team_id
             ORDER BY question_id
@@ -4123,11 +4889,10 @@ async def get_team_answers_for_game(
                 "question_id": row[2],
                 "correct_score": row[3],
                 "wrong_score": row[4],
-                "slide_id": row[5],
-                "answer": row[6],
-                "is_correct": row[7],
-                "answered_at": row[8].isoformat() if row[8] else None,
-                "player_id": row[9],
+                "answer": row[5],
+                "is_correct": row[6],
+                "answered_at": row[7].isoformat() if row[7] else None,
+                "player_id": row[8],
             })
         
         return answers
@@ -4137,6 +4902,172 @@ async def get_team_answers_for_game(
     except Exception as e:
         logger.error(f"Error getting team answers: {e}")
         raise HTTPException(status_code=500, detail=f"Error retrieving team answers: {str(e)}")
+
+
+@app.put("/api/active-games/team-answers/{game_name_safe}/{team_id}")
+async def put_team_answers_batch(
+    game_name_safe: str,
+    team_id: int,
+    body: TeamAnswersBatchRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Batch update answer text in active_teams_answers_{game_name_safe} for a team.
+    Optional round_name + round_timer enable server-side list exclusivity when round_timer != 0.
+    """
+    try:
+        answers_table_name = f"active_teams_answers_{game_name_safe}"
+        if not body.answers:
+            return {"success": True, "updated": 0, "conflicts": []}
+
+        if current_user.role != "admin":
+            user_team_id = _resolve_user_team_id_int(current_user, db)
+            if user_team_id is None or user_team_id != team_id:
+                raise HTTPException(status_code=403, detail="Access denied")
+
+        team = db.query(Teams).filter(Teams.id == team_id).first()
+        if not team:
+            raise HTTPException(status_code=404, detail="Team not found")
+
+        if current_user.role != "admin":
+            if team.writer_user_id is None or team.writer_user_id != current_user.id:
+                raise HTTPException(status_code=403, detail="Only the team writer can update answers")
+
+        game = _find_games_list_by_safe(db, game_name_safe)
+        if not game:
+            raise HTTPException(status_code=404, detail=f"Game not found for '{game_name_safe}'")
+
+        # Current answers for this team
+        q_existing = text(
+            f"""
+            SELECT question_id, COALESCE(answer, '') AS answer
+            FROM `{answers_table_name}`
+            WHERE team_id = :team_id
+        """
+        )
+        existing_rows = db.execute(q_existing, {"team_id": team_id}).fetchall()
+        merged: Dict[int, str] = {int(r[0]): str(r[1] or "") for r in existing_rows}
+        for item in body.answers:
+            merged[item.question_id] = item.answer
+
+        r_timer = body.round_timer or 0
+        if r_timer != 0 and body.round_name:
+            game_table = game.game_name
+            rq = text(
+                f"""
+                SELECT id, question_num, answers_for_selection
+                FROM `{game_table}`
+                WHERE round_name = :rn
+                ORDER BY question_num ASC, id ASC
+            """
+            )
+            round_rows = db.execute(rq, {"rn": body.round_name}).fetchall()
+            list_qids: List[int] = []
+            for row in round_rows:
+                qid = int(row[0])
+                afs = row[2]
+                kind, _opts = _parse_answers_for_selection(afs)
+                if kind == "list":
+                    list_qids.append(qid)
+            canonical_list = _canonical_list_options_first_in_round(round_rows)
+            if canonical_list and list_qids:
+                canon_set = set(canonical_list)
+                for qid in list_qids:
+                    raw = (merged.get(qid) or "").strip()
+                    if not raw:
+                        continue
+                    for opt in [x.strip() for x in raw.split(",") if x.strip()]:
+                        if opt not in canon_set:
+                            raise HTTPException(
+                                status_code=400,
+                                detail={
+                                    "success": False,
+                                    "message": "List selection not in round canonical option pool",
+                                    "question_id": qid,
+                                    "option": opt,
+                                    "canonical": canonical_list,
+                                },
+                            )
+            if len(list_qids) > 1:
+                confl = _list_exclusivity_conflicts(list_qids, merged)
+                if confl:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "success": False,
+                            "message": "List option used in more than one question",
+                            "conflicts": confl,
+                        },
+                    )
+
+        updated = 0
+        player_id = current_user.id
+        upd_sql_full = text(
+            f"""
+            UPDATE `{answers_table_name}`
+            SET answer = :answer, player_id = :player_id,
+                correct_score = :correct_score, wrong_score = :wrong_score
+            WHERE team_id = :team_id AND question_id = :question_id
+        """
+        )
+        upd_sql_ans = text(
+            f"""
+            UPDATE `{answers_table_name}`
+            SET answer = :answer, player_id = :player_id
+            WHERE team_id = :team_id AND question_id = :question_id
+        """
+        )
+        for item in body.answers:
+            has_scores = item.correct_score is not None and item.wrong_score is not None
+            if has_scores:
+                result = db.execute(
+                    upd_sql_full,
+                    {
+                        "answer": item.answer,
+                        "player_id": player_id,
+                        "team_id": team_id,
+                        "question_id": item.question_id,
+                        "correct_score": item.correct_score,
+                        "wrong_score": item.wrong_score,
+                    },
+                )
+            else:
+                result = db.execute(
+                    upd_sql_ans,
+                    {
+                        "answer": item.answer,
+                        "player_id": player_id,
+                        "team_id": team_id,
+                        "question_id": item.question_id,
+                    },
+                )
+            rc = result.rowcount  # type: ignore
+            if rc is None or rc == 0:
+                db.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"No row to update for question_id={item.question_id} (run game bootstrap to create team answer rows)",
+                )
+            updated += int(rc)
+
+        db.commit()
+        return {"success": True, "updated": updated, "conflicts": []}
+
+    except HTTPException as exc:
+        try:
+            db.rollback()
+        except Exception:  # noqa: S110
+            pass
+        raise exc
+    except Exception as e:
+        logger.error(f"Error updating team answers: {e}")
+        try:
+            db.rollback()
+        except Exception:  # noqa: S110
+            pass
+        raise HTTPException(status_code=500, detail=f"Error updating team answers: {str(e)}")
+
 
 @app.get("/api/health")
 async def health_check():
@@ -4233,7 +5164,7 @@ async def get_app_version():
     """
     return {
         "version": "1.0.0",  # Update this when releasing a new version
-        "build": "1"  # Update this build number for each new build
+        "build": "2"  # Update this build number for each new build
     }
 
 @app.get("/api/auth/check-login")
@@ -4274,6 +5205,25 @@ async def echo_session(
         # Update last seen timestamp and visible_connected status
         current_user.last_seen = datetime.utcnow()
         current_user.visible_connected = 1 if app_visible else 0
+
+        async with _echo_tracking_lock_for(current_user.id):
+            source = str(echo_data.get("source") or "periodic").strip().lower()
+            visibility_reason_raw = echo_data.get("visibility_reason")
+            visibility_reason: Optional[str] = None
+            if visibility_reason_raw is not None:
+                visibility_reason = str(visibility_reason_raw).strip()[:64]
+
+            if (
+                source == "immediate"
+                and visibility_reason
+                and visibility_reason in TRACKING_REASONS_ALL
+                and visibility_reason not in ("connection", "disconnection")
+            ):
+                _try_record_player_tracking_event(db, current_user, visibility_reason)
+
+            _prev_echo_app_visible[current_user.id] = app_visible
+            _echo_app_visible[current_user.id] = app_visible
+
         db.commit()
         
         # Log visibility status for monitoring

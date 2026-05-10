@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart' show RenderBox;
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'dart:async';
 import 'dart:convert';
@@ -7,6 +6,8 @@ import 'dart:io' show Platform;
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../services/user_data_service.dart';
+import '../services/strict_visibility_service.dart';
+import '../widgets/answer_editor_dialog.dart';
 import '../widgets/responsive_layout.dart';
 import 'login_page.dart'; // For DatabaseService
 
@@ -17,23 +18,17 @@ Function(Map<String, dynamic>)? _globalTimerMessageHandler;
 String _startTimerStatus = 'Idle'; // Status for START_TIMER
 String _lastTimerStatus = 'Idle';  // Status for LAST_TIMER
 
-// Global timer data storage
-int? _startTimerDuration; // Duration in seconds
-int? _lastTimerDuration;  // Duration in seconds
 DateTime? _startTimerStartTime;
 DateTime? _lastTimerStartTime;
 Timer? _globalStartTimer;
 Timer? _globalLastTimer;
 
-// Global variable to store last timer action data payload
-Map<String, dynamic>? _lastTimerActionData;
-
 // Function to forward timer messages from main_page
-void forwardTimerMessage(Map<String, dynamic> message) {
-  // Handle timer in background regardless of page
-  _handleGlobalTimer(message);
-  
-  // Also forward to page handler if registered
+Future<void> forwardTimerMessage(Map<String, dynamic> message) async {
+  // Handle timer first - must complete before page handler so status is available
+  await _handleGlobalTimer(message);
+
+  // Then forward to page handler if registered
   if (_globalTimerMessageHandler != null) {
     print('QuestionPage: Received timer message, forwarding to handler');
     _globalTimerMessageHandler!(message);
@@ -43,18 +38,25 @@ void forwardTimerMessage(Map<String, dynamic> message) {
 }
 
 // Global timer handler - runs in background
-void _handleGlobalTimer(Map<String, dynamic> message) async {
+Future<void> _handleGlobalTimer(Map<String, dynamic> message) async {
   final timerAction = message['timer_action'] as String?;
   if (timerAction == null) return;
   
   try {
     final prefs = await SharedPreferences.getInstance();
-    
-    // Store the complete timer action data payload
-    _lastTimerActionData = Map<String, dynamic>.from(message);
-    await prefs.setString('last_timer_action_data', jsonEncode(message));
-    print('Global timer: Stored timer action data payload');
-    
+
+    // Store timer action data, but do NOT overwrite with STOP_TIMER when it would clear final_timer
+    // (STOP_TIMER has final_timer:0; we need to preserve final_timer from START_TIMER for round mode)
+    final ft = message['final_timer'];
+    final ftVal = ft is int ? ft : int.tryParse(ft?.toString() ?? '');
+    final shouldStore = timerAction != 'STOP_TIMER' || (ftVal != null && ftVal > 0);
+    if (shouldStore) {
+      await prefs.setString('last_timer_action_data', jsonEncode(message));
+      print('Global timer: Stored timer action data payload');
+    } else {
+      print('Global timer: Skipping store for STOP_TIMER to preserve final_timer for round mode');
+    }
+
     switch (timerAction) {
       case 'START_TIME':
       case 'START_TIMER':
@@ -63,7 +65,6 @@ void _handleGlobalTimer(Map<String, dynamic> message) async {
         // But for START_TIMER command, we always set START_TIMER to Running and LAST_TIMER to Idle
         _globalLastTimer?.cancel();
         _lastTimerStatus = 'Idle';
-        _lastTimerDuration = null;
         _lastTimerStartTime = null;
         await prefs.setString('last_timer_status', 'Idle');
         
@@ -103,14 +104,44 @@ void _handleGlobalTimer(Map<String, dynamic> message) async {
         }
         
         final now = DateTime.now().toUtc();
-        final elapsed = now.difference(timerStart).inSeconds;
-        final adjustedTimer = (questionTimer - elapsed).clamp(0, questionTimer);
+        final String? timerEndFromServer = message['timer_end'] as String?;
+        int adjustedTimer;
+        if (timerEndFromServer != null && timerEndFromServer.isNotEmpty) {
+          try {
+            final end = DateTime.parse(timerEndFromServer).toUtc();
+            adjustedTimer = end.difference(now).inSeconds.clamp(0, questionTimer > 0 ? questionTimer : 86400);
+            await prefs.setString('start_timer_end_utc', timerEndFromServer);
+          } catch (e) {
+            print('Error parsing timer_end for START, falling back: $e');
+            final elapsed = now.difference(timerStart).inSeconds;
+            adjustedTimer = (questionTimer - elapsed).clamp(0, questionTimer);
+            await prefs.remove('start_timer_end_utc');
+          }
+        } else {
+          final elapsed = now.difference(timerStart).inSeconds;
+          adjustedTimer = (questionTimer - elapsed).clamp(0, questionTimer);
+          await prefs.remove('start_timer_end_utc');
+        }
+
+        print('Timer calculation: timerStart=$timerStart (UTC), now=$now (UTC), adjustedTimer=$adjustedTimer (timer_end=$timerEndFromServer)');
         
-        print('Timer calculation: timerStart=$timerStart (UTC), now=$now (UTC), elapsed=$elapsed, adjustedTimer=$adjustedTimer');
+        // type_game/round_timer != 0: only the final (LAST) timer runs; no per-question countdown
+        final cachedRoundTimer = prefs.getInt('cached_round_timer') ?? 0;
+        if (cachedRoundTimer != 0) {
+          _globalStartTimer?.cancel();
+          _startTimerStatus = 'Idle';
+          _startTimerStartTime = null;
+          await prefs.setString('start_timer_status', 'Idle');
+          await prefs.setInt('start_timer_duration', 0);
+          await prefs.remove('start_timer_start_time');
+          await prefs.remove('start_timer_original_duration');
+          await prefs.remove('start_timer_end_utc');
+          print('Global timer: Skipping per-question START (round mode, cached_round_timer=$cachedRoundTimer)');
+          break;
+        }
         
         if (adjustedTimer > 0) {
           _startTimerStatus = 'Running';
-          _startTimerDuration = adjustedTimer;
           _startTimerStartTime = timerStart;
           
           // Save to SharedPreferences (store both remaining and original duration)
@@ -124,23 +155,33 @@ void _handleGlobalTimer(Map<String, dynamic> message) async {
           final startTimeForTimer = timerStart; // Capture non-null value
           final originalDurationForTimer = questionTimer; // Capture original duration
           _globalStartTimer = Timer.periodic(const Duration(seconds: 1), (timer) async {
-            // Calculate remaining time based on elapsed time from start
+            final p2 = await SharedPreferences.getInstance();
+            final endStr = p2.getString('start_timer_end_utc');
+            int remaining;
+            if (endStr != null && endStr.isNotEmpty) {
+              try {
+                final end = DateTime.parse(endStr).toUtc();
+                remaining = end.difference(DateTime.now().toUtc()).inSeconds.clamp(0, originalDurationForTimer);
+              } catch (e) {
+                final now = DateTime.now().toUtc();
+                final elapsed = now.difference(startTimeForTimer).inSeconds;
+                remaining = (originalDurationForTimer - elapsed).clamp(0, originalDurationForTimer);
+              }
+            } else {
             final now = DateTime.now().toUtc();
             final elapsed = now.difference(startTimeForTimer).inSeconds;
-            final remaining = (originalDurationForTimer - elapsed).clamp(0, originalDurationForTimer);
+              remaining = (originalDurationForTimer - elapsed).clamp(0, originalDurationForTimer);
+            }
             
-            // Update global state
-            _startTimerDuration = remaining;
             await prefs.setInt('start_timer_duration', remaining);
             
             // Debug log every 5 seconds
             if (remaining % 5 == 0 || remaining < 5) {
-              print('Global START_TIMER: Countdown - elapsed=$elapsed, remaining=$remaining, original=$originalDurationForTimer');
+              print('Global START_TIMER: Countdown - remaining=$remaining, original=$originalDurationForTimer');
             }
             
             if (remaining <= 0) {
               _startTimerStatus = 'Idle';
-              _startTimerDuration = 0;
               timer.cancel();
               await prefs.setString('start_timer_status', 'Idle');
               await prefs.setInt('start_timer_duration', 0);
@@ -151,7 +192,6 @@ void _handleGlobalTimer(Map<String, dynamic> message) async {
           print('Global START_TIMER: Started with original=$questionTimer seconds, adjusted=$adjustedTimer seconds, status: Running, startTime=$startTimeForTimer');
         } else {
           _startTimerStatus = 'Idle';
-          _startTimerDuration = 0;
           await prefs.setString('start_timer_status', 'Idle');
           await prefs.setInt('start_timer_duration', 0);
           print('Global START_TIMER: Expired, status: Idle');
@@ -163,10 +203,10 @@ void _handleGlobalTimer(Map<String, dynamic> message) async {
         if (_startTimerStatus == 'Running') {
           _globalStartTimer?.cancel();
           _startTimerStatus = 'Stopped';
-          _startTimerDuration = null;
           _startTimerStartTime = null;
           await prefs.setString('start_timer_status', 'Stopped');
           await prefs.setInt('start_timer_duration', 0);
+          await prefs.remove('start_timer_end_utc');
           print('Global LAST_TIMER: START_TIMER was Running, set to Stopped');
         }
         
@@ -206,16 +246,32 @@ void _handleGlobalTimer(Map<String, dynamic> message) async {
         }
         
         final now = DateTime.now().toUtc();
+        final String? lastEndFromServer = message['timer_end'] as String?;
+        int adjustedTimer;
+        if (lastEndFromServer != null && lastEndFromServer.isNotEmpty) {
+          try {
+            final end = DateTime.parse(lastEndFromServer).toUtc();
+            adjustedTimer = end.difference(now).inSeconds.clamp(0, finalTimer > 0 ? finalTimer : 86400);
+            await prefs.setString('last_timer_end_utc', lastEndFromServer);
+          } catch (e) {
+            print('Error parsing timer_end for LAST, falling back: $e');
+            final elapsed = now.difference(timerStart).inSeconds;
+            adjustedTimer = (finalTimer - elapsed).clamp(0, finalTimer);
+            await prefs.remove('last_timer_end_utc');
+          }
+        } else {
         final elapsed = now.difference(timerStart).inSeconds;
-        final adjustedTimer = (finalTimer - elapsed).clamp(0, finalTimer);
-        
-        print('LAST_TIMER calculation: timerStart=$timerStart (UTC), now=$now (UTC), elapsed=$elapsed, adjustedTimer=$adjustedTimer');
+        adjustedTimer = (finalTimer - elapsed).clamp(0, finalTimer);
+        await prefs.remove('last_timer_end_utc');
+        }
+
+        print('LAST_TIMER calculation: timerStart=$timerStart (UTC), now=$now (UTC), adjustedTimer=$adjustedTimer (timer_end=$lastEndFromServer)');
         
         if (adjustedTimer > 0) {
           _lastTimerStatus = 'Running';
-          _lastTimerDuration = adjustedTimer;
           _lastTimerStartTime = timerStart;
-          
+          final lastTimerRoundName = message['round_name'] as String? ?? '';
+
           // Save to SharedPreferences (store both remaining and original duration)
           await prefs.setString('last_timer_status', 'Running');
           await prefs.setInt('last_timer_duration', adjustedTimer);
@@ -227,54 +283,104 @@ void _handleGlobalTimer(Map<String, dynamic> message) async {
           final startTimeForTimer = timerStart; // Capture non-null value
           final originalDurationForTimer = finalTimer; // Capture original duration
           _globalLastTimer = Timer.periodic(const Duration(seconds: 1), (timer) async {
-            // Calculate remaining time based on elapsed time from start
+            final p2 = await SharedPreferences.getInstance();
+            final endStr = p2.getString('last_timer_end_utc');
+            int remaining;
+            if (endStr != null && endStr.isNotEmpty) {
+              try {
+                final end = DateTime.parse(endStr).toUtc();
+                remaining = end.difference(DateTime.now().toUtc()).inSeconds.clamp(0, originalDurationForTimer);
+              } catch (e) {
             final now = DateTime.now().toUtc();
             final elapsed = now.difference(startTimeForTimer).inSeconds;
-            final remaining = (originalDurationForTimer - elapsed).clamp(0, originalDurationForTimer);
+                remaining = (originalDurationForTimer - elapsed).clamp(0, originalDurationForTimer);
+              }
+            } else {
+            final now = DateTime.now().toUtc();
+            final elapsed = now.difference(startTimeForTimer).inSeconds;
+            remaining = (originalDurationForTimer - elapsed).clamp(0, originalDurationForTimer);
+            }
             
-            // Update global state
-            _lastTimerDuration = remaining;
             await prefs.setInt('last_timer_duration', remaining);
             
-            print('Global LAST_TIMER: Countdown - elapsed=$elapsed, remaining=$remaining, original=$originalDurationForTimer');
+            print('Global LAST_TIMER: Countdown - remaining=$remaining, original=$originalDurationForTimer');
             
             if (remaining <= 0) {
-              _lastTimerStatus = 'Idle';
-              _lastTimerDuration = 0;
+              _lastTimerStatus = 'Stopped';
               timer.cancel();
-              await prefs.setString('last_timer_status', 'Idle');
+              await prefs.setString('last_timer_status', 'Stopped');
               await prefs.setInt('last_timer_duration', 0);
-              print('Global LAST_TIMER: Timer expired, status set to Idle');
+              if (lastTimerRoundName.isNotEmpty) {
+                await _addRoundFinalTimerExpired(prefs, lastTimerRoundName);
+              }
+              print('Global LAST_TIMER: Timer expired, status set to Stopped');
             }
           });
           
           print('Global LAST_TIMER: Started with original=$finalTimer seconds, adjusted=$adjustedTimer seconds, status: Running, startTime=$startTimeForTimer');
         } else {
-          _lastTimerStatus = 'Idle';
-          _lastTimerDuration = 0;
-          await prefs.setString('last_timer_status', 'Idle');
+          _lastTimerStatus = 'Stopped';
+          await prefs.setString('last_timer_status', 'Stopped');
           await prefs.setInt('last_timer_duration', 0);
-          print('Global LAST_TIMER: Expired, status: Idle');
+          final lastTimerRoundName = message['round_name'] as String? ?? '';
+          if (lastTimerRoundName.isNotEmpty) {
+            await _addRoundFinalTimerExpired(prefs, lastTimerRoundName);
+          }
+          print('Global LAST_TIMER: Expired, status: Stopped');
         }
         break;
         
       case 'STOP_TIMER':
-        // Stop both timers
+        // Stop both timers (idempotent; server may send duplicates)
         _globalStartTimer?.cancel();
         _globalLastTimer?.cancel();
         _startTimerStatus = 'Idle';
         _lastTimerStatus = 'Idle';
-        _startTimerDuration = 0;
-        _lastTimerDuration = 0;
         await prefs.setString('start_timer_status', 'Idle');
         await prefs.setString('last_timer_status', 'Idle');
         await prefs.setInt('start_timer_duration', 0);
         await prefs.setInt('last_timer_duration', 0);
-        print('Global STOP_TIMER: Both timers stopped, status: Idle');
+        await prefs.remove('start_timer_end_utc');
+        await prefs.remove('last_timer_end_utc');
+        print('Global STOP_TIMER: Both timers stopped, status: Idle (server_stop=${message['server_stop']})');
         break;
     }
   } catch (e) {
     print('Error handling global timer: $e');
+  }
+}
+
+/// When the server sent [question_timer]=0 but the game row has [time_to_get_answer], restart the global countdown.
+Future<void> reapplyGlobalStartTimerFromGameData(Map<String, dynamic> message, int questionTimerSeconds) async {
+  if (questionTimerSeconds <= 0) return;
+  final enriched = Map<String, dynamic>.from(message);
+  enriched['question_timer'] = questionTimerSeconds;
+  await _handleGlobalTimer(enriched);
+}
+
+/// Add round to the set of rounds whose final timer has expired (persisted across slide changes)
+Future<void> _addRoundFinalTimerExpired(SharedPreferences prefs, String roundName) async {
+  try {
+    final key = 'rounds_final_timer_expired';
+    final existing = prefs.getStringList(key) ?? [];
+    if (!existing.contains(roundName)) {
+      existing.add(roundName);
+      await prefs.setStringList(key, existing);
+      print('QuestionPage: Marked round "$roundName" as final timer expired');
+    }
+  } catch (e) {
+    print('QuestionPage: Error adding round to expired set: $e');
+  }
+}
+
+/// Check if a round's final timer has expired
+Future<bool> _isRoundFinalTimerExpired(String roundName) async {
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    final existing = prefs.getStringList('rounds_final_timer_expired') ?? [];
+    return existing.contains(roundName);
+  } catch (e) {
+    return false;
   }
 }
 
@@ -284,11 +390,8 @@ Future<void> initializeTimerStatus() async {
     final prefs = await SharedPreferences.getInstance();
     _startTimerStatus = 'Idle';
     _lastTimerStatus = 'Idle';
-    _startTimerDuration = null;
-    _lastTimerDuration = null;
     _startTimerStartTime = null;
     _lastTimerStartTime = null;
-    _lastTimerActionData = null;
     _globalStartTimer?.cancel();
     _globalLastTimer?.cancel();
     
@@ -301,6 +404,10 @@ Future<void> initializeTimerStatus() async {
     await prefs.remove('start_timer_start_time');
     await prefs.remove('last_timer_start_time');
     await prefs.remove('last_timer_action_data');
+    await prefs.remove('rounds_final_timer_expired');
+    await prefs.remove('cached_round_timer');
+    await prefs.remove('start_timer_end_utc');
+    await prefs.remove('last_timer_end_utc');
     
     print('Timer status initialized to Idle on login, timer action data cleared');
   } catch (e) {
@@ -331,11 +438,8 @@ Future<Map<String, dynamic>> getCurrentTimerStatus() async {
         if (remainingSeconds > 0) {
           activeStatus = 'START_TIMER';
           startTime = _startTimerStartTime;
-          // Update _startTimerDuration to current remaining
-          _startTimerDuration = remainingSeconds;
         } else {
           _startTimerStatus = 'Idle';
-          _startTimerDuration = 0;
           remainingSeconds = 0;
         }
       }
@@ -351,11 +455,8 @@ Future<Map<String, dynamic>> getCurrentTimerStatus() async {
         if (remainingSeconds > 0) {
           activeStatus = 'LAST_TIMER';
           startTime = _lastTimerStartTime;
-          // Update _lastTimerDuration to current remaining
-          _lastTimerDuration = remainingSeconds;
         } else {
           _lastTimerStatus = 'Idle';
-          _lastTimerDuration = 0;
           remainingSeconds = 0;
         }
       }
@@ -375,12 +476,11 @@ Future<Map<String, dynamic>> getCurrentTimerStatus() async {
             final now = DateTime.now().toUtc();
             final elapsed = now.difference(savedStartTime).inSeconds;
             remainingSeconds = (duration - elapsed).clamp(0, duration);
-            if (remainingSeconds! > 0) {
+            if (remainingSeconds > 0) {
               activeStatus = 'START_TIMER';
               startTime = savedStartTime;
               _startTimerStatus = 'Running';
               _startTimerStartTime = savedStartTime;
-              _startTimerDuration = duration;
               // Get original duration
               originalDuration = prefs.getInt('start_timer_original_duration');
             }
@@ -397,12 +497,11 @@ Future<Map<String, dynamic>> getCurrentTimerStatus() async {
             final now = DateTime.now().toUtc();
             final elapsed = now.difference(savedStartTime).inSeconds;
             remainingSeconds = (duration - elapsed).clamp(0, duration);
-            if (remainingSeconds! > 0) {
+            if (remainingSeconds > 0) {
               activeStatus = 'LAST_TIMER';
               startTime = savedStartTime;
               _lastTimerStatus = 'Running';
               _lastTimerStartTime = savedStartTime;
-              _lastTimerDuration = duration;
               // Get original duration
               originalDuration = prefs.getInt('last_timer_original_duration');
             }
@@ -413,11 +512,16 @@ Future<Map<String, dynamic>> getCurrentTimerStatus() async {
       }
     }
     
+    final startStatus = prefs.getString('start_timer_status') ?? _startTimerStatus;
+    final lastStatus = prefs.getString('last_timer_status') ?? _lastTimerStatus;
+
     return {
       'active_timer': activeStatus,
       'remaining_seconds': remainingSeconds ?? 0,
       'original_duration': originalDuration,
-      'start_time': startTime?.toIso8601String(), // Return as ISO8601 string
+      'start_time': startTime?.toIso8601String(),
+      'start_timer_status': startStatus,
+      'last_timer_status': lastStatus,
     };
   } catch (e) {
     print('Error getting timer status: $e');
@@ -425,6 +529,8 @@ Future<Map<String, dynamic>> getCurrentTimerStatus() async {
       'active_timer': 'Idle',
       'remaining_seconds': 0,
       'start_time': null,
+      'start_timer_status': 'Idle',
+      'last_timer_status': 'Idle',
     };
   }
 }
@@ -455,13 +561,10 @@ class _QuestionPageState extends State<QuestionPage> {
   bool _isBlinking = false;
   Timer? _blinkTimer;
   
-  // Stop timer countdown state
-  int _stopCountdown = 0;
-  Timer? _stopCountdownTimer;
-  
   // Game state
   String _gameName = "Current Game";
   String _roundName = ""; // Round name from timer message
+  int _roundTimer = 0; // activeGame.round_timer or final_timer from timer message
   int _regScore = 1;
   int _regScoreTotal = 0;
   int _bonusScore = 0;
@@ -469,17 +572,17 @@ class _QuestionPageState extends State<QuestionPage> {
   
   // Answer state
   List<Map<String, dynamic>> _answers = [];
+  /// Bumped when [_answers] changes so list dialogs (shared pool) refresh disabled options.
+  final ValueNotifier<int> _answerPoolRevision = ValueNotifier<int>(0);
   bool _isWriter = false;
   int? _currentQuestionId;
   final Map<int, GlobalKey> _answerItemKeys = {};
-  final Map<int, FocusNode> _answerFocusNodes = {};
   final ScrollController _pageScrollController = ScrollController();
   
   // Writer status check timer
   Timer? _writerStatusCheckTimer;
-  bool _isAppVisible = true;
-  
-  // Game data cache - keyed by question ID (primary key from game table)
+
+  /// Game data cache, keyed by question ID (primary key from game table).
   Map<int, Map<String, dynamic>> _gameData = {};
   
   // Current game name for persistent storage
@@ -492,7 +595,9 @@ class _QuestionPageState extends State<QuestionPage> {
   void initState() {
     super.initState();
     
-    // Check if page was refreshed (no navigation history)
+    StrictVisibilityService.instance.init();
+
+    // Check if page was refreshed
     // If so, navigate to main page (same as back button behavior)
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted && !Navigator.canPop(context)) {
@@ -619,7 +724,6 @@ class _QuestionPageState extends State<QuestionPage> {
     
     // Get the most current status from global timer to get timer_start time
     final currentStatus = await getCurrentTimerStatus();
-    final currentRemaining = currentStatus['remaining_seconds'] as int;
     final currentOriginal = currentStatus['original_duration'] as int? ?? originalDuration;
     final startTimeStr = currentStatus['start_time'] as String?;
     DateTime? startTime;
@@ -768,11 +872,26 @@ class _QuestionPageState extends State<QuestionPage> {
   /// Update answer editability based on current timer status
   Future<void> _updateAnswerEditability(String startTimerStatus, String lastTimerStatus) async {
     try {
-      // Get active game to check round_timer
+      // Get round_timer: prefer activeGame, then final_timer from last_timer_action_data (timer message)
+      var roundTimer = 0;
       final activeGame = await _getActiveGame();
-      if (activeGame == null) return;
-      
-      final roundTimer = activeGame['round_timer'] as int? ?? 0;
+      if (activeGame != null) {
+        roundTimer = activeGame['round_timer'] as int? ?? 0;
+      }
+      if (roundTimer == 0) {
+        final prefs = await SharedPreferences.getInstance();
+        final lastTimerDataStr = prefs.getString('last_timer_action_data');
+        if (lastTimerDataStr != null) {
+          try {
+            final lastTimerData = jsonDecode(lastTimerDataStr) as Map<String, dynamic>;
+            final ft = lastTimerData['final_timer'];
+            roundTimer = ft is int ? ft : (int.tryParse(ft?.toString() ?? '') ?? 0);
+          } catch (_) {}
+        }
+        if (roundTimer > 0) {
+          print('QuestionPage: Using final_timer=$roundTimer from last_timer_action_data for editability');
+        }
+      }
       
       // Get question_id from last_timer_setting or current message
       final prefs = await SharedPreferences.getInstance();
@@ -789,12 +908,23 @@ class _QuestionPageState extends State<QuestionPage> {
           print('Error parsing last_timer_action_data: $e');
         }
       }
+      if ((roundName == null || roundName.isEmpty) && _roundName.isNotEmpty) {
+        roundName = _roundName;
+      }
+      if (roundName == null) {
+        return;
+      }
+      final intQuestionId = questionId is int
+          ? questionId
+          : (questionId is String ? int.tryParse(questionId) : int.tryParse('$questionId'));
+      if (roundTimer == 0 && intQuestionId == null) {
+        return;
+      }
       
-      if (questionId == null || roundName == null) return;
-      
-      final intQuestionId = questionId is int ? questionId : (questionId is String ? int.tryParse(questionId) : null);
-      if (intQuestionId == null) return;
-      
+      // If this round's final timer has expired (persisted), keep all fields disabled
+      final roundFinalTimerExpired = await _isRoundFinalTimerExpired(roundName);
+      final effectiveLastStatus = roundFinalTimerExpired ? 'Stopped' : lastTimerStatus;
+
       // Update editability for each answer
       bool needsUpdate = false;
       for (var i = 0; i < _answers.length; i++) {
@@ -806,16 +936,14 @@ class _QuestionPageState extends State<QuestionPage> {
         final questionRoundName = question['round_name'] as String?;
         
         bool shouldBeEnabled = false;
-        
-        // Rule 1: Answer field is editable when start_timer_status == "Running" (for START_TIMER)
-        if (startTimerStatus == 'Running' && qId == intQuestionId) {
-          shouldBeEnabled = true;
-        }
-        
-        // Rule 2: If round_timer != 0, all questions in the round remain editable 
-        // until last_timer_status gets "Stopped"
-        if (roundTimer != 0 && lastTimerStatus != 'Stopped' && questionRoundName == roundName) {
-          shouldBeEnabled = true;
+        if (roundTimer != 0) {
+          if (effectiveLastStatus != 'Stopped' && questionRoundName == roundName) {
+            shouldBeEnabled = true;
+          }
+        } else {
+          if (startTimerStatus == 'Running' && intQuestionId != null && qId == intQuestionId) {
+            shouldBeEnabled = true;
+          }
         }
         
         if (answer['enabled'] != shouldBeEnabled) {
@@ -840,14 +968,10 @@ class _QuestionPageState extends State<QuestionPage> {
     _tick?.cancel();
     _writerStatusCheckTimer?.cancel();
     _blinkTimer?.cancel();
-    _stopCountdownTimer?.cancel();
     _autoSaveTimer?.cancel();
 
     _pageScrollController.dispose();
-    for (final node in _answerFocusNodes.values) {
-      node.dispose();
-    }
-    
+    _answerPoolRevision.dispose();
     // Save answers before disposing
     _saveAnswers();
     
@@ -893,7 +1017,10 @@ class _QuestionPageState extends State<QuestionPage> {
 
   Future<void> _checkWriterStatus() async {
     try {
-      final echoResult = await DatabaseService.sendEchoCall(_isAppVisible);
+      final echoResult = await DatabaseService.sendEchoCall(
+        StrictVisibilityService.instance.isStrictVisible,
+        source: 'periodic',
+      );
       
       if (echoResult['success'] == true) {
         // Handle writer status changes
@@ -1027,6 +1154,10 @@ class _QuestionPageState extends State<QuestionPage> {
       }
       
       print('QuestionPage: Game name: $gameName');
+
+      final int? resolvedQuestionId = questionId is int
+          ? questionId
+          : int.tryParse(questionId?.toString() ?? '');
       
       // Update current game name for storage
       _currentGameNameForStorage = gameName;
@@ -1043,6 +1174,41 @@ class _QuestionPageState extends State<QuestionPage> {
         print('QuestionPage: Loaded ${_gameData.length} questions into cache');
       } else {
         print('QuestionPage: Using cached game data (${_gameData.length} questions)');
+      }
+
+      // Round-scoped API can return nothing (e.g. round_name mismatch) while timer already has question_id
+      if (_gameData.isEmpty && resolvedQuestionId != null && resolvedQuestionId > 0) {
+        print('QuestionPage: Round query empty; fetching question id=$resolvedQuestionId via question-by-id API');
+        final row = await DatabaseService.getGameQuestionById(gameName, resolvedQuestionId);
+        if (row != null) {
+          _gameData[resolvedQuestionId] = row;
+          print('QuestionPage: Cached question $resolvedQuestionId (round_name=${row['round_name']})');
+        }
+      }
+
+      int msgQTimer = 0;
+      final msgQTimerRaw = message['question_timer'];
+      if (msgQTimerRaw is int) {
+        msgQTimer = msgQTimerRaw;
+      } else if (msgQTimerRaw != null) {
+        msgQTimer = int.tryParse(msgQTimerRaw.toString()) ?? 0;
+      }
+      if (msgQTimer <= 0 &&
+          resolvedQuestionId != null &&
+          resolvedQuestionId > 0 &&
+          _gameData.containsKey(resolvedQuestionId)) {
+        final ttaRaw = _gameData[resolvedQuestionId]!['time_to_get_answer'];
+        var tta = 0;
+        if (ttaRaw is int) {
+          tta = ttaRaw;
+        } else if (ttaRaw != null) {
+          tta = int.tryParse(ttaRaw.toString()) ?? 0;
+        }
+        if (tta > 0) {
+          print('QuestionPage: Re-applying global START timer with time_to_get_answer=$tta from game data');
+          await reapplyGlobalStartTimerFromGameData(message, tta);
+          if (mounted) await _loadTimerStatus();
+        }
       }
       
       // Get user's team ID
@@ -1078,9 +1244,35 @@ class _QuestionPageState extends State<QuestionPage> {
         print('QuestionPage: Loaded ${teamAnswersFromDb.length} team answers from database');
       }
       
+      // Merge final_timer from timer message into activeGame (API may not return round_timer)
+      final effectiveActiveGame = Map<String, dynamic>.from(activeGame);
+      final msgFinalTimer = message['final_timer'];
+      if (msgFinalTimer != null) {
+        final v = msgFinalTimer is int ? msgFinalTimer : int.tryParse(msgFinalTimer.toString());
+        if (v != null) {
+          effectiveActiveGame['round_timer'] = v;
+          print('QuestionPage: Using final_timer=$v from message as round_timer');
+        }
+      }
+
+      // So global _handleGlobalTimer can skip per-question countdown when type_game/round_timer != 0
+      {
+        int rtc = 0;
+        final rawRt = effectiveActiveGame['round_timer'];
+        if (rawRt is int) {
+          rtc = rawRt;
+        } else if (rawRt is String) {
+          rtc = int.tryParse(rawRt) ?? 0;
+        } else if (rawRt != null) {
+          rtc = int.tryParse(rawRt.toString()) ?? 0;
+        }
+        final p = await SharedPreferences.getInstance();
+        await p.setInt('cached_round_timer', rtc);
+      }
+
       // Build answers list from game data and saved answers
       print('QuestionPage: Building answers from game data...');
-      await _buildAnswersFromGameData(roundName, questionId, savedAnswers, activeGame, teamAnswersFromDb);
+      await _buildAnswersFromGameData(roundName, questionId, savedAnswers, effectiveActiveGame, teamAnswersFromDb);
       print('QuestionPage: Built ${_answers.length} answers');
       
       // Update game info with specific question data
@@ -1138,6 +1330,30 @@ class _QuestionPageState extends State<QuestionPage> {
     }
   }
   
+  /// Convert savedAnswers map to _answers list format
+  List<Map<String, dynamic>> _savedAnswersToAnswersList(Map<int, Map<String, dynamic>> savedAnswers) {
+    final result = <Map<String, dynamic>>[];
+    for (final entry in savedAnswers.entries) {
+      final qId = entry.key;
+      final answerData = entry.value;
+      Map<String, dynamic>? questionData;
+      if (_gameData.containsKey(qId)) {
+        questionData = _gameData[qId];
+      }
+      result.add({
+        'id': qId,
+        'num': questionData?['question_num'] ?? qId,
+        'inputType': 'text',
+        'options': [],
+        'value': answerData['answer'] as String? ?? '',
+        'selected': answerData['selected'] as bool? ?? false,
+        'enabled': false,
+        'checkboxEnabled': false,
+      });
+    }
+    return result;
+  }
+  
   /// Build answers list from cached game data and saved answers
   Future<void> _buildAnswersFromGameData(
     String roundName,
@@ -1154,9 +1370,8 @@ class _QuestionPageState extends State<QuestionPage> {
       
       // Get timer status to determine editability
       final timerStatus = await getCurrentTimerStatus();
-      final activeTimer = timerStatus['active_timer'] as String;
-      final startTimerStatus = timerStatus['start_timer_status'] as String? ?? 'Idle';
-      final lastTimerStatus = timerStatus['last_timer_status'] as String? ?? 'Idle';
+      var startTimerStatus = timerStatus['start_timer_status'] as String? ?? 'Idle';
+      var lastTimerStatus = timerStatus['last_timer_status'] as String? ?? 'Idle';
       
       // Get round_timer (type_game) from active game
       // Handle both int and string types
@@ -1170,13 +1385,20 @@ class _QuestionPageState extends State<QuestionPage> {
         roundTimer = int.tryParse(roundTimerValue.toString()) ?? 0;
       }
       print('QuestionPage: roundTimer=$roundTimer (from value: $roundTimerValue, type: ${roundTimerValue.runtimeType})');
+
+      // If this round's final timer has expired (persisted), treat as Stopped so fields stay disabled
+      final roundFinalTimerExpired = await _isRoundFinalTimerExpired(roundName);
+      if (roundFinalTimerExpired && roundTimer != 0) {
+        lastTimerStatus = 'Stopped';
+        print('QuestionPage: Round "$roundName" final timer expired (persisted), keeping fields disabled');
+      }
       
       // Convert questionId to int for comparison
       final intQuestionId = questionId is int ? questionId : (questionId is String ? int.tryParse(questionId) : null);
       print('QuestionPage: intQuestionId=$intQuestionId (from questionId: $questionId, type: ${questionId.runtimeType})');
       
       // Filter questions based on round_timer and question_id:
-      // - If round_timer != 0 AND received any question_id value: publish all questions from the round
+      // - If round_timer != 0: ADD the current question to existing (incremental); all stay enabled until last_timer stops
       // - If round_timer == 0 AND question_id == 0: don't publish questions (save existing answers instead)
       // - If round_timer == 0 AND question_id != 0: publish only the current question based on question_id
       final questionsToProcess = <MapEntry<int, Map<String, dynamic>>>[];
@@ -1191,9 +1413,16 @@ class _QuestionPageState extends State<QuestionPage> {
           .toList();
       
       if (roundTimer != 0) {
-        // If round_timer != 0: publish all questions from the round (regardless of question_id)
+        // Show every question in this round (reconnect / return to page) — answers remain editable until final timer ends
         questionsToProcess.addAll(roundQuestions);
-        print('QuestionPage: round_timer != 0, publishing all ${questionsToProcess.length} questions in round: $roundName');
+        questionsToProcess.sort((a, b) {
+          final numA = a.value['question_num'];
+          final numB = b.value['question_num'];
+          final nA = numA is int ? numA : int.tryParse(numA.toString()) ?? 0;
+          final nB = numB is int ? numB : int.tryParse(numB.toString()) ?? 0;
+          return nA.compareTo(nB);
+        });
+        print('QuestionPage: round_timer != 0, publishing all ${questionsToProcess.length} questions in round');
       } else {
         // If round_timer == 0
         if (intQuestionId != null && intQuestionId != 0) {
@@ -1208,36 +1437,31 @@ class _QuestionPageState extends State<QuestionPage> {
           // If question_id == 0: don't publish questions, but save existing answers
           print('QuestionPage: round_timer == 0 AND question_id == 0, not publishing questions - saving existing answers instead');
           
-          // Save existing answers locally and update in backend
-          if (savedAnswers.isNotEmpty) {
-            print('QuestionPage: Found ${savedAnswers.length} existing answers, saving them...');
+          // Save existing answers locally - prefer _answers (current edits) over savedAnswers
+          final toSave = _answers.isNotEmpty ? _answers : _savedAnswersToAnswersList(savedAnswers);
+          if (toSave.isNotEmpty) {
+            print('QuestionPage: Saving ${toSave.length} answers...');
             
-            // Convert saved answers to _answers format for saving
-            final answersToSave = <Map<String, dynamic>>[];
-            for (var entry in savedAnswers.entries) {
-              final qId = entry.key;
-              final answerData = entry.value;
-              
-              // Get question data from gameData if available
+            final answersToSave = toSave.map((a) {
+              final qId = a['id'];
+              final qIdInt = qId is int ? qId : int.tryParse(qId?.toString() ?? '');
               Map<String, dynamic>? questionData;
-              if (_gameData.containsKey(qId)) {
-                questionData = _gameData[qId];
+              if (qIdInt != null && _gameData.containsKey(qIdInt)) {
+                questionData = _gameData[qIdInt];
               }
-              
-              answersToSave.add({
+              return <String, dynamic>{
                 'id': qId,
                 'num': questionData?['question_num'] ?? qId,
-                'inputType': 'text', // Default, will be determined if question data available
-                'options': [],
-                'value': answerData['answer'] as String? ?? '',
-                'selected': answerData['selected'] as bool? ?? false,
+                'inputType': a['inputType'] ?? 'text',
+                'options': a['options'] ?? [],
+                'value': a['value'] as String? ?? '',
+                'selected': a['selected'] as bool? ?? false,
                 'enabled': false,
                 'checkboxEnabled': false,
-              });
-            }
+              };
+            }).toList();
             
             // Temporarily set _answers and game name for saving
-            final previousAnswers = _answers;
             final previousGameName = _currentGameNameForStorage;
             setState(() {
               _answers = answersToSave;
@@ -1271,6 +1495,33 @@ class _QuestionPageState extends State<QuestionPage> {
         }
       }
       
+      // First List: question in round (by question_num) supplies canonical options when round has final round timer
+      var canonicalListForRound = <String>[];
+      if (roundTimer != 0) {
+        final rq = _gameData.entries
+            .where((e) => (e.value['round_name'] as String?) == roundName)
+            .toList();
+        rq.sort((a, b) {
+          final aNum = a.value['question_num'];
+          final bNum = b.value['question_num'];
+          final nA = aNum is int ? aNum : int.tryParse(aNum.toString()) ?? 0;
+          final nB = bNum is int ? bNum : int.tryParse(bNum.toString()) ?? 0;
+          return nA.compareTo(nB);
+        });
+        for (final e in rq) {
+          final afs = e.value['answers_for_selection'] as String?;
+          if (afs != null && afs.startsWith('List:')) {
+            final part = afs.length > 5 ? afs.substring(5) : '';
+            canonicalListForRound = part
+                .split(';')
+                .map((x) => x.trim())
+                .where((x) => x.isNotEmpty)
+                .toList();
+            break;
+          }
+        }
+      }
+
       // Process each question from filtered list
       for (var entry in questionsToProcess) {
         final qId = entry.key;
@@ -1278,37 +1529,43 @@ class _QuestionPageState extends State<QuestionPage> {
         print('QuestionPage: Processing question ID: $qId (type: ${qId.runtimeType})');
 
         _answerItemKeys.putIfAbsent(qId, () => GlobalKey());
-        _answerFocusNodes.putIfAbsent(qId, () => FocusNode());
         
-        // Determine if answer should be enabled for editing based on timer status
+        // Per-question START timer is only for round_timer == 0. Round mode: only last/final timer gates editing.
         bool isEnabled = false;
-        
-        // Rule 1: Answer field is editable when start_timer_status == "Running" (for START_TIMER)
-        if (startTimerStatus == 'Running' && intQuestionId != null && qId == intQuestionId) {
-          isEnabled = true;
-        }
-        
-        // Rule 2: If round_timer != 0, all questions in the round remain editable 
-        // until last_timer_status gets "Stopped"
-        if (roundTimer != 0 && lastTimerStatus != 'Stopped') {
-          // Check if this question belongs to the same round
-          final questionRoundName = question['round_name'] as String?;
-          if (questionRoundName == roundName) {
+        final questionRoundName = question['round_name'] as String?;
+        if (roundTimer != 0) {
+          if (lastTimerStatus != 'Stopped' && questionRoundName == roundName) {
+            isEnabled = true;
+          }
+        } else {
+          if (startTimerStatus == 'Running' && intQuestionId != null && qId == intQuestionId) {
             isEnabled = true;
           }
         }
         
-        // Get saved answer if exists
+        // Get answer value: prefer existing _answers (current edits) over savedAnswers
         Map<String, dynamic>? savedAnswer;
         try {
           savedAnswer = savedAnswers[qId];
         } catch (e) {
           print('QuestionPage: Error accessing savedAnswers[$qId]: $e');
-          print('QuestionPage: qId type: ${qId.runtimeType}, savedAnswers keys: ${savedAnswers.keys.toList()}');
           savedAnswer = null;
         }
-        final answerText = savedAnswer?['answer'] as String? ?? '';
-        final isSelected = savedAnswer?['selected'] as bool? ?? false;
+        Map<String, dynamic>? existingAnswer;
+        for (final a in _answers) {
+          final aId = a['id'];
+          final aid = aId is int ? aId : int.tryParse(aId?.toString() ?? '');
+          if (aid == qId) {
+            existingAnswer = a;
+            break;
+          }
+        }
+        String answerText = savedAnswer?['answer'] as String? ?? '';
+        bool isSelected = savedAnswer?['selected'] as bool? ?? false;
+        if (existingAnswer != null) {
+          answerText = existingAnswer['value'] as String? ?? answerText;
+          isSelected = existingAnswer['selected'] as bool? ?? isSelected;
+        }
         
         // Get question data
         final answersForSelection = question['answers_for_selection'] as String?;
@@ -1349,6 +1606,10 @@ class _QuestionPageState extends State<QuestionPage> {
             inputType = 'text';
             options = [];
           }
+        }
+        
+        if (inputType == 'list' && roundTimer != 0 && canonicalListForRound.isNotEmpty) {
+          options = List<String>.from(canonicalListForRound);
         }
         
         // Determine checkbox state
@@ -1424,7 +1685,9 @@ class _QuestionPageState extends State<QuestionPage> {
       setState(() {
         _answers = mergedAnswers;
         _currentQuestionId = intQuestionId;
+        _roundTimer = roundTimer;
       });
+      _bumpAnswerPoolRevision();
       
       print('QuestionPage: Built ${mergedAnswers.length} answers from game data (enabled: ${mergedAnswers.where((a) => a['enabled'] == true).length})');
 
@@ -1466,16 +1729,6 @@ class _QuestionPageState extends State<QuestionPage> {
       // Ignore layout errors (e.g. "RenderBox was not laid out")
     }
 
-    final currentAnswer = _answers.firstWhere(
-      (answer) => answer['id'] == _currentQuestionId,
-      orElse: () => {},
-    );
-    final inputType = currentAnswer['inputType'] as String?;
-    final isEnabled = currentAnswer['enabled'] as bool? ?? false;
-    if (_isWriter && isEnabled && inputType == 'text') {
-      final focusNode = _answerFocusNodes[_currentQuestionId!];
-      focusNode?.requestFocus();
-    }
   }
   
   /// Update game info from active game and specific question
@@ -1518,7 +1771,7 @@ class _QuestionPageState extends State<QuestionPage> {
             .toList();
         
         if (roundQuestions.isNotEmpty) {
-          Map<String, dynamic>? selectedQuestion;
+          late final Map<String, dynamic> selectedQuestion;
           
           if (intQuestionId == null || intQuestionId == 0) {
             // Get the last question in the list for this round
@@ -1549,19 +1802,17 @@ class _QuestionPageState extends State<QuestionPage> {
             print('QuestionPage: question_id=$intQuestionId not found, using last question in round: question_num=${selectedQuestion['question_num']}');
           }
           
-          if (selectedQuestion != null) {
-            final regScoreStr = selectedQuestion['reg_score'] as String? ?? '1;0';
-            final regParts = regScoreStr.split(';');
-            regScore = int.tryParse(regParts[0]) ?? 1;
-            regScoreTotal = int.tryParse(regParts.length > 1 ? regParts[1] : '0') ?? 0;
-            
-            final bonusScoreStr = selectedQuestion['bonus_score'] as String? ?? '0;0';
-            final bonusParts = bonusScoreStr.split(';');
-            bonusScore = int.tryParse(bonusParts[0]) ?? 0;
-            bonusScoreTotal = int.tryParse(bonusParts.length > 1 ? bonusParts[1] : '0') ?? 0;
-            
-            print('QuestionPage: Got reg_score and bonus_score from game table (round_name=$_roundName): reg_score=$regScore/$regScoreTotal, bonus_score=$bonusScore/$bonusScoreTotal');
-          }
+          final regScoreStr = selectedQuestion['reg_score'] as String? ?? '1;0';
+          final regParts = regScoreStr.split(';');
+          regScore = int.tryParse(regParts[0]) ?? 1;
+          regScoreTotal = int.tryParse(regParts.length > 1 ? regParts[1] : '0') ?? 0;
+          
+          final bonusScoreStr = selectedQuestion['bonus_score'] as String? ?? '0;0';
+          final bonusParts = bonusScoreStr.split(';');
+          bonusScore = int.tryParse(bonusParts[0]) ?? 0;
+          bonusScoreTotal = int.tryParse(bonusParts.length > 1 ? bonusParts[1] : '0') ?? 0;
+          
+          print('QuestionPage: Got reg_score and bonus_score from game table (round_name=$_roundName): reg_score=$regScore/$regScoreTotal, bonus_score=$bonusScore/$bonusScoreTotal');
         } else {
           print('QuestionPage: WARNING - No questions found for round_name=$_roundName');
         }
@@ -1643,68 +1894,6 @@ class _QuestionPageState extends State<QuestionPage> {
       });
       
       print('QuestionPage: Final game info - reg_score=$regScore/$regScoreTotal, bonus_score=$bonusScore/$bonusScoreTotal');
-    } catch (e) {
-      print('QuestionPage: Error updating game info: $e');
-    }
-  }
-  
-  /// Update game info from active game and specific question (old version - keeping for reference)
-  Future<void> _updateGameInfo_OLD(Map<String, dynamic> activeGame, dynamic questionId) async {
-    try {
-      final gameName = activeGame['game_name'] as String? ?? 'Current Game';
-      
-      // Convert questionId to int for lookup
-      final intQuestionId = questionId is int ? questionId : (questionId is String ? int.tryParse(questionId) : null);
-      
-      // Get reg_score and bonus_score from specific question by question_id
-      if (_gameData.isNotEmpty && intQuestionId != null && _gameData.containsKey(intQuestionId)) {
-        final question = _gameData[intQuestionId]!;
-        final regScoreStr = question['reg_score'] as String? ?? '1;0';
-        final regParts = regScoreStr.split(';');
-        final regScore = int.tryParse(regParts[0]) ?? 1;
-        final regScoreTotal = int.tryParse(regParts.length > 1 ? regParts[1] : '0') ?? 0;
-        
-        final bonusScoreStr = question['bonus_score'] as String? ?? '0;0';
-        final bonusParts = bonusScoreStr.split(';');
-        final bonusScore = int.tryParse(bonusParts[0]) ?? 0;
-        final bonusScoreTotal = int.tryParse(bonusParts.length > 1 ? bonusParts[1] : '0') ?? 0;
-        
-        setState(() {
-          _gameName = gameName;
-          _regScore = regScore;
-          _regScoreTotal = regScoreTotal;
-          _bonusScore = bonusScore;
-          _bonusScoreTotal = bonusScoreTotal;
-        });
-        
-        print('QuestionPage: Updated game info from question_id=$intQuestionId: reg_score=$regScore/$regScoreTotal, bonus_score=$bonusScore/$bonusScoreTotal');
-      } else {
-        // Fallback to first question if specific question not found
-        if (_gameData.isNotEmpty) {
-          final firstQuestion = _gameData.values.first;
-          final regScoreStr = firstQuestion['reg_score'] as String? ?? '1;0';
-          final regParts = regScoreStr.split(';');
-          final regScore = int.tryParse(regParts[0]) ?? 1;
-          final regScoreTotal = int.tryParse(regParts.length > 1 ? regParts[1] : '0') ?? 0;
-          
-          final bonusScoreStr = firstQuestion['bonus_score'] as String? ?? '0;0';
-          final bonusParts = bonusScoreStr.split(';');
-          final bonusScore = int.tryParse(bonusParts[0]) ?? 0;
-          final bonusScoreTotal = int.tryParse(bonusParts.length > 1 ? bonusParts[1] : '0') ?? 0;
-          
-          setState(() {
-            _gameName = gameName;
-            _regScore = regScore;
-            _regScoreTotal = regScoreTotal;
-            _bonusScore = bonusScore;
-            _bonusScoreTotal = bonusScoreTotal;
-          });
-        } else {
-          setState(() {
-            _gameName = gameName;
-          });
-        }
-      }
     } catch (e) {
       print('QuestionPage: Error updating game info: $e');
     }
@@ -1974,16 +2163,6 @@ class _QuestionPageState extends State<QuestionPage> {
     }
   }
 
-  Future<void> timer_trigger_action() async {
-    // TODO: Implement timer_trigger_action
-  }
-
-  void _startTimer(int durationInSeconds) {
-    // This method is now deprecated - timers are managed globally
-    // Just sync with global timer status instead of starting a new timer
-    _loadTimerStatus();
-  }
-  
   void _startBlinking() {
     _isBlinking = true;
     _blinkTimer?.cancel();
@@ -2001,59 +2180,6 @@ class _QuestionPageState extends State<QuestionPage> {
   void _stopBlinking() {
     _isBlinking = false;
     _blinkTimer?.cancel();
-  }
-
-  void _stopTimer() {
-    // Immediately stop timer and set to 0 - no countdown, no notifications
-    _isTimerRunning = false;
-    _timerStarted = false;
-    _tick?.cancel();
-    _stopCountdownTimer?.cancel();
-    _stopBlinking();
-    
-    // Immediately set timer to 0
-    setState(() {
-      timer_counter_down = 0;
-      _remainingTime = Duration.zero;
-      _stopCountdown = 0;
-    });
-    
-    print('QuestionPage: Timer stopped immediately, set to 0');
-  }
-
-  int _buildTimerDuration(String timestamp1, String timestamp2) {
-    try {
-      // Parse timestamps (format: "YYYY-MM-DD HH:MM:SS")
-      final date1 = DateTime.parse(timestamp1);
-      final date2 = DateTime.parse(timestamp2);
-      
-      // Calculate difference in seconds
-      final difference = date2.difference(date1).inSeconds;
-      
-      // Return 0 if negative, otherwise return the difference
-      return difference < 0 ? 0 : difference;
-    } catch (e) {
-      print('Error calculating timer duration: $e');
-      return 0;
-    }
-  }
-
-  void _pauseTimer() {
-    _isTimerRunning = false;
-    _tick?.cancel();
-  }
-
-  void _resetTimer() {
-    _isTimerRunning = false;
-    _timerStarted = false;
-    timer_counter_down = 0;
-    _stopCountdown = 0;
-    _tick?.cancel();
-    _stopCountdownTimer?.cancel();
-    _stopBlinking();
-    setState(() {
-      _remainingTime = _totalTime;
-    });
   }
 
   String _formatDuration(Duration duration) {
@@ -2113,8 +2239,12 @@ class _QuestionPageState extends State<QuestionPage> {
         // Timer already started globally, just build question board
         print('QuestionPage: About to call build_question_board for START_TIMER');
         print('QuestionPage: Message content: $message');
-        build_question_board(message).then((_) {
+        build_question_board(message).then((_) async {
           print('QuestionPage: build_question_board completed for START_TIMER');
+          final status = await getCurrentTimerStatus();
+          final start = status['start_timer_status'] as String? ?? 'Idle';
+          final last = status['last_timer_status'] as String? ?? 'Idle';
+          _updateAnswerEditability(start, last);
         }).catchError((e) {
           print('QuestionPage: Error in build_question_board for START_TIMER: $e');
         });
@@ -2130,6 +2260,13 @@ class _QuestionPageState extends State<QuestionPage> {
           _timerStarted = false;
         });
         _tick?.cancel();
+        // Re-evaluate editability: with final_timer>0, Rule 2 keeps all fields enabled until last_timer stops
+        getCurrentTimerStatus().then((status) {
+          _updateAnswerEditability(
+            status['start_timer_status'] as String? ?? 'Idle',
+            status['last_timer_status'] as String? ?? 'Idle',
+          );
+        });
         break;
         
       case 'LAST_TIMER':
@@ -2169,8 +2306,12 @@ class _QuestionPageState extends State<QuestionPage> {
         // Build question board for LAST_TIMER as well
         print('QuestionPage: About to call build_question_board for LAST_TIMER');
         print('QuestionPage: Message content: $message');
-        build_question_board(message).then((_) {
+        build_question_board(message).then((_) async {
           print('QuestionPage: build_question_board completed for LAST_TIMER');
+          final status = await getCurrentTimerStatus();
+          final start = status['start_timer_status'] as String? ?? 'Idle';
+          final last = status['last_timer_status'] as String? ?? 'Idle';
+          _updateAnswerEditability(start, last);
         }).catchError((e) {
           print('QuestionPage: Error in build_question_board for LAST_TIMER: $e');
         });
@@ -2178,78 +2319,6 @@ class _QuestionPageState extends State<QuestionPage> {
         
       default:
         print('Unknown timer action: $timerAction');
-    }
-  }
-
-  /// Calculate adjusted timer value based on UTC time difference
-  /// Returns: timer_value - (current_utc_time - timer_start).inSeconds
-  /// If result is positive, timer should run; if zero or negative, timer expired
-  int _calculateAdjustedTimer(int timerValue, dynamic timerStart) {
-    try {
-      // Parse timer_start - it could be a DateTime string or already a DateTime
-      DateTime? startTime;
-      
-      if (timerStart == null) {
-        print('QuestionPage: timer_start is null, using original timer value');
-        return timerValue;
-      }
-      
-      if (timerStart is DateTime) {
-        // If already a DateTime, ensure it's UTC
-        startTime = timerStart.isUtc ? timerStart : timerStart.toUtc();
-      } else if (timerStart is String) {
-        String timerStartStr = timerStart.trim();
-        
-        // Parse the datetime string
-        DateTime parsedTime;
-        try {
-          // Try parsing as-is first (handles ISO 8601 with timezone)
-          parsedTime = DateTime.parse(timerStartStr);
-        } catch (e) {
-          // Try parsing as "YYYY-MM-DD HH:MM:SS" format (replace space with T)
-          try {
-            parsedTime = DateTime.parse(timerStartStr.replaceAll(' ', 'T'));
-          } catch (e2) {
-            print('QuestionPage: Error parsing timer_start "$timerStart": $e2');
-            return timerValue;
-          }
-        }
-        
-        // Convert to UTC if not already UTC (backend sends UTC time)
-        if (parsedTime.isUtc) {
-          startTime = parsedTime;
-        } else {
-          // Treat as UTC (backend sends naive datetime as UTC)
-          startTime = DateTime.utc(
-            parsedTime.year,
-            parsedTime.month,
-            parsedTime.day,
-            parsedTime.hour,
-            parsedTime.minute,
-            parsedTime.second,
-            parsedTime.millisecond,
-            parsedTime.microsecond,
-          );
-        }
-      } else {
-        print('QuestionPage: timer_start is not a valid type: ${timerStart.runtimeType}');
-        return timerValue;
-      }
-      
-      // Calculate elapsed time in seconds (both should be UTC)
-      final now = DateTime.now().toUtc();
-      final elapsedSeconds = now.difference(startTime).inSeconds;
-      
-      // Adjust timer: timer_value - elapsed_seconds
-      final adjustedValue = timerValue - elapsedSeconds;
-      
-      print('QuestionPage: Timer adjustment - original: $timerValue, elapsed: $elapsedSeconds, adjusted: $adjustedValue');
-      
-      return adjustedValue.toInt();
-    } catch (e) {
-      print('QuestionPage: Error calculating adjusted timer: $e');
-      // Return original value on error
-      return timerValue;
     }
   }
 
@@ -2405,10 +2474,218 @@ class _QuestionPageState extends State<QuestionPage> {
     );
   }
 
+  String _summaryLabelForAnswer(Map<String, dynamic> answer) {
+    final inputType = answer['inputType'] as String? ?? 'text';
+    final value = (answer['value'] as String? ?? '').trim();
+    if (value.isEmpty) {
+      return 'No answer yet';
+    }
+    switch (inputType) {
+      case 'list':
+        final parts = value.split(',').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+        if (parts.isEmpty) {
+          return 'No answer yet';
+        }
+        return '${parts.length} selected';
+      case 'radio':
+      case 'text':
+      default:
+        return value;
+    }
+  }
+
+  void _bumpAnswerPoolRevision() {
+    _answerPoolRevision.value = _answerPoolRevision.value + 1;
+  }
+
+  /// When round uses shared list pool, which question id currently "owns" this option (if not [forQuestionId]).
+  int? _listOptionOwnerQuestionId(String option, int forQuestionId) {
+    if (_roundTimer == 0) {
+      return null;
+    }
+    for (final a in _answers) {
+      if (a['inputType'] != 'list') {
+        continue;
+      }
+      final int? qid = a['id'] is int ? a['id'] as int : int.tryParse('${a['id']}');
+      if (qid == null || qid == forQuestionId) {
+        continue;
+      }
+      final v = a['value'] as String? ?? '';
+      final set = v.split(',').map((e) => e.trim()).where((e) => e.isNotEmpty).toSet();
+      if (set.contains(option)) {
+        return qid;
+      }
+    }
+    return null;
+  }
+
+  ({double c, double w}) _regWrongPairForQuestion(int questionId) {
+    final q = _gameData[questionId];
+    if (q == null) {
+      return (c: 1.0, w: 0.0);
+    }
+    final r = (q['reg_score'] as String? ?? '1;0').split(';');
+    final c = double.tryParse(r[0].trim()) ?? 1.0;
+    final w = double.tryParse(r.length > 1 ? r[1].trim() : '0') ?? 0.0;
+    return (c: c, w: w);
+  }
+
+  ({double c, double w}) _bonusWrongPairForQuestion(int questionId) {
+    final q = _gameData[questionId];
+    if (q == null) {
+      return (c: 0.0, w: 0.0);
+    }
+    final b = (q['bonus_score'] as String? ?? '0;0').split(';');
+    final c = double.tryParse(b[0].trim()) ?? 0.0;
+    final w = double.tryParse(b.length > 1 ? b[1].trim() : '0') ?? 0.0;
+    return (c: c, w: w);
+  }
+
+  /// Checkbox: persist reg_score pair (unchecked) or bonus pair (checked) to active_teams_answers.
+  Future<AnswerPersistStatus> _persistAnswerWithCheckboxScores(
+    int questionId,
+    String answerText,
+    bool selected,
+  ) async {
+    final reg = _regWrongPairForQuestion(questionId);
+    final bon = _bonusWrongPairForQuestion(questionId);
+    final c = selected ? bon.c : reg.c;
+    final w = selected ? bon.w : reg.w;
+    return _persistAnswerValue(
+      questionId,
+      answerText,
+      correctScore: c,
+      wrongScore: w,
+    );
+  }
+
+  Future<AnswerPersistStatus> _persistAnswerValue(
+    int questionId,
+    String value, {
+    double? correctScore,
+    double? wrongScore,
+  }) async {
+    if (!_isWriter || _currentGameNameForStorage.isEmpty) {
+      return AnswerPersistStatus.failed;
+    }
+    final gameNameSafe = _currentGameNameForStorage.replaceAll(' ', '_').replaceAll('-', '_').toLowerCase();
+    final userData = await UserDataService.getUserData();
+    final teamIdRaw = userData?['playing_in_team_id'];
+    if (teamIdRaw == null) {
+      return AnswerPersistStatus.failed;
+    }
+    final teamIdInt = teamIdRaw is int ? teamIdRaw : int.tryParse(teamIdRaw.toString());
+    if (teamIdInt == null) {
+      return AnswerPersistStatus.failed;
+    }
+    final roundName = _roundName.isNotEmpty ? _roundName : null;
+    final rt = _roundTimer != 0 ? _roundTimer : null;
+    final item = <String, dynamic>{'question_id': questionId, 'answer': value};
+    if (correctScore != null && wrongScore != null) {
+      item['correct_score'] = correctScore;
+      item['wrong_score'] = wrongScore;
+    }
+    final res = await DatabaseService.putTeamAnswersBatch(
+      gameNameSafe,
+      teamIdInt,
+      <Map<String, dynamic>>[item],
+      roundName: roundName,
+      roundTimer: rt,
+    );
+    if (res['success'] == true) {
+      if (mounted) {
+        setState(() {
+          final idx = _answers.indexWhere((a) => a['id'] == questionId);
+          if (idx >= 0) {
+            _answers[idx]['value'] = value;
+          }
+        });
+        _bumpAnswerPoolRevision();
+        await _saveAnswers();
+      }
+      return AnswerPersistStatus.success;
+    }
+    if (res['statusCode'] == 409) {
+      if (mounted) {
+        unawaited(_handleRefresh(quiet: true).then((_) {
+          if (!mounted) return;
+          if (Navigator.of(context).canPop()) {
+            Navigator.of(context).pop();
+          }
+        }));
+      }
+      return AnswerPersistStatus.conflict;
+    }
+    if (res['error'] == 'network') {
+      if (mounted) {
+        setState(() {
+          final idx = _answers.indexWhere((a) => a['id'] == questionId);
+          if (idx >= 0) {
+            _answers[idx]['value'] = value;
+          }
+        });
+        _bumpAnswerPoolRevision();
+        await _saveAnswers();
+      }
+      return AnswerPersistStatus.offline;
+    }
+    return AnswerPersistStatus.failed;
+  }
+
+  void _openAnswerEditor(int index) {
+    if (index < 0 || index >= _answers.length) {
+      return;
+    }
+    final answer = _answers[index];
+    final answerEnabled = answer['enabled'] as bool? ?? false;
+    if (!_isWriter || !answerEnabled) {
+      return;
+    }
+    final qId = answer['id'] as int? ?? 0;
+    if (qId == 0) {
+      return;
+    }
+    final numLabel = answer['num'];
+    final sub = _roundName.isNotEmpty ? _roundName : _gameName;
+    final useSharedList = (answer['inputType'] as String? ?? '') == 'list' && _roundTimer != 0;
+
+    showDialog<void>(
+      context: context,
+      barrierDismissible: true,
+      builder: (ctx) {
+        return AnswerEditorDialog(
+          questionId: qId,
+          questionNum: numLabel is int ? numLabel : int.tryParse(numLabel.toString()) ?? index + 1,
+          subtitle: sub,
+          inputType: answer['inputType'] as String? ?? 'text',
+          options: List<String>.from(
+            (answer['options'] as List?)?.map((e) => e.toString()) ?? <String>[],
+          ),
+          initialValue: answer['value'] as String? ?? '',
+          roundUsesSharedListPool: useSharedList,
+          ownerQuestionIdForOption: useSharedList
+              ? (opt) => _listOptionOwnerQuestionId(opt, qId)
+              : null,
+          answerPoolRevision: useSharedList ? _answerPoolRevision : null,
+          isEditable: () {
+            if (!mounted) {
+              return false;
+            }
+            final i = _answers.indexWhere((a) => a['id'] == qId);
+            if (i < 0) {
+              return false;
+            }
+            final en = _answers[i]['enabled'] as bool? ?? false;
+            return _isWriter && en;
+          },
+          onPersist: (v) => _persistAnswerValue(qId, v),
+        );
+      },
+    );
+  }
+
   Widget _buildAnswerSelection() {
-    // Check if checkbox should be disabled (bonus score is 0/0)
-    final isCheckboxDisabled = _bonusScore == 0 && _bonusScoreTotal == 0;
-    
     return Card(
       elevation: 2,
       child: Column(
@@ -2433,59 +2710,92 @@ class _QuestionPageState extends State<QuestionPage> {
               final answer = _answers[index];
               final qId = answer['id'] as int?;
               final itemKey = qId == null ? null : _answerItemKeys[qId];
+              final answerEnabled = answer['enabled'] as bool? ?? false;
+              final answerCheckboxEnabled = answer['checkboxEnabled'] as bool? ?? false;
+              final canOpen = _isWriter && answerEnabled;
+              final labelStyle = (!answerEnabled || !_isWriter)
+                  ? TextStyle(
+                      color: Colors.grey.shade500,
+                    )
+                  : null;
+              final summary = _summaryLabelForAnswer(answer);
 
               return Container(
                 key: itemKey,
                 child: Card(
                   margin: const EdgeInsets.only(bottom: 8),
                   child: Padding(
-                    padding: const EdgeInsets.all(8),
+                    padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 4),
                     child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.center,
                       children: [
-                        // Middle: Dynamic input based on type
-                        Expanded(
-                          child: _buildDynamicInput(answer, index),
-                        ),
-                        const SizedBox(width: 8),
-                        // Right side: Num label (non-editable)
-                        SizedBox(
-                          width: 60,
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              const Text(
-                                'Num',
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w500,
-                                  color: Colors.grey,
-                                ),
+                        Material(
+                          color: Colors.transparent,
+                          child: InkWell(
+                            onTap: canOpen ? () => _openAnswerEditor(index) : null,
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 12),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  const Text(
+                                    'Num',
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w500,
+                                      color: Colors.grey,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    answer['num'].toString(),
+                                    style: TextStyle(
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.bold,
+                                      color: canOpen ? null : Colors.grey.shade500,
+                                    ),
+                                  ),
+                                ],
                               ),
-                              const SizedBox(height: 4),
-                              Text(
-                                answer['num'].toString(),
-                                style: const TextStyle(
-                                  fontSize: 16,
-                                  fontWeight: FontWeight.bold,
-                                ),
-                              ),
-                            ],
+                            ),
                           ),
                         ),
-                        const SizedBox(width: 8),
-                        // Right side: Checkbox (wrapped for min touch target)
+                        Expanded(
+                          child: Material(
+                            color: Colors.transparent,
+                            child: InkWell(
+                              onTap: canOpen ? () => _openAnswerEditor(index) : null,
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 12),
+                                child: Text(
+                                  summary,
+                                  style: labelStyle,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
                         SizedBox(
                           width: kMinTouchTargetSize,
                           height: kMinTouchTargetSize,
                           child: Checkbox(
                             value: answer['selected'] as bool,
-                            onChanged: (isCheckboxDisabled || !_isWriter)
+                            onChanged: (!answerCheckboxEnabled || !answerEnabled || !_isWriter)
                                 ? null
-                                : (value) {
+                                : (value) async {
+                                    final v = value ?? false;
+                                    final id = _answers[index]['id'] as int? ?? 0;
+                                    if (id == 0) {
+                                      return;
+                                    }
                                     setState(() {
-                                      _answers[index]['selected'] = value ?? false;
+                                      _answers[index]['selected'] = v;
                                     });
+                                    final txt = _answers[index]['value'] as String? ?? '';
+                                    await _persistAnswerWithCheckboxScores(id, txt, v);
                                     _triggerAutoSave();
                                   },
                           ),
@@ -2502,202 +2812,7 @@ class _QuestionPageState extends State<QuestionPage> {
     );
   }
 
-  Widget _buildDynamicInput(Map<String, dynamic> answer, int index) {
-    final inputType = answer['inputType'] as String;
-    final isEnabled = answer['enabled'] as bool? ?? false;
-
-    Widget child;
-    switch (inputType) {
-      case 'radio':
-        child = _buildRadioButtons(answer, index);
-        break;
-      case 'list':
-        child = _buildListOptions(answer, index);
-        break;
-      case 'text':
-      default:
-        child = _buildTextField(answer, index);
-        break;
-    }
-
-    return AbsorbPointer(
-      absorbing: !isEnabled || !_isWriter,
-      child: Opacity(
-        opacity: (isEnabled && _isWriter) ? 1.0 : 0.6,
-        child: child,
-      ),
-    );
-  }
-
-  Widget _buildRadioButtons(Map<String, dynamic> answer, int index) {
-    final options = answer['options'] as List<String>;
-    final selectedValue = answer['value'] as String;
-    
-    if (options.isEmpty) {
-      return const Text('No options available', style: TextStyle(color: Colors.grey));
-    }
-    
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: options.map((option) {
-          return ConstrainedBox(
-          constraints: const BoxConstraints(minHeight: kMinTouchTargetSize),
-          child: RadioListTile<String>(
-            title: Text(
-              option,
-              style: TextStyle(
-                color: _isWriter ? null : Colors.grey.shade600,
-              ),
-            ),
-            value: option,
-            groupValue: selectedValue,
-            onChanged: _isWriter
-                ? (value) {
-                    setState(() {
-                      _answers[index]['value'] = value ?? '';
-                    });
-                    _triggerAutoSave();
-                  }
-                : null,
-            contentPadding: const EdgeInsets.symmetric(
-              horizontal: 16,
-              vertical: 8,
-            ),
-          ),
-        );
-      }).toList(),
-    );
-  }
-
-  Widget _buildListOptions(Map<String, dynamic> answer, int index) {
-    final options = answer['options'] as List<String>;
-    final selectedValues = (answer['value'] as String).split(',').where((v) => v.isNotEmpty).toSet();
-    
-    if (options.isEmpty) {
-      return const Text('No options available', style: TextStyle(color: Colors.grey));
-    }
-    
-    return Container(
-      constraints: const BoxConstraints(maxHeight: 200),
-      child: ListView.builder(
-        shrinkWrap: true,
-        itemCount: options.length,
-        itemBuilder: (context, optIndex) {
-          final option = options[optIndex];
-          final isSelected = selectedValues.contains(option);
-          
-          return InkWell(
-            onTap: _isWriter
-                ? () {
-                    setState(() {
-                      if (isSelected) {
-                        selectedValues.remove(option);
-                      } else {
-                        selectedValues.add(option);
-                      }
-                      _answers[index]['value'] = selectedValues.join(',');
-                    });
-                    _triggerAutoSave();
-                  }
-                : null,
-            child: Container(
-              constraints: const BoxConstraints(minHeight: kMinTouchTargetSize),
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-              decoration: BoxDecoration(
-                color: isSelected 
-                    ? (_isWriter ? Colors.blue.shade100 : Colors.grey.shade200)
-                    : Colors.transparent,
-                border: Border(
-                  bottom: BorderSide(color: Colors.grey.shade300),
-                ),
-              ),
-              child: Row(
-                children: [
-                  Icon(
-                    isSelected ? Icons.check_box : Icons.check_box_outline_blank,
-                    size: 20,
-                    color: isSelected 
-                        ? (_isWriter ? Colors.blue : Colors.grey.shade600)
-                        : (_isWriter ? Colors.grey : Colors.grey.shade400),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      option,
-                      style: TextStyle(
-                        color: isSelected 
-                            ? (_isWriter ? Colors.blue.shade900 : Colors.grey.shade700)
-                            : (_isWriter ? Colors.black87 : Colors.grey.shade600),
-                        fontWeight: isSelected ? FontWeight.w500 : FontWeight.normal,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          );
-        },
-      ),
-    );
-  }
-
-  Widget _buildTextField(Map<String, dynamic> answer, int index) {
-    final qId = answer['id'] as int?;
-    final focusNode = qId == null ? null : _answerFocusNodes[qId];
-    final isEnabled = answer['enabled'] as bool? ?? false;
-    return TextField(
-      decoration: const InputDecoration(
-        border: OutlineInputBorder(),
-        hintText: 'Enter your answer...',
-      ),
-      focusNode: focusNode,
-      enabled: _isWriter && isEnabled,
-      maxLines: 3,
-      minLines: 1,
-      controller: TextEditingController(
-        text: answer['value'] as String,
-      )..selection = TextSelection.fromPosition(
-        TextPosition(offset: (answer['value'] as String).length),
-      ),
-      onChanged: (value) {
-        setState(() {
-          _answers[index]['value'] = value;
-        });
-        _triggerAutoSave();
-      },
-    );
-  }
-
-  Future<void> _handleSave() async {
-    try {
-      // Save answers to persistent storage
-      await _saveAnswers();
-      
-      // Also save to backend if needed (can be implemented later)
-      // For now, just save to local storage
-      
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Answers saved successfully'),
-            duration: Duration(seconds: 2),
-          ),
-        );
-      }
-    } catch (e) {
-      print('Error saving answers: $e');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Error saving answers: $e'),
-            duration: const Duration(seconds: 3),
-          ),
-        );
-      }
-    }
-  }
-
-  Future<void> _handleRefresh() async {
+  Future<void> _handleRefresh({bool quiet = false}) async {
     try {
       // Reload game data and saved answers
       if (_currentGameNameForStorage.isNotEmpty) {
@@ -2748,7 +2863,7 @@ class _QuestionPageState extends State<QuestionPage> {
             }
           }
           
-          if (mounted) {
+          if (mounted && !quiet) {
             ScaffoldMessenger.of(context).showSnackBar(
               const SnackBar(
                 content: Text('Answers refreshed from saved data'),
@@ -2760,7 +2875,7 @@ class _QuestionPageState extends State<QuestionPage> {
       }
     } catch (e) {
       print('Error refreshing answers: $e');
-      if (mounted) {
+      if (mounted && !quiet) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text('Error refreshing answers: $e'),
@@ -2788,7 +2903,7 @@ class _QuestionPageState extends State<QuestionPage> {
   Widget build(BuildContext context) {
     return PopScope(
       canPop: false, // Prevent default back button behavior
-      onPopInvoked: (didPop) async {
+      onPopInvokedWithResult: (didPop, result) async {
         if (!didPop) {
           await _onWillPop();
         }
@@ -2820,27 +2935,6 @@ class _QuestionPageState extends State<QuestionPage> {
               const SizedBox(height: 16),
               // Answer Selection
               _buildAnswerSelection(),
-              const SizedBox(height: 16),
-              // Action Button
-              SizedBox(
-                height: 52,
-                child: ElevatedButton(
-                  onPressed: _isWriter ? _handleSave : _handleRefresh,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: _isWriter ? Colors.green : Colors.blue,
-                    foregroundColor: Colors.white,
-                    minimumSize: const Size(kMinTouchTargetSize, kMinTouchTargetSize),
-                    padding: const EdgeInsets.symmetric(vertical: 16),
-                  ),
-                child: Text(
-                  _isWriter ? 'Save' : 'Refresh',
-                  style: const TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-              ),
-            ),
             ],
           ),
         ),
