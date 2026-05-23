@@ -19,6 +19,66 @@ class _SummaryPageState extends State<SummaryPage> {
   Map<String, List<Map<String, dynamic>>> _roundQuestions = {};
   Map<int, Map<String, dynamic>> _teamAnswers = {}; // Key: question_id, Value: answer data
 
+  /// Matches game table nonempty answer1..answer4; 0 nonempty → single slot.
+  int _expectedSlotCountFromQuestion(Map<String, dynamic> question) {
+    var c = 0;
+    for (final key in ['answer1', 'answer2', 'answer3', 'answer4']) {
+      final v = question[key];
+      if (v != null && v.toString().trim().isNotEmpty) {
+        c++;
+      }
+    }
+    return c == 0 ? 1 : c;
+  }
+
+  List<String> _fourPlayerAnswers(Map<String, dynamic>? answer) {
+    if (answer == null) {
+      return ['', '', '', ''];
+    }
+    return [
+      answer['player_answer1']?.toString() ?? '',
+      answer['player_answer2']?.toString() ?? '',
+      answer['player_answer3']?.toString() ?? '',
+      answer['player_answer4']?.toString() ?? '',
+    ];
+  }
+
+  int? _asSlotGrade(dynamic v) {
+    if (v == null) {
+      return null;
+    }
+    if (v is int) {
+      return v;
+    }
+    return int.tryParse(v.toString());
+  }
+
+  bool _hasPerSlotGrades(Map<String, dynamic>? answer) {
+    if (answer == null) {
+      return false;
+    }
+    for (final k in ['is_correct_1', 'is_correct_2', 'is_correct_3', 'is_correct_4']) {
+      if (answer[k] != null) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// JSON / SQL may surface whole numbers as [double]; map keys must stay stable for lookups.
+  int? _asInt(dynamic v) {
+    if (v == null) {
+      return null;
+    }
+    if (v is int) {
+      return v;
+    }
+    if (v is double) {
+      return v.round();
+    }
+    return int.tryParse(v.toString());
+  }
+
   @override
   void initState() {
     super.initState();
@@ -126,7 +186,7 @@ class _SummaryPageState extends State<SummaryPage> {
       // Load team answers
       final answers = await DatabaseService.getTeamAnswersForGame(_gameNameSafe!, _teamId!);
       for (final answer in answers) {
-        final questionId = answer['question_id'] as int?;
+        final questionId = _asInt(answer['question_id']);
         if (questionId != null) {
           _teamAnswers[questionId] = answer;
         }
@@ -136,7 +196,7 @@ class _SummaryPageState extends State<SummaryPage> {
         _isLoading = false;
       });
     } catch (e) {
-      print('Error loading summary data: $e');
+      debugPrint('Error loading summary data: $e');
       setState(() {
         _errorMessage = 'Error loading summary: ${e.toString()}';
         _isLoading = false;
@@ -144,18 +204,68 @@ class _SummaryPageState extends State<SummaryPage> {
     }
   }
 
+  /// Earned / admin-adjusted points for totals and pills. Prefer final_score; legacy fallback unchanged.
+  num _playerFacingPoints(Map<String, dynamic>? answer) {
+    if (answer == null) {
+      return 0;
+    }
+    final fs = answer['final_score'];
+    if (fs != null) {
+      return _coerceScore(fs);
+    }
+    if (_hasPerSlotGrades(answer)) {
+      return _coerceScore(answer['correct_score']);
+    }
+
+    final isCorrect = answer['is_correct'];
+    if (isCorrect == null || isCorrect == 0) {
+      return 0;
+    } else if (isCorrect == 1) {
+      return _coerceScore(answer['correct_score']);
+    } else if (isCorrect == -1) {
+      return _coerceScore(answer['wrong_score']);
+    }
+    return 0;
+  }
+
+  num _luckyBonusPoints(Map<String, dynamic>? answer) {
+    if (answer == null) {
+      return 0;
+    }
+    return _coerceScore(answer['lucky_bonus']);
+  }
+
+  /// Question score including any populated lucky bonus (used for round totals and row score).
+  num _questionTotalPoints(Map<String, dynamic>? answer) {
+    return _playerFacingPoints(answer) + _luckyBonusPoints(answer);
+  }
+
   /// Non-empty only when a graded result exists (hides the old "no answer yet" when answer text is present).
   String? _getResultPillText(Map<String, dynamic>? answer) {
     if (answer == null) {
       return null;
     }
+    if (_hasPerSlotGrades(answer)) {
+      final net = _playerFacingPoints(answer);
+      final isCorrect = answer['is_correct'];
+      if (isCorrect == 1) {
+        return 'correct (+$net)';
+      }
+      if (isCorrect == -1) {
+        return 'incorrect ($net)';
+      }
+      if (net != 0) {
+        return 'partial ($net)';
+      }
+      return 'graded';
+    }
     final isCorrect = answer['is_correct'];
     if (isCorrect == 1) {
-      final score = answer['correct_score'] ?? 0;
+      final score = _playerFacingPoints(answer);
       return 'correct (+$score)';
     }
     if (isCorrect == -1) {
-      final score = answer['wrong_score'] ?? 0;
+      final score = _playerFacingPoints(answer);
       return 'incorrect ($score)';
     }
     return null;
@@ -183,6 +293,28 @@ class _SummaryPageState extends State<SummaryPage> {
     return null;
   }
 
+  /// Scores may be int or double from SQL/JSON (e.g. 0.5); never use `as int?` on dynamic.
+  num _coerceScore(dynamic raw) {
+    if (raw == null) {
+      return 0;
+    }
+    if (raw is num) {
+      return raw;
+    }
+    return num.tryParse(raw.toString()) ?? 0;
+  }
+
+  /// One sign only: +N for positive, -N for negative (not "+-N").
+  String _formatSignedPoints(num value) {
+    if (value > 0) {
+      return '+$value';
+    }
+    if (value < 0) {
+      return '$value';
+    }
+    return '0';
+  }
+
   Color _getResultColor(Map<String, dynamic>? answer) {
     if (answer == null) {
       return Colors.grey;
@@ -200,21 +332,23 @@ class _SummaryPageState extends State<SummaryPage> {
     return Colors.grey;
   }
 
-  int _getResultScore(Map<String, dynamic>? answer) {
+  /// Row background for View Results: green (correct), red (incorrect), white (undefined / 0).
+  Color _getQuestionRowBackgroundColor(Map<String, dynamic>? answer) {
     if (answer == null) {
-      return 0;
+      return Colors.white;
     }
-
     final isCorrect = answer['is_correct'];
-    if (isCorrect == null || isCorrect == 0) {
-      return 0;
-    } else if (isCorrect == 1) {
-      return answer['correct_score'] as int? ?? 0;
-    } else if (isCorrect == -1) {
-      return answer['wrong_score'] as int? ?? 0;
+    if (isCorrect == 1) {
+      return Colors.green.shade50;
     }
+    if (isCorrect == -1) {
+      return Colors.red.shade50;
+    }
+    return Colors.white;
+  }
 
-    return 0;
+  num _getResultScore(Map<String, dynamic>? answer) {
+    return _questionTotalPoints(answer);
   }
 
   @override
@@ -285,14 +419,14 @@ class _SummaryPageState extends State<SummaryPage> {
   }
 
   Widget _buildRoundScorecard(String roundName, List<Map<String, dynamic>> questions) {
-    // Calculate round totals
-    int roundTotalScore = 0;
+    // Calculate round totals (fractional scores from DB are valid)
+    num roundTotalScore = 0;
     int roundCorrectCount = 0;
     int roundIncorrectCount = 0;
     int roundNoAnswerCount = 0;
 
     for (final question in questions) {
-      final questionId = question['id'] as int?;
+      final questionId = _asInt(question['id']);
       final answer = questionId != null ? _teamAnswers[questionId] : null;
       final score = _getResultScore(answer);
       roundTotalScore += score;
@@ -393,22 +527,124 @@ class _SummaryPageState extends State<SummaryPage> {
           label,
           style: TextStyle(
             fontSize: 12,
-            color: color.withOpacity(0.8),
+            color: color.withValues(alpha: 0.8),
           ),
         ),
       ],
     );
   }
 
+  Widget _gradeChipForSlot(int? grade) {
+    if (grade == null) {
+      return const SizedBox.shrink();
+    }
+    late final Color bg;
+    late final Color fg;
+    late final String label;
+    if (grade == 1) {
+      label = '✓';
+      bg = Colors.green.shade100;
+      fg = Colors.green.shade900;
+    } else if (grade == -1) {
+      label = '✗';
+      bg = Colors.red.shade100;
+      fg = Colors.red.shade900;
+    } else {
+      label = '○';
+      bg = Colors.grey.shade200;
+      fg = Colors.grey.shade700;
+    }
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          fontSize: 12,
+          fontWeight: FontWeight.bold,
+          color: fg,
+        ),
+      ),
+    );
+  }
+
+  /// Per-question answer lines: up to [kSlots] rows with optional per-slot grade chips.
+  Widget _buildAnswerLines(Map<String, dynamic> question, Map<String, dynamic>? answer) {
+    final kSlots = _expectedSlotCountFromQuestion(question);
+    final parts = List<String>.from(_fourPlayerAnswers(answer));
+    final syn = answer?['answer']?.toString() ?? '';
+    if (parts.every((s) => s.trim().isEmpty) && syn.trim().isNotEmpty) {
+      final lines = syn.split('\n');
+      for (var i = 0; i < 4 && i < lines.length; i++) {
+        parts[i] = lines[i];
+      }
+    }
+
+    final grades = [
+      _asSlotGrade(answer?['is_correct_1']),
+      _asSlotGrade(answer?['is_correct_2']),
+      _asSlotGrade(answer?['is_correct_3']),
+      _asSlotGrade(answer?['is_correct_4']),
+    ];
+
+    final children = <Widget>[];
+    for (var i = 0; i < kSlots; i++) {
+      final t = parts[i].trim();
+      final display = t.isEmpty ? '—' : t;
+      children.add(
+        Padding(
+          padding: EdgeInsets.only(top: children.isEmpty ? 0 : 6),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              SizedBox(
+                width: 56,
+                child: Text(
+                  kSlots > 1 ? '${i + 1}' : '',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: Colors.grey.shade700,
+                  ),
+                ),
+              ),
+              Expanded(
+                child: Text(
+                  display,
+                  style: const TextStyle(fontSize: 14),
+                ),
+              ),
+              _gradeChipForSlot(grades[i]),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: children,
+    );
+  }
+
   Widget _buildQuestionRow(Map<String, dynamic> question) {
-    final questionId = question['id'] as int?;
+    final questionId = _asInt(question['id']);
     final questionNum = question['question_num']?.toString() ?? 'N/A';
     final answer = questionId != null ? _teamAnswers[questionId] : null;
-    final rawAnswer = answer?['answer']?.toString().trim() ?? '';
+    final kSlots = _expectedSlotCountFromQuestion(question);
+    final pa = _fourPlayerAnswers(answer);
+    final syn = answer?['answer']?.toString().trim() ?? '';
+    final hasAnswerContent =
+        pa.any((s) => s.trim().isNotEmpty) || syn.isNotEmpty;
     final resultPill = _getResultPillText(answer);
     final resultColor = _getResultColor(answer);
+    final rowBg = _getQuestionRowBackgroundColor(answer);
     final score = _getResultScore(answer);
     final bonusNote = _bonusNoteForQuestion(question, answer);
+    final luckyBonus = _luckyBonusPoints(answer);
 
     return Container(
       margin: const EdgeInsets.only(bottom: 12),
@@ -416,7 +652,7 @@ class _SummaryPageState extends State<SummaryPage> {
       decoration: BoxDecoration(
         border: Border.all(color: Colors.grey.shade300),
         borderRadius: BorderRadius.circular(8),
-        color: Colors.grey.shade50,
+        color: rowBg,
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -442,7 +678,7 @@ class _SummaryPageState extends State<SummaryPage> {
                         ),
                       ),
                     ),
-                    if (rawAnswer.isNotEmpty && bonusNote != null) ...[
+                    if (hasAnswerContent && bonusNote != null) ...[
                       const SizedBox(width: 8),
                       Text(
                         '($bonusNote)',
@@ -460,7 +696,7 @@ class _SummaryPageState extends State<SummaryPage> {
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                   decoration: BoxDecoration(
-                    color: resultColor.withOpacity(0.2),
+                    color: resultColor.withValues(alpha: 0.2),
                     borderRadius: BorderRadius.circular(4),
                   ),
                   child: Text(
@@ -474,14 +710,32 @@ class _SummaryPageState extends State<SummaryPage> {
                 ),
             ],
           ),
-          if (rawAnswer.isNotEmpty) ...[
+          if (hasAnswerContent) ...[
             const SizedBox(height: 8),
             Text(
-              'Answer: $rawAnswer',
-              style: const TextStyle(fontSize: 14),
+              kSlots > 1 ? 'Your answers' : 'Answer',
+              style: TextStyle(
+                fontSize: 12,
+                color: Colors.grey.shade700,
+                fontWeight: FontWeight.w600,
+              ),
             ),
+            const SizedBox(height: 4),
+            _buildAnswerLines(question, answer),
           ],
-          if (score != 0)
+          if (luckyBonus != 0)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(
+                'Lucky bonus: ${_formatSignedPoints(luckyBonus)}',
+                style: TextStyle(
+                  fontSize: 13,
+                  color: Colors.deepPurple.shade800,
+                  fontStyle: FontStyle.italic,
+                ),
+              ),
+            ),
+          if (_hasPerSlotGrades(answer) || score != 0)
             Padding(
               padding: const EdgeInsets.only(top: 8),
               child: Text(

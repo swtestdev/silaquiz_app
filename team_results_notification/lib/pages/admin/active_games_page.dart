@@ -1606,6 +1606,22 @@ class _AddBonusOptionDialogState extends State<AddBonusOptionDialog> {
             itemBuilder: (context, index) {
               final question = _availableQuestions[index];
               final isSelected = _selectedQuestions.contains(question['id'].toString());
+              final preview =
+                  question['preview']?.toString().trim() ?? '';
+              final nested = question['data'];
+              final linkFromData = nested is Map<String, dynamic>
+                  ? (nested['links_for_question']?.toString().trim() ?? '')
+                  : '';
+              final commFromData = nested is Map<String, dynamic>
+                  ? (nested['comments']?.toString().trim() ?? '')
+                  : '';
+              final subtitleText = preview.isNotEmpty
+                  ? preview
+                  : (linkFromData.isNotEmpty
+                      ? linkFromData
+                      : (commFromData.isNotEmpty
+                          ? commFromData
+                          : 'No links or notes'));
               
               return CheckboxListTile(
                 dense: true, // More compact layout
@@ -1617,7 +1633,7 @@ class _AddBonusOptionDialogState extends State<AddBonusOptionDialog> {
                   ),
                 ),
                 subtitle: Text(
-                  question['question'] ?? 'No question text',
+                  subtitleText,
                   maxLines: 2, // Balanced to show content but fit more items
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(fontSize: 12),

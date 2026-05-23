@@ -23,8 +23,120 @@ DateTime? _lastTimerStartTime;
 Timer? _globalStartTimer;
 Timer? _globalLastTimer;
 
+int _parseRoundTimerValue(dynamic v) {
+  if (v == null) return 0;
+  if (v is int) return v;
+  if (v is String) return int.tryParse(v) ?? 0;
+  return int.tryParse(v.toString()) ?? 0;
+}
+
+bool _roundNameKeysMatch(String a, String b) {
+  final x = a.trim().toLowerCase();
+  final y = b.trim().toLowerCase();
+  return x.isNotEmpty && y.isNotEmpty && x == y;
+}
+
+Future<void> _persistCachedRoundTimer(SharedPreferences prefs, int rt) async {
+  if (rt != 0) {
+    await prefs.setInt('cached_round_timer', rt);
+  }
+}
+
+/// Per-slide START/STOP often omit final_timer — merge from cache or previous payload before storing.
+Future<Map<String, dynamic>> _mergeTimerPayloadForStorage(
+  SharedPreferences prefs,
+  Map<String, dynamic> message,
+  String timerAction,
+) async {
+  final payload = Map<String, dynamic>.from(message);
+  var ft = _parseRoundTimerValue(payload['final_timer']);
+
+  if (ft == 0 &&
+      (timerAction == 'START_TIMER' ||
+          timerAction == 'START_TIME' ||
+          timerAction == 'LAST_TIMER')) {
+    final lastRunning = (prefs.getString('last_timer_status') ?? '') == 'Running';
+    if (lastRunning) {
+      final cached = prefs.getInt('cached_round_timer') ?? 0;
+      if (cached != 0) {
+        ft = cached;
+        payload['final_timer'] = cached;
+      } else {
+        final prevStr = prefs.getString('last_timer_action_data');
+        if (prevStr != null) {
+          try {
+            final prev = jsonDecode(prevStr) as Map<String, dynamic>;
+            final prevFt = _parseRoundTimerValue(prev['final_timer']);
+            if (prevFt != 0) {
+              ft = prevFt;
+              payload['final_timer'] = prevFt;
+            }
+          } catch (_) {}
+        }
+      }
+    } else {
+      final prevStr = prefs.getString('last_timer_action_data');
+      if (prevStr != null) {
+        try {
+          final prev = jsonDecode(prevStr) as Map<String, dynamic>;
+          final prevFt = _parseRoundTimerValue(prev['final_timer']);
+          if (prevFt != 0 &&
+              (timerAction == 'LAST_TIMER' ||
+                  _parseRoundTimerValue(message['final_timer']) != 0)) {
+            ft = prevFt;
+            payload['final_timer'] = prevFt;
+          }
+        } catch (_) {}
+      }
+    }
+  }
+
+  if (ft != 0) {
+    await _persistCachedRoundTimer(prefs, ft);
+  }
+
+  if (timerAction == 'LAST_TIMER' && ft != 0) {
+    final rn = message['round_name'] as String? ?? '';
+    if (rn.isNotEmpty) {
+      await _removeRoundFinalTimerExpired(prefs, rn);
+    }
+  }
+
+  return payload;
+}
+
+Future<int> _resolveRoundTimerFromPrefsOnly() async {
+  final prefs = await SharedPreferences.getInstance();
+  var rt = prefs.getInt('cached_round_timer') ?? 0;
+  if (rt != 0) return rt;
+
+  final lastTimerDataStr = prefs.getString('last_timer_action_data');
+  if (lastTimerDataStr != null) {
+    try {
+      final lastTimerData = jsonDecode(lastTimerDataStr) as Map<String, dynamic>;
+      rt = _parseRoundTimerValue(lastTimerData['final_timer']);
+    } catch (_) {}
+  }
+  return rt;
+}
+
+bool _storedTimerPayloadIndicatesRoundMode(SharedPreferences prefs) {
+  try {
+    if ((prefs.getString('last_timer_status') ?? '') == 'Running') return true;
+
+    final rawPayload = prefs.getString('last_timer_action_data');
+    if (rawPayload == null) return false;
+    final lm = jsonDecode(rawPayload) as Map<String, dynamic>;
+    return _parseRoundTimerValue(lm['final_timer']) != 0;
+  } catch (_) {
+    return false;
+  }
+}
+
 // Function to forward timer messages from main_page
+
 Future<void> forwardTimerMessage(Map<String, dynamic> message) async {
+
   // Handle timer first - must complete before page handler so status is available
   await _handleGlobalTimer(message);
 
@@ -45,14 +157,22 @@ Future<void> _handleGlobalTimer(Map<String, dynamic> message) async {
   try {
     final prefs = await SharedPreferences.getInstance();
 
-    // Store timer action data, but do NOT overwrite with STOP_TIMER when it would clear final_timer
-    // (STOP_TIMER has final_timer:0; we need to preserve final_timer from START_TIMER for round mode)
-    final ft = message['final_timer'];
-    final ftVal = ft is int ? ft : int.tryParse(ft?.toString() ?? '');
-    final shouldStore = timerAction != 'STOP_TIMER' || (ftVal != null && ftVal > 0);
+    if (timerAction == 'START_TIMER' || timerAction == 'START_TIME') {
+      final ftMsg = _parseRoundTimerValue(message['final_timer']);
+      final lastRunning = (prefs.getString('last_timer_status') ?? '') == 'Running';
+      if (ftMsg == 0 && !lastRunning) {
+        await prefs.remove('cached_round_timer');
+      }
+    }
+
+    // Merge final_timer into payload so per-slide START does not wipe round mode from prefs.
+    // Do NOT overwrite with STOP_TIMER when it would clear final_timer (STOP often sends final_timer:0).
+    final payloadToStore = await _mergeTimerPayloadForStorage(prefs, message, timerAction);
+    final ftVal = _parseRoundTimerValue(payloadToStore['final_timer']);
+    final shouldStore = timerAction != 'STOP_TIMER' || ftVal > 0;
     if (shouldStore) {
-      await prefs.setString('last_timer_action_data', jsonEncode(message));
-      print('Global timer: Stored timer action data payload');
+      await prefs.setString('last_timer_action_data', jsonEncode(payloadToStore));
+      print('Global timer: Stored timer action data (final_timer=$ftVal)');
     } else {
       print('Global timer: Skipping store for STOP_TIMER to preserve final_timer for round mode');
     }
@@ -60,14 +180,25 @@ Future<void> _handleGlobalTimer(Map<String, dynamic> message) async {
     switch (timerAction) {
       case 'START_TIME':
       case 'START_TIMER':
-        // When START_TIMER is set to Running, LAST_TIMER must be Idle
-        // If START_TIMER is already Running and LAST_TIMER is going to Running, START_TIMER becomes Stopped
-        // But for START_TIMER command, we always set START_TIMER to Running and LAST_TIMER to Idle
-        _globalLastTimer?.cancel();
-        _lastTimerStatus = 'Idle';
-        _lastTimerStartTime = null;
-        await prefs.setString('last_timer_status', 'Idle');
-        
+        dynamic finalTimerFromMsgEarly = message['final_timer'];
+        int typeGameFromMessageEarly = 0;
+        if (finalTimerFromMsgEarly is int) {
+          typeGameFromMessageEarly = finalTimerFromMsgEarly;
+        } else if (finalTimerFromMsgEarly != null) {
+          typeGameFromMessageEarly = int.tryParse(finalTimerFromMsgEarly.toString()) ?? 0;
+        }
+        final bool roundModeSlideStart = typeGameFromMessageEarly != 0;
+
+        // Classic mode only: LAST must be Idle when the per-slide question window opens.
+        // Round mode (final_timer != 0): per-slide START must NOT cancel LAST_TIMER or clear
+        // last_timer prefs — that kills the team's round countdown and breaks editability/timer UI.
+        if (!roundModeSlideStart) {
+          _globalLastTimer?.cancel();
+          _lastTimerStatus = 'Idle';
+          _lastTimerStartTime = null;
+          await prefs.setString('last_timer_status', 'Idle');
+        }
+
         // Get timer value
         dynamic questionTimerValue = message['question_timer'];
         int questionTimer = 0;
@@ -125,21 +256,9 @@ Future<void> _handleGlobalTimer(Map<String, dynamic> message) async {
 
         print('Timer calculation: timerStart=$timerStart (UTC), now=$now (UTC), adjustedTimer=$adjustedTimer (timer_end=$timerEndFromServer)');
         
-        // type_game/round_timer != 0: only the final (LAST) timer runs; no per-question countdown
-        final cachedRoundTimer = prefs.getInt('cached_round_timer') ?? 0;
-        if (cachedRoundTimer != 0) {
-          _globalStartTimer?.cancel();
-          _startTimerStatus = 'Idle';
-          _startTimerStartTime = null;
-          await prefs.setString('start_timer_status', 'Idle');
-          await prefs.setInt('start_timer_duration', 0);
-          await prefs.remove('start_timer_start_time');
-          await prefs.remove('start_timer_original_duration');
-          await prefs.remove('start_timer_end_utc');
-          print('Global timer: Skipping per-question START (round mode, cached_round_timer=$cachedRoundTimer)');
-          break;
-        }
-        
+        // Round mode (final_timer != 0): we still run per-slide START here so prefs/UI show the question
+        // window and answer fields enable (see _buildAnswersFromGameData). LAST prefs are only cleared on
+        // classic slides above (!roundModeSlideStart), so the round countdown is preserved.
         if (adjustedTimer > 0) {
           _startTimerStatus = 'Running';
           _startTimerStartTime = timerStart;
@@ -331,18 +450,46 @@ Future<void> _handleGlobalTimer(Map<String, dynamic> message) async {
         break;
         
       case 'STOP_TIMER':
-        // Stop both timers (idempotent; server may send duplicates)
+        // Per-slide STOP often means "typing window overlay ended", not "round ends".
+        // In round mode (final_timer from stored START/LAST payload != 0), keep LAST countdown + prefs intact.
+        final isRoundModeStop = _storedTimerPayloadIndicatesRoundMode(prefs) ||
+            ftVal > 0;
+
         _globalStartTimer?.cancel();
-        _globalLastTimer?.cancel();
         _startTimerStatus = 'Idle';
-        _lastTimerStatus = 'Idle';
         await prefs.setString('start_timer_status', 'Idle');
-        await prefs.setString('last_timer_status', 'Idle');
         await prefs.setInt('start_timer_duration', 0);
-        await prefs.setInt('last_timer_duration', 0);
         await prefs.remove('start_timer_end_utc');
+
+        if (isRoundModeStop) {
+          final lastSt = prefs.getString('last_timer_status') ?? _lastTimerStatus;
+          _lastTimerStatus = lastSt;
+          if (lastSt == 'Running') {
+            final stm = prefs.getString('last_timer_start_time');
+            if (stm != null) {
+              try {
+                _lastTimerStartTime = DateTime.parse(stm);
+              } catch (_) {}
+            }
+          } else {
+            _lastTimerStartTime = null;
+          }
+          print(
+              'Global STOP_TIMER: round mode — cleared START only, preserved LAST ($_lastTimerStatus)'
+              ', server_stop=${message['server_stop']}',
+          );
+          break;
+        }
+
+        _globalLastTimer?.cancel();
+        _lastTimerStatus = 'Stopped';
+        await prefs.setString('last_timer_status', 'Stopped');
+        await prefs.setInt('last_timer_duration', 0);
         await prefs.remove('last_timer_end_utc');
-        print('Global STOP_TIMER: Both timers stopped, status: Idle (server_stop=${message['server_stop']})');
+
+        print(
+            'Global STOP_TIMER: start=Idle last=Stopped (server_stop=${message['server_stop']})',
+        );
         break;
     }
   } catch (e) {
@@ -363,13 +510,77 @@ Future<void> _addRoundFinalTimerExpired(SharedPreferences prefs, String roundNam
   try {
     final key = 'rounds_final_timer_expired';
     final existing = prefs.getStringList(key) ?? [];
-    if (!existing.contains(roundName)) {
-      existing.add(roundName);
-      await prefs.setStringList(key, existing);
-      print('QuestionPage: Marked round "$roundName" as final timer expired');
-    }
+    if (existing.any((r) => _roundNameKeysMatch(r, roundName))) return;
+    existing.add(roundName.trim());
+    await prefs.setStringList(key, existing);
+    print('QuestionPage: Marked round "$roundName" as final timer expired');
   } catch (e) {
     print('QuestionPage: Error adding round to expired set: $e');
+  }
+}
+
+Future<void> _removeRoundFinalTimerExpired(SharedPreferences prefs, String roundName) async {
+  try {
+    final key = 'rounds_final_timer_expired';
+    final existing = prefs.getStringList(key) ?? [];
+    final filtered =
+        existing.where((r) => !_roundNameKeysMatch(r, roundName)).toList();
+    if (filtered.length != existing.length) {
+      await prefs.setStringList(key, filtered);
+      print('QuestionPage: Cleared expired flag for round "$roundName" (round restarted)');
+    }
+  } catch (e) {
+    print('QuestionPage: Error removing round from expired set: $e');
+  }
+}
+
+/// When wall-clock time has passed the LAST_TIMER window but prefs still say Running
+/// (e.g. global tick missed or UI refreshed during editing), persist Stopped and mark the round expired.
+Future<void> _finalizeLastTimerIfExpiredFromPrefs(SharedPreferences prefs) async {
+  if (prefs.getString('last_timer_status') != 'Running') return;
+  final now = DateTime.now().toUtc();
+
+  // Server-driven absolute end — must be checked; start+duration can disagree with timer_end.
+  final endStr = prefs.getString('last_timer_end_utc');
+  if (endStr != null && endStr.isNotEmpty) {
+    try {
+      final end = DateTime.parse(endStr).toUtc();
+      if (!end.isAfter(now)) {
+        await _persistLastTimerStoppedFromPrefs(prefs);
+        return;
+      }
+    } catch (_) {}
+  }
+
+  final startStr = prefs.getString('last_timer_start_time');
+  final orig =
+      prefs.getInt('last_timer_original_duration') ?? prefs.getInt('last_timer_duration') ?? 0;
+  if (startStr == null || orig <= 0) return;
+  try {
+    final start = DateTime.parse(startStr).toUtc();
+    final elapsed = now.difference(start).inSeconds;
+    if (elapsed < orig) return;
+  } catch (_) {
+    return;
+  }
+  await _persistLastTimerStoppedFromPrefs(prefs);
+}
+
+Future<void> _persistLastTimerStoppedFromPrefs(SharedPreferences prefs) async {
+  await prefs.setString('last_timer_status', 'Stopped');
+  await prefs.setInt('last_timer_duration', 0);
+  _lastTimerStatus = 'Stopped';
+  _lastTimerStartTime = null;
+  _globalLastTimer?.cancel();
+  final data = prefs.getString('last_timer_action_data');
+  if (data != null) {
+    try {
+      final m = jsonDecode(data) as Map<String, dynamic>;
+      final rn = m['round_name'] as String?;
+      if (rn != null && rn.isNotEmpty) {
+        await _addRoundFinalTimerExpired(prefs, rn);
+      }
+    } catch (_) {}
   }
 }
 
@@ -378,7 +589,7 @@ Future<bool> _isRoundFinalTimerExpired(String roundName) async {
   try {
     final prefs = await SharedPreferences.getInstance();
     final existing = prefs.getStringList('rounds_final_timer_expired') ?? [];
-    return existing.contains(roundName);
+    return existing.any((r) => _roundNameKeysMatch(r, roundName));
   } catch (e) {
     return false;
   }
@@ -444,21 +655,30 @@ Future<Map<String, dynamic>> getCurrentTimerStatus() async {
         }
       }
     } else if (_lastTimerStatus == 'Running' && _lastTimerStartTime != null) {
-      // Get original duration from SharedPreferences
+      final now = DateTime.now().toUtc();
       final origDuration = prefs.getInt('last_timer_original_duration') ?? 0;
-      if (origDuration > 0) {
-        final now = DateTime.now().toUtc();
-        final elapsed = now.difference(_lastTimerStartTime!).inSeconds;
-        // Calculate remaining from original duration, not adjusted duration
-        remainingSeconds = (origDuration - elapsed).clamp(0, origDuration);
-        originalDuration = origDuration;
-        if (remainingSeconds > 0) {
-          activeStatus = 'LAST_TIMER';
-          startTime = _lastTimerStartTime;
-        } else {
-          _lastTimerStatus = 'Idle';
-          remainingSeconds = 0;
-        }
+      final endStr = prefs.getString('last_timer_end_utc');
+      var rem = 0;
+      var computed = false;
+      if (endStr != null && endStr.isNotEmpty) {
+        try {
+          rem = DateTime.parse(endStr).toUtc().difference(now).inSeconds;
+          computed = true;
+        } catch (_) {}
+      }
+      if (!computed && origDuration > 0) {
+        final elapsed = now.difference(_lastTimerStartTime!.toUtc()).inSeconds;
+        rem = (origDuration - elapsed).clamp(0, origDuration);
+        computed = true;
+      }
+      remainingSeconds = rem < 0 ? 0 : rem;
+      originalDuration = origDuration > 0 ? origDuration : null;
+      if (remainingSeconds > 0) {
+        activeStatus = 'LAST_TIMER';
+        startTime = _lastTimerStartTime;
+      } else {
+        remainingSeconds = 0;
+        await _finalizeLastTimerIfExpiredFromPrefs(prefs);
       }
     }
     
@@ -469,20 +689,39 @@ Future<Map<String, dynamic>> getCurrentTimerStatus() async {
       
       if (startStatus == 'Running') {
         final startTimeStr = prefs.getString('start_timer_start_time');
-        final duration = prefs.getInt('start_timer_duration') ?? 0;
-        if (startTimeStr != null && duration > 0) {
+        if (startTimeStr != null) {
           try {
-            final savedStartTime = DateTime.parse(startTimeStr);
+            final savedStartTime = DateTime.parse(startTimeStr).toUtc();
             final now = DateTime.now().toUtc();
-            final elapsed = now.difference(savedStartTime).inSeconds;
-            remainingSeconds = (duration - elapsed).clamp(0, duration);
+            final endUtcStr = prefs.getString('start_timer_end_utc');
+            final origDuration = prefs.getInt('start_timer_original_duration') ?? 0;
+            int rem;
+            if (endUtcStr != null && endUtcStr.isNotEmpty) {
+              rem = DateTime.parse(endUtcStr).toUtc().difference(now).inSeconds;
+            } else if (origDuration > 0) {
+              final elapsed = now.difference(savedStartTime).inSeconds;
+              rem = (origDuration - elapsed).clamp(0, origDuration);
+            } else {
+              final duration = prefs.getInt('start_timer_duration') ?? 0;
+              if (duration <= 0) {
+                rem = 0;
+              } else {
+                final elapsed = now.difference(savedStartTime).inSeconds;
+                rem = (duration - elapsed).clamp(0, duration);
+              }
+            }
+            remainingSeconds = rem < 0 ? 0 : rem;
+            originalDuration = origDuration > 0 ? origDuration : prefs.getInt('start_timer_original_duration');
             if (remainingSeconds > 0) {
               activeStatus = 'START_TIMER';
               startTime = savedStartTime;
               _startTimerStatus = 'Running';
               _startTimerStartTime = savedStartTime;
-              // Get original duration
-              originalDuration = prefs.getInt('start_timer_original_duration');
+            } else {
+              await prefs.setString('start_timer_status', 'Idle');
+              await prefs.setInt('start_timer_duration', 0);
+              _startTimerStatus = 'Idle';
+              _startTimerStartTime = null;
             }
           } catch (e) {
             print('Error parsing start timer time: $e');
@@ -490,20 +729,30 @@ Future<Map<String, dynamic>> getCurrentTimerStatus() async {
         }
       } else if (lastStatus == 'Running') {
         final startTimeStr = prefs.getString('last_timer_start_time');
-        final duration = prefs.getInt('last_timer_duration') ?? 0;
-        if (startTimeStr != null && duration > 0) {
+        if (startTimeStr != null) {
           try {
-            final savedStartTime = DateTime.parse(startTimeStr);
+            final savedStartTime = DateTime.parse(startTimeStr).toUtc();
             final now = DateTime.now().toUtc();
-            final elapsed = now.difference(savedStartTime).inSeconds;
-            remainingSeconds = (duration - elapsed).clamp(0, duration);
+            final endUtcStr = prefs.getString('last_timer_end_utc');
+            final origDuration = prefs.getInt('last_timer_original_duration') ?? 0;
+            int rem;
+            if (endUtcStr != null && endUtcStr.isNotEmpty) {
+              rem = DateTime.parse(endUtcStr).toUtc().difference(now).inSeconds;
+            } else if (origDuration > 0) {
+              final elapsed = now.difference(savedStartTime).inSeconds;
+              rem = (origDuration - elapsed).clamp(0, origDuration);
+            } else {
+              rem = 0;
+            }
+            remainingSeconds = rem < 0 ? 0 : rem;
+            originalDuration = origDuration > 0 ? origDuration : null;
             if (remainingSeconds > 0) {
               activeStatus = 'LAST_TIMER';
               startTime = savedStartTime;
               _lastTimerStatus = 'Running';
               _lastTimerStartTime = savedStartTime;
-              // Get original duration
-              originalDuration = prefs.getInt('last_timer_original_duration');
+            } else {
+              await _finalizeLastTimerIfExpiredFromPrefs(prefs);
             }
           } catch (e) {
             print('Error parsing last timer time: $e');
@@ -511,6 +760,8 @@ Future<Map<String, dynamic>> getCurrentTimerStatus() async {
         }
       }
     }
+    
+    await _finalizeLastTimerIfExpiredFromPrefs(prefs);
     
     final startStatus = prefs.getString('start_timer_status') ?? _startTimerStatus;
     final lastStatus = prefs.getString('last_timer_status') ?? _lastTimerStatus;
@@ -542,7 +793,7 @@ class QuestionPage extends StatefulWidget {
   State<QuestionPage> createState() => _QuestionPageState();
 }
 
-class _QuestionPageState extends State<QuestionPage> {
+class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver {
   // Timer state - countdown timer
   Duration _remainingTime = const Duration(minutes: 45); // Initialize to total time
   Duration _totalTime = const Duration(minutes: 45);
@@ -565,10 +816,11 @@ class _QuestionPageState extends State<QuestionPage> {
   String _gameName = "Current Game";
   String _roundName = ""; // Round name from timer message
   int _roundTimer = 0; // activeGame.round_timer or final_timer from timer message
-  int _regScore = 1;
-  int _regScoreTotal = 0;
-  int _bonusScore = 0;
-  int _bonusScoreTotal = 0;
+  bool _roundModeActive = false; // type_game != 0 for this round (from game table)
+  num _regScore = 1;
+  num _regScoreTotal = 0;
+  num _bonusScore = 0;
+  num _bonusScoreTotal = 0;
   
   // Answer state
   List<Map<String, dynamic>> _answers = [];
@@ -584,7 +836,148 @@ class _QuestionPageState extends State<QuestionPage> {
 
   /// Game data cache, keyed by question ID (primary key from game table).
   Map<int, Map<String, dynamic>> _gameData = {};
+
+  bool _questionBelongsToRound(Map<String, dynamic> question, String roundName) {
+    return _roundNamesMatch(question['round_name'] as String?, roundName);
+  }
+
+  /// Backend LAST_TIMER uses type_game from the last question (by id) in the round.
+  int _resolveTypeGameForRound(String roundName) {
+    MapEntry<int, Map<String, dynamic>>? lastEntry;
+    for (final entry in _gameData.entries) {
+      if (!_questionBelongsToRound(entry.value, roundName)) continue;
+      if (lastEntry == null || entry.key > lastEntry.key) {
+        lastEntry = entry;
+      }
+    }
+    if (lastEntry == null) return 0;
+    return _parseRoundTimerField(lastEntry.value['type_game']);
+  }
+
+  /// Round mode only when the round's [type_game] (last question by id) is nonzero.
+  bool _isRoundModeFor({required String roundName}) {
+    return _resolveTypeGameForRound(roundName) != 0;
+  }
+
+  /// Round mode (type_game != 0): answers stay editable until the round is marked expired
+  /// (LAST / final timer ended). Per-question START/STOP must not lock fields.
+  bool _shouldEnableAnswerInRoundMode({
+    required bool roundFinalTimerExpired,
+    required String? questionRoundName,
+    required String roundName,
+  }) {
+    if (roundFinalTimerExpired) return false;
+    if (!_roundNamesMatch(questionRoundName, roundName)) return false;
+    return true;
+  }
+
+  String _answersForSelectionKind(String? afs) {
+    if (afs == null) return '';
+    final t = afs.trim();
+    if (t.isEmpty || t == '=') return '';
+    final lower = t.toLowerCase();
+    if (lower.startsWith('radio:')) return 'radio';
+    if (lower.startsWith('list:')) return 'list';
+    return '';
+  }
+
+  List<String> _optionsAfterAnswersForSelectionPrefix(String? afs) {
+    if (afs == null) return [];
+    final t = afs.trim();
+    final lower = t.toLowerCase();
+    String optionsString = '';
+    if (lower.startsWith('radio:')) {
+      optionsString = t.substring(6);
+    } else if (lower.startsWith('list:')) {
+      optionsString = t.substring(5);
+    } else {
+      return [];
+    }
+    return optionsString.split(';').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+  }
+
+  bool _roundNamesMatch(String? questionRoundName, String roundName) {
+    final a = (questionRoundName ?? '').trim();
+    final b = roundName.trim();
+    if (a.isEmpty || b.isEmpty) return false;
+    if (a == b) return true;
+    return a.toLowerCase() == b.toLowerCase();
+  }
+
+  /// Count of nonempty cells in game.answer1…answer4; 0 nonempty → treat as single free-text slot.
+  int _expectedAnswerSlotCount(Map<String, dynamic> question) {
+    var c = 0;
+    for (final key in ['answer1', 'answer2', 'answer3', 'answer4']) {
+      final v = question[key];
+      if (v != null && v.toString().trim().isNotEmpty) {
+        c++;
+      }
+    }
+    return c == 0 ? 1 : c;
+  }
+
+  /// Comma-merged list tokens for shared-pool conflict checks (multislot list).
+  String _listRawForConflictCheck(Map<String, dynamic> answer) {
+    final sc = answer['slotCount'] as int? ?? 1;
+    if (sc <= 1) {
+      return (answer['value'] as String? ?? '').trim();
+    }
+    final sv = answer['slotValues'];
+    if (sv is List) {
+      final parts = sv.map((e) => e.toString().trim()).where((e) => e.isNotEmpty).toList();
+      return parts.join(',');
+    }
+    return '';
+  }
+
+  List<String> _fourSlotValuesFromAnswerMap(Map<String, dynamic> answer) {
+    final raw = answer['slotValues'];
+    final out = List<String>.filled(4, '');
+    if (raw is List) {
+      for (var i = 0; i < raw.length && i < 4; i++) {
+        out[i] = raw[i]?.toString() ?? '';
+      }
+    }
+    return out;
+  }
+
+  String _compositeValueFromSlots(List<String> four, int slotCount) {
+    final k = slotCount.clamp(1, 4);
+    final parts = <String>[];
+    for (var i = 0; i < k; i++) {
+      parts.add(four[i].trim());
+    }
+    return parts.join('\n');
+  }
+
+  List<String> _slotValuesForPersist(Map<String, dynamic> answer) {
+    final sc = answer['slotCount'] as int? ?? 1;
+    final k = sc.clamp(1, 4);
+    final four = _fourSlotValuesFromAnswerMap(answer);
+    final v = answer['value'] as String?;
+    if (four.every((e) => e.trim().isEmpty) && v != null && v.trim().isNotEmpty) {
+      if (k <= 1) {
+        four[0] = v;
+      } else {
+        final lines = v.split('\n');
+        for (var i = 0; i < k && i < lines.length; i++) {
+          four[i] = lines[i];
+        }
+      }
+    }
+    return four.take(k).map((e) => e.toString()).toList();
+  }
+
   
+  /// Reg/bonus scores may be fractional (e.g. 0.5) from DB or game table strings.
+  static String _formatScoreDisplay(num v) {
+    final d = v.toDouble();
+    if ((d - d.round()).abs() < 1e-9) {
+      return d.round().toString();
+    }
+    return d.toString();
+  }
+
   // Current game name for persistent storage
   String _currentGameNameForStorage = '';
   
@@ -594,7 +987,8 @@ class _QuestionPageState extends State<QuestionPage> {
   @override
   void initState() {
     super.initState();
-    
+    WidgetsBinding.instance.addObserver(this);
+
     StrictVisibilityService.instance.init();
 
     // Check if page was refreshed
@@ -622,6 +1016,27 @@ class _QuestionPageState extends State<QuestionPage> {
     
     // Try to load question board from last_timer_setting if available
     _loadQuestionBoardFromLastTimer();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      unawaited(_syncTimersAndEditabilityAfterResume());
+    }
+  }
+
+  /// Mobile: JS timers / backgrounding can stall global ticks; LAST may end while away.
+  /// Re-run prefs sync + finalize + editability when returning foreground.
+  Future<void> _syncTimersAndEditabilityAfterResume() async {
+    try {
+      if (!mounted) {
+        return;
+      }
+      await _loadTimerStatus();
+      await _updateAnswerEditability();
+    } catch (e) {
+      print('QuestionPage: _syncTimersAndEditabilityAfterResume failed: $e');
+    }
   }
   
   /// Load question board from last_timer_setting if available
@@ -827,8 +1242,6 @@ class _QuestionPageState extends State<QuestionPage> {
         final activeTimer = status['active_timer'] as String;
         final remainingSeconds = status['remaining_seconds'] as int;
         final originalDuration = status['original_duration'] as int?;
-        final startTimerStatus = status['start_timer_status'] as String? ?? 'Idle';
-        final lastTimerStatus = status['last_timer_status'] as String? ?? 'Idle';
         
         if (mounted) {
           setState(() {
@@ -863,36 +1276,19 @@ class _QuestionPageState extends State<QuestionPage> {
           });
           
           // Update answer editability when timer status changes
-          _updateAnswerEditability(startTimerStatus, lastTimerStatus);
+          _updateAnswerEditability();
         }
       });
     });
   }
   
   /// Update answer editability based on current timer status
-  Future<void> _updateAnswerEditability(String startTimerStatus, String lastTimerStatus) async {
+  Future<void> _updateAnswerEditability() async {
     try {
-      // Get round_timer: prefer activeGame, then final_timer from last_timer_action_data (timer message)
-      var roundTimer = 0;
-      final activeGame = await _getActiveGame();
-      if (activeGame != null) {
-        roundTimer = activeGame['round_timer'] as int? ?? 0;
-      }
-      if (roundTimer == 0) {
-        final prefs = await SharedPreferences.getInstance();
-        final lastTimerDataStr = prefs.getString('last_timer_action_data');
-        if (lastTimerDataStr != null) {
-          try {
-            final lastTimerData = jsonDecode(lastTimerDataStr) as Map<String, dynamic>;
-            final ft = lastTimerData['final_timer'];
-            roundTimer = ft is int ? ft : (int.tryParse(ft?.toString() ?? '') ?? 0);
-          } catch (_) {}
-        }
-        if (roundTimer > 0) {
-          print('QuestionPage: Using final_timer=$roundTimer from last_timer_action_data for editability');
-        }
-      }
-      
+      final timerSnapshot = await getCurrentTimerStatus();
+      final startTimerStatus =
+          timerSnapshot['start_timer_status'] as String? ?? 'Idle';
+
       // Get question_id from last_timer_setting or current message
       final prefs = await SharedPreferences.getInstance();
       final lastTimerDataStr = prefs.getString('last_timer_action_data');
@@ -914,16 +1310,31 @@ class _QuestionPageState extends State<QuestionPage> {
       if (roundName == null) {
         return;
       }
+
+      final roundMode = _isRoundModeFor(roundName: roundName);
+      _roundModeActive = roundMode;
+      var roundTimer = 0;
+      if (roundMode) {
+        roundTimer = _roundTimer;
+        if (roundTimer == 0) {
+          roundTimer = await _resolveRoundTimerFromPrefsOnly();
+          if (roundTimer != 0) {
+            _roundTimer = roundTimer;
+          }
+        }
+      } else {
+        _roundTimer = 0;
+      }
+
       final intQuestionId = questionId is int
           ? questionId
           : (questionId is String ? int.tryParse(questionId) : int.tryParse('$questionId'));
-      if (roundTimer == 0 && intQuestionId == null) {
+      if (!roundMode && intQuestionId == null) {
         return;
       }
       
       // If this round's final timer has expired (persisted), keep all fields disabled
       final roundFinalTimerExpired = await _isRoundFinalTimerExpired(roundName);
-      final effectiveLastStatus = roundFinalTimerExpired ? 'Stopped' : lastTimerStatus;
 
       // Update editability for each answer
       bool needsUpdate = false;
@@ -936,8 +1347,12 @@ class _QuestionPageState extends State<QuestionPage> {
         final questionRoundName = question['round_name'] as String?;
         
         bool shouldBeEnabled = false;
-        if (roundTimer != 0) {
-          if (effectiveLastStatus != 'Stopped' && questionRoundName == roundName) {
+        if (roundMode) {
+          if (_shouldEnableAnswerInRoundMode(
+                roundFinalTimerExpired: roundFinalTimerExpired,
+                questionRoundName: questionRoundName,
+                roundName: roundName,
+              )) {
             shouldBeEnabled = true;
           }
         } else {
@@ -953,6 +1368,12 @@ class _QuestionPageState extends State<QuestionPage> {
       }
       
       if (needsUpdate && mounted) {
+        print(
+          'QuestionPage: _updateAnswerEditability roundMode=$roundMode roundTimer=$_roundTimer '
+          'start=$startTimerStatus qId=$intQuestionId '
+          'roundExpired=$roundFinalTimerExpired enabled='
+          '${_answers.where((a) => a['enabled'] == true).length}/${_answers.length}',
+        );
         setState(() {
           // Trigger rebuild
         });
@@ -964,6 +1385,7 @@ class _QuestionPageState extends State<QuestionPage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     // Cancel local UI timers (but NOT global timers - they continue in background)
     _tick?.cancel();
     _writerStatusCheckTimer?.cancel();
@@ -1177,6 +1599,23 @@ class _QuestionPageState extends State<QuestionPage> {
       }
 
       // Round-scoped API can return nothing (e.g. round_name mismatch) while timer already has question_id
+      if (resolvedQuestionId != null &&
+          resolvedQuestionId > 0 &&
+          !_gameData.containsKey(resolvedQuestionId)) {
+        print(
+          'QuestionPage: question id=$resolvedQuestionId missing from cache '
+          '(keys=${_gameData.keys.toList()}); fetching by id',
+        );
+        final row = await DatabaseService.getGameQuestionById(gameName, resolvedQuestionId);
+        if (row != null) {
+          _gameData[resolvedQuestionId] = row;
+          print(
+            'QuestionPage: Cached question $resolvedQuestionId '
+            '(round_name=${row['round_name']}, type_game=${row['type_game']})',
+          );
+        }
+      }
+
       if (_gameData.isEmpty && resolvedQuestionId != null && resolvedQuestionId > 0) {
         print('QuestionPage: Round query empty; fetching question id=$resolvedQuestionId via question-by-id API');
         final row = await DatabaseService.getGameQuestionById(gameName, resolvedQuestionId);
@@ -1228,8 +1667,17 @@ class _QuestionPageState extends State<QuestionPage> {
       final savedAnswers = await _loadSavedAnswers(gameName, teamId);
       print('QuestionPage: Loaded ${savedAnswers.length} saved answers');
       
-      // Store round name for display
+      // Store round name for display; clear stale round-timer cache when the round changes
       print('QuestionPage: Setting round name to: $roundName');
+      final prefsForRound = await SharedPreferences.getInstance();
+      if (roundName.isNotEmpty && _roundName.isNotEmpty && !_roundNamesMatch(_roundName, roundName)) {
+        await prefsForRound.remove('cached_round_timer');
+        _roundModeActive = false;
+        _roundTimer = 0;
+        print(
+          'QuestionPage: Round switched "$_roundName" -> "$roundName", cleared cached_round_timer',
+        );
+      }
       setState(() {
         _roundName = roundName ?? "";
       });
@@ -1244,30 +1692,41 @@ class _QuestionPageState extends State<QuestionPage> {
         print('QuestionPage: Loaded ${teamAnswersFromDb.length} team answers from database');
       }
       
-      // Merge final_timer from timer message into activeGame (API may not return round_timer)
+      // Merge final_timer from timer message into activeGame (API may not return round_timer).
+      // Per-slide START_TIME often omits final_timer — do not overwrite a nonzero cache with 0.
+      final prevCachedRt = prefsForRound.getInt('cached_round_timer') ?? 0;
       final effectiveActiveGame = Map<String, dynamic>.from(activeGame);
       final msgFinalTimer = message['final_timer'];
       if (msgFinalTimer != null) {
         final v = msgFinalTimer is int ? msgFinalTimer : int.tryParse(msgFinalTimer.toString());
-        if (v != null) {
+        if (v != null && v != 0) {
           effectiveActiveGame['round_timer'] = v;
           print('QuestionPage: Using final_timer=$v from message as round_timer');
         }
       }
-
-      // So global _handleGlobalTimer can skip per-question countdown when type_game/round_timer != 0
-      {
-        int rtc = 0;
-        final rawRt = effectiveActiveGame['round_timer'];
-        if (rawRt is int) {
-          rtc = rawRt;
-        } else if (rawRt is String) {
-          rtc = int.tryParse(rawRt) ?? 0;
-        } else if (rawRt != null) {
-          rtc = int.tryParse(rawRt.toString()) ?? 0;
+      final tgFromGame = _resolveTypeGameForRound(roundName);
+      final classicRound = tgFromGame == 0;
+      if (classicRound) {
+        await prefsForRound.remove('cached_round_timer');
+        effectiveActiveGame['round_timer'] = 0;
+        print('QuestionPage: type_game=0 (classic) — cleared cached_round_timer');
+      } else {
+        if (_parseRoundTimerField(effectiveActiveGame['round_timer']) == 0 && prevCachedRt != 0) {
+          effectiveActiveGame['round_timer'] = prevCachedRt;
+          print(
+            'QuestionPage: Preserved round_timer=$prevCachedRt (slide had no nonzero final_timer)',
+          );
         }
-        final p = await SharedPreferences.getInstance();
-        await p.setInt('cached_round_timer', rtc);
+        if (_parseRoundTimerField(effectiveActiveGame['round_timer']) == 0) {
+          effectiveActiveGame['round_timer'] = tgFromGame.abs();
+          print(
+            'QuestionPage: Using type_game=$tgFromGame from game data as round_timer',
+          );
+        }
+        var rtc = _parseRoundTimerField(effectiveActiveGame['round_timer']);
+        if (rtc != 0) {
+          await prefsForRound.setInt('cached_round_timer', rtc);
+        }
       }
 
       // Build answers list from game data and saved answers
@@ -1340,12 +1799,35 @@ class _QuestionPageState extends State<QuestionPage> {
       if (_gameData.containsKey(qId)) {
         questionData = _gameData[qId];
       }
+      final kSlots = questionData != null ? _expectedAnswerSlotCount(questionData) : 1;
+      List<String> four = ['', '', '', ''];
+      final sv = answerData['slotValues'];
+      if (sv is List) {
+        for (var i = 0; i < sv.length && i < 4; i++) {
+          four[i] = sv[i]?.toString() ?? '';
+        }
+      } else if (answerData['answer'] is String &&
+          ((answerData['answer'] as String).trim()).isNotEmpty) {
+        final s = answerData['answer'] as String;
+        if (kSlots <= 1) {
+          four[0] = s;
+        } else {
+          final ls = s.split('\n');
+          for (var i = 0; i < kSlots && i < ls.length; i++) {
+            four[i] = ls[i];
+          }
+        }
+      }
+      final composite = _compositeValueFromSlots(four, kSlots);
+
       result.add({
         'id': qId,
         'num': questionData?['question_num'] ?? qId,
         'inputType': 'text',
         'options': [],
-        'value': answerData['answer'] as String? ?? '',
+        'slotCount': kSlots,
+        'slotValues': four,
+        'value': composite,
         'selected': answerData['selected'] as bool? ?? false,
         'enabled': false,
         'checkboxEnabled': false,
@@ -1353,7 +1835,41 @@ class _QuestionPageState extends State<QuestionPage> {
     }
     return result;
   }
-  
+
+  int _parseRoundTimerField(dynamic v) {
+    if (v == null) return 0;
+    if (v is int) return v;
+    if (v is String) return int.tryParse(v) ?? 0;
+    return int.tryParse(v.toString()) ?? 0;
+  }
+
+  /// API often omits [round_timer]. Resolve from prefs/type_game only when [type_game] != 0.
+  Future<int> _resolveRoundTimer(
+    Map<String, dynamic> activeGame, {
+    String? roundName,
+  }) async {
+    if (roundName != null &&
+        roundName.isNotEmpty &&
+        _resolveTypeGameForRound(roundName) == 0) {
+      return 0;
+    }
+    var rt = _parseRoundTimerField(activeGame['round_timer']);
+    if (rt != 0) return rt.abs();
+    rt = await _resolveRoundTimerFromPrefsOnly();
+    if (rt != 0) {
+      print('QuestionPage: _resolveRoundTimer using prefs (cached/final_timer)=$rt');
+      return rt.abs();
+    }
+    if (roundName != null && roundName.isNotEmpty) {
+      final tg = _resolveTypeGameForRound(roundName);
+      if (tg != 0) {
+        print('QuestionPage: _resolveRoundTimer using type_game=$tg from game data (round=$roundName)');
+        return tg.abs();
+      }
+    }
+    return 0;
+  }
+
   /// Build answers list from cached game data and saved answers
   Future<void> _buildAnswersFromGameData(
     String roundName,
@@ -1372,26 +1888,41 @@ class _QuestionPageState extends State<QuestionPage> {
       final timerStatus = await getCurrentTimerStatus();
       var startTimerStatus = timerStatus['start_timer_status'] as String? ?? 'Idle';
       var lastTimerStatus = timerStatus['last_timer_status'] as String? ?? 'Idle';
+      final activeTimer = timerStatus['active_timer'] as String? ?? 'Idle';
       
-      // Get round_timer (type_game) from active game
-      // Handle both int and string types
-      dynamic roundTimerValue = activeGame['round_timer'];
-      int roundTimer = 0;
-      if (roundTimerValue is int) {
-        roundTimer = roundTimerValue;
-      } else if (roundTimerValue is String) {
-        roundTimer = int.tryParse(roundTimerValue) ?? 0;
-      } else if (roundTimerValue != null) {
-        roundTimer = int.tryParse(roundTimerValue.toString()) ?? 0;
+      // Round mode only when type_game != 0 on the round (classic: one question per START timer).
+      final typeGame = _resolveTypeGameForRound(roundName);
+      final roundMode = _isRoundModeFor(roundName: roundName);
+      var roundTimer = 0;
+      if (roundMode) {
+        roundTimer = await _resolveRoundTimer(activeGame, roundName: roundName);
+        if (roundTimer == 0 && typeGame != 0) {
+          roundTimer = typeGame.abs();
+        }
+        if (roundTimer != 0) {
+          final prefsRt = await SharedPreferences.getInstance();
+          await prefsRt.setInt('cached_round_timer', roundTimer);
+        }
+      } else {
+        final prefsRt = await SharedPreferences.getInstance();
+        await prefsRt.remove('cached_round_timer');
+        roundTimer = 0;
       }
-      print('QuestionPage: roundTimer=$roundTimer (from value: $roundTimerValue, type: ${roundTimerValue.runtimeType})');
+      _roundModeActive = roundMode;
+      _roundTimer = roundTimer;
 
       // If this round's final timer has expired (persisted), treat as Stopped so fields stay disabled
       final roundFinalTimerExpired = await _isRoundFinalTimerExpired(roundName);
-      if (roundFinalTimerExpired && roundTimer != 0) {
+      if (roundFinalTimerExpired && roundMode) {
         lastTimerStatus = 'Stopped';
         print('QuestionPage: Round "$roundName" final timer expired (persisted), keeping fields disabled');
       }
+
+      print(
+        'QuestionPage: roundTimer=$roundTimer typeGame=$typeGame roundMode=$roundMode '
+        'start=$startTimerStatus last=$lastTimerStatus active=$activeTimer '
+        'roundExpired=$roundFinalTimerExpired (round-mode editability)',
+      );
       
       // Convert questionId to int for comparison
       final intQuestionId = questionId is int ? questionId : (questionId is String ? int.tryParse(questionId) : null);
@@ -1405,15 +1936,11 @@ class _QuestionPageState extends State<QuestionPage> {
       
       // Get all questions in the round
       final roundQuestions = _gameData.entries
-          .where((entry) {
-            final question = entry.value;
-            final questionRoundName = question['round_name'] as String?;
-            return questionRoundName == roundName;
-          })
+          .where((entry) => _questionBelongsToRound(entry.value, roundName))
           .toList();
       
-      if (roundTimer != 0) {
-        // Show every question in this round (reconnect / return to page) — answers remain editable until final timer ends
+      if (roundMode) {
+        // Show every question in this round — answers remain editable until final timer ends
         questionsToProcess.addAll(roundQuestions);
         questionsToProcess.sort((a, b) {
           final numA = a.value['question_num'];
@@ -1422,16 +1949,18 @@ class _QuestionPageState extends State<QuestionPage> {
           final nB = numB is int ? numB : int.tryParse(numB.toString()) ?? 0;
           return nA.compareTo(nB);
         });
-        print('QuestionPage: round_timer != 0, publishing all ${questionsToProcess.length} questions in round');
+        print('QuestionPage: round mode, publishing all ${questionsToProcess.length} questions in round');
       } else {
-        // If round_timer == 0
+        // Classic mode (type_game == 0)
         if (intQuestionId != null && intQuestionId != 0) {
-          // Publish only the current question based on question_id
           if (_gameData.containsKey(intQuestionId)) {
             questionsToProcess.add(MapEntry(intQuestionId, _gameData[intQuestionId]!));
-            print('QuestionPage: round_timer == 0 AND question_id != 0, publishing only question_id=$intQuestionId');
+            print('QuestionPage: classic mode, publishing only question_id=$intQuestionId');
           } else {
-            print('QuestionPage: WARNING - round_timer == 0 AND question_id != 0, but question_id=$intQuestionId not found in gameData');
+            print(
+              'QuestionPage: WARNING - classic mode, question_id=$intQuestionId not found in gameData '
+              '(keys=${_gameData.keys.toList()})',
+            );
           }
         } else {
           // If question_id == 0: don't publish questions, but save existing answers
@@ -1449,12 +1978,24 @@ class _QuestionPageState extends State<QuestionPage> {
               if (qIdInt != null && _gameData.containsKey(qIdInt)) {
                 questionData = _gameData[qIdInt];
               }
+              final ks = questionData != null ? _expectedAnswerSlotCount(questionData) : (a['slotCount'] as int? ?? 1);
+              List<String> four = _fourSlotValuesFromAnswerMap(a);
+              final vSingle = a['value'] as String? ?? '';
+              if (four.every((e) => e.trim().isEmpty) && vSingle.trim().isNotEmpty) {
+                final lines = vSingle.split('\n');
+                for (var i = 0; i < ks && i < lines.length && i < 4; i++) {
+                  four[i] = lines[i];
+                }
+              }
+
               return <String, dynamic>{
                 'id': qId,
                 'num': questionData?['question_num'] ?? qId,
                 'inputType': a['inputType'] ?? 'text',
                 'options': a['options'] ?? [],
-                'value': a['value'] as String? ?? '',
+                'slotCount': ks,
+                'slotValues': four,
+                'value': _compositeValueFromSlots(four, ks),
                 'selected': a['selected'] as bool? ?? false,
                 'enabled': false,
                 'checkboxEnabled': false,
@@ -1497,9 +2038,9 @@ class _QuestionPageState extends State<QuestionPage> {
       
       // First List: question in round (by question_num) supplies canonical options when round has final round timer
       var canonicalListForRound = <String>[];
-      if (roundTimer != 0) {
+      if (roundMode) {
         final rq = _gameData.entries
-            .where((e) => (e.value['round_name'] as String?) == roundName)
+            .where((e) => _questionBelongsToRound(e.value, roundName))
             .toList();
         rq.sort((a, b) {
           final aNum = a.value['question_num'];
@@ -1510,13 +2051,8 @@ class _QuestionPageState extends State<QuestionPage> {
         });
         for (final e in rq) {
           final afs = e.value['answers_for_selection'] as String?;
-          if (afs != null && afs.startsWith('List:')) {
-            final part = afs.length > 5 ? afs.substring(5) : '';
-            canonicalListForRound = part
-                .split(';')
-                .map((x) => x.trim())
-                .where((x) => x.isNotEmpty)
-                .toList();
+          if (_answersForSelectionKind(afs) == 'list') {
+            canonicalListForRound = _optionsAfterAnswersForSelectionPrefix(afs);
             break;
           }
         }
@@ -1530,11 +2066,15 @@ class _QuestionPageState extends State<QuestionPage> {
 
         _answerItemKeys.putIfAbsent(qId, () => GlobalKey());
         
-        // Per-question START timer is only for round_timer == 0. Round mode: only last/final timer gates editing.
+        // Round mode: only LAST / round expiry gates editing — question START expiry does not.
         bool isEnabled = false;
         final questionRoundName = question['round_name'] as String?;
-        if (roundTimer != 0) {
-          if (lastTimerStatus != 'Stopped' && questionRoundName == roundName) {
+        if (roundMode) {
+          if (_shouldEnableAnswerInRoundMode(
+                roundFinalTimerExpired: roundFinalTimerExpired,
+                questionRoundName: questionRoundName,
+                roundName: roundName,
+              )) {
             isEnabled = true;
           }
         } else {
@@ -1543,7 +2083,6 @@ class _QuestionPageState extends State<QuestionPage> {
           }
         }
         
-        // Get answer value: prefer existing _answers (current edits) over savedAnswers
         Map<String, dynamic>? savedAnswer;
         try {
           savedAnswer = savedAnswers[qId];
@@ -1560,13 +2099,76 @@ class _QuestionPageState extends State<QuestionPage> {
             break;
           }
         }
-        String answerText = savedAnswer?['answer'] as String? ?? '';
-        bool isSelected = savedAnswer?['selected'] as bool? ?? false;
-        if (existingAnswer != null) {
-          answerText = existingAnswer['value'] as String? ?? answerText;
-          isSelected = existingAnswer['selected'] as bool? ?? isSelected;
+
+        final kSlots = _expectedAnswerSlotCount(question);
+
+        Map<String, dynamic> teamAnswerRow = {};
+        for (final ta in teamAnswersFromDb) {
+          final tid = ta['question_id'];
+          final int? tidInt = tid is int
+              ? tid
+              : tid is String
+                  ? int.tryParse(tid)
+                  : tid != null
+                      ? int.tryParse(tid.toString())
+                      : null;
+          if (tidInt == qId) {
+            teamAnswerRow = Map<String, dynamic>.from(ta);
+            break;
+          }
         }
-        
+
+        final slotVals = ['', '', '', ''];
+
+        if (teamAnswerRow.isNotEmpty) {
+          for (var i = 0; i < 4; i++) {
+            final pk = 'player_answer${i + 1}';
+            slotVals[i] = teamAnswerRow[pk]?.toString() ?? '';
+          }
+        }
+
+        void applySerializedToSlots(String s) {
+          if (kSlots <= 1) {
+            slotVals[0] = s;
+          } else {
+            final lines = s.split('\n');
+            for (var i = 0; i < kSlots && i < lines.length; i++) {
+              slotVals[i] = lines[i];
+            }
+          }
+        }
+
+        bool isSelected = savedAnswer?['selected'] as bool? ?? false;
+
+        final svSav = savedAnswer?['slotValues'];
+        if (svSav is List) {
+          for (var i = 0; i < svSav.length && i < 4; i++) {
+            slotVals[i] = svSav[i]?.toString() ?? '';
+          }
+        } else {
+          final ansStr = savedAnswer?['answer'] as String?;
+          if (ansStr != null && ansStr.trim().isNotEmpty) {
+            applySerializedToSlots(ansStr);
+          }
+        }
+
+        if (existingAnswer != null) {
+          isSelected = existingAnswer['selected'] as bool? ?? isSelected;
+          final svEx = existingAnswer['slotValues'];
+          if (svEx is List) {
+            for (var i = 0; i < svEx.length && i < 4; i++) {
+              slotVals[i] = svEx[i]?.toString() ?? '';
+            }
+          } else {
+            final vx = existingAnswer['value'] as String? ?? '';
+            if (vx.trim().isNotEmpty) {
+              applySerializedToSlots(vx);
+            }
+          }
+        }
+
+        final String answerText = _compositeValueFromSlots(slotVals, kSlots);
+
         // Get question data
         final answersForSelection = question['answers_for_selection'] as String?;
         // Handle question_num as both int and string
@@ -1581,42 +2183,34 @@ class _QuestionPageState extends State<QuestionPage> {
         }
         final bonusScore = question['bonus_score'] as String? ?? '0;0';
         
-        // Determine input type based on prefix
         // Format: "Radio:Option A;Option B" or "List:Option A;Option B" or null/""/"=" for text
         String inputType = 'text';
         List<String> options = [];
-        
-        if (answersForSelection != null && 
-            answersForSelection.isNotEmpty && 
-            answersForSelection != '=') {
-          
-          // Check if it starts with "Radio:" or "List:"
-          if (answersForSelection.startsWith('Radio:')) {
-            inputType = 'radio';
-            // Extract options after "Radio:" and split by ';'
-            final optionsString = answersForSelection.substring(6); // Remove "Radio:" prefix
-            options = optionsString.split(';').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
-          } else if (answersForSelection.startsWith('List:')) {
-            inputType = 'list';
-            // Extract options after "List:" and split by ';'
-            final optionsString = answersForSelection.substring(5); // Remove "List:" prefix
-            options = optionsString.split(';').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
-          } else {
-            // No prefix or unknown format, default to text
-            inputType = 'text';
-            options = [];
-          }
+
+        final afsKind = _answersForSelectionKind(answersForSelection);
+        if (afsKind == 'radio') {
+          inputType = 'radio';
+          options = _optionsAfterAnswersForSelectionPrefix(answersForSelection);
+        } else if (afsKind == 'list') {
+          inputType = 'list';
+          options = _optionsAfterAnswersForSelectionPrefix(answersForSelection);
         }
         
-        if (inputType == 'list' && roundTimer != 0 && canonicalListForRound.isNotEmpty) {
+        if (inputType == 'list' && roundMode && canonicalListForRound.isNotEmpty) {
           options = List<String>.from(canonicalListForRound);
+        } else if (inputType == 'list' && options.isEmpty) {
+          print(
+            'QuestionPage: list question qId=$qId has no options '
+            '(afs=$answersForSelection, canonical=${canonicalListForRound.length})',
+          );
         }
         
         // Determine checkbox state
         bool checkboxEnabled = true;
         final bonusParts = bonusScore.split(';');
-        final bonusCorrect = int.tryParse(bonusParts[0]) ?? 0;
-        final bonusWrong = int.tryParse(bonusParts.length > 1 ? bonusParts[1] : '0') ?? 0;
+        final bonusCorrect = double.tryParse(bonusParts[0].trim()) ?? 0;
+        final bonusWrong =
+            double.tryParse(bonusParts.length > 1 ? bonusParts[1].trim() : '0') ?? 0;
         
         if (bonusCorrect == 0 && bonusWrong == 0) {
           checkboxEnabled = false;
@@ -1625,56 +2219,45 @@ class _QuestionPageState extends State<QuestionPage> {
         // Get reg_score for checkbox state logic
         final regScoreStr = question['reg_score'] as String? ?? '1;0';
         final regParts = regScoreStr.split(';');
-        final regScoreCorrect = int.tryParse(regParts[0]) ?? 1;
-        final regScoreWrong = int.tryParse(regParts.length > 1 ? regParts[1] : '0') ?? 0;
+        final regScoreCorrect = double.tryParse(regParts[0].trim()) ?? 1;
+        final regScoreWrong =
+            double.tryParse(regParts.length > 1 ? regParts[1].trim() : '0') ?? 0;
         
         // Update checkbox state from team answers in database
         bool finalCheckboxState = isSelected;
-        if (checkboxEnabled) {
-          // Find team answer for this question_id
-          final teamAnswer = teamAnswersFromDb.firstWhere(
-            (ta) {
-              final taQuestionId = ta['question_id'];
-              final taQuestionIdInt = taQuestionId is int ? taQuestionId : (taQuestionId is String ? int.tryParse(taQuestionId) : null);
-              return taQuestionIdInt == qId;
-            },
-            orElse: () => <String, dynamic>{},
-          );
-          
-          if (teamAnswer.isNotEmpty) {
-            final correctScore = teamAnswer['correct_score'];
-            final wrongScore = teamAnswer['wrong_score'];
-            
-            // Convert to numbers
-            double? correctScoreNum;
-            double? wrongScoreNum;
-            if (correctScore is num) {
-              correctScoreNum = correctScore.toDouble();
-            } else if (correctScore is String) {
-              correctScoreNum = double.tryParse(correctScore);
-            }
-            if (wrongScore is num) {
-              wrongScoreNum = wrongScore.toDouble();
-            } else if (wrongScore is String) {
-              wrongScoreNum = double.tryParse(wrongScore);
-            }
-            
-            // Check if correct_score;wrong_score equals bonus_score (then checked) or reg_score (then unchecked)
-            if (correctScoreNum != null && wrongScoreNum != null) {
-              if (correctScoreNum == bonusCorrect && wrongScoreNum == bonusWrong) {
-                finalCheckboxState = true; // Checked (bonus score)
-              } else if (correctScoreNum == regScoreCorrect && wrongScoreNum == regScoreWrong) {
-                finalCheckboxState = false; // Unchecked (reg score)
-              }
+        if (checkboxEnabled && teamAnswerRow.isNotEmpty) {
+          final correctScore = teamAnswerRow['correct_score'];
+          final wrongScore = teamAnswerRow['wrong_score'];
+
+          double? correctScoreNum;
+          double? wrongScoreNum;
+          if (correctScore is num) {
+            correctScoreNum = correctScore.toDouble();
+          } else if (correctScore is String) {
+            correctScoreNum = double.tryParse(correctScore);
+          }
+          if (wrongScore is num) {
+            wrongScoreNum = wrongScore.toDouble();
+          } else if (wrongScore is String) {
+            wrongScoreNum = double.tryParse(wrongScore);
+          }
+
+          if (correctScoreNum != null && wrongScoreNum != null) {
+            if (correctScoreNum == bonusCorrect && wrongScoreNum == bonusWrong) {
+              finalCheckboxState = true;
+            } else if (correctScoreNum == regScoreCorrect && wrongScoreNum == regScoreWrong) {
+              finalCheckboxState = false;
             }
           }
         }
-        
+
         mergedAnswers.add({
           'id': qId,
           'num': questionNumer,
           'inputType': inputType,
           'options': options,
+          'slotCount': kSlots,
+          'slotValues': List<String>.from(slotVals),
           'value': answerText,
           'selected': finalCheckboxState,
           'enabled': isEnabled,
@@ -1755,19 +2338,15 @@ class _QuestionPageState extends State<QuestionPage> {
       
       // Get reg_score and bonus_score from game table using round_name
       // If question_id is 0, get it for the last question in the list for that round
-      int regScore = 1;
-      int regScoreTotal = 0;
-      int bonusScore = 0;
-      int bonusScoreTotal = 0;
+      num regScore = 1;
+      num regScoreTotal = 0;
+      num bonusScore = 0;
+      num bonusScoreTotal = 0;
       
       if (_gameData.isNotEmpty && _roundName.isNotEmpty) {
         // Filter questions by round_name
         final roundQuestions = _gameData.entries
-            .where((entry) {
-              final question = entry.value;
-              final questionRoundName = question['round_name'] as String?;
-              return questionRoundName == _roundName;
-            })
+            .where((entry) => _questionBelongsToRound(entry.value, _roundName))
             .toList();
         
         if (roundQuestions.isNotEmpty) {
@@ -1804,13 +2383,15 @@ class _QuestionPageState extends State<QuestionPage> {
           
           final regScoreStr = selectedQuestion['reg_score'] as String? ?? '1;0';
           final regParts = regScoreStr.split(';');
-          regScore = int.tryParse(regParts[0]) ?? 1;
-          regScoreTotal = int.tryParse(regParts.length > 1 ? regParts[1] : '0') ?? 0;
+          regScore = double.tryParse(regParts[0].trim()) ?? 1;
+          regScoreTotal =
+              double.tryParse(regParts.length > 1 ? regParts[1].trim() : '0') ?? 0;
           
           final bonusScoreStr = selectedQuestion['bonus_score'] as String? ?? '0;0';
           final bonusParts = bonusScoreStr.split(';');
-          bonusScore = int.tryParse(bonusParts[0]) ?? 0;
-          bonusScoreTotal = int.tryParse(bonusParts.length > 1 ? bonusParts[1] : '0') ?? 0;
+          bonusScore = double.tryParse(bonusParts[0].trim()) ?? 0;
+          bonusScoreTotal =
+              double.tryParse(bonusParts.length > 1 ? bonusParts[1].trim() : '0') ?? 0;
           
           print('QuestionPage: Got reg_score and bonus_score from game table (round_name=$_roundName): reg_score=$regScore/$regScoreTotal, bonus_score=$bonusScore/$bonusScoreTotal');
         } else {
@@ -1821,13 +2402,15 @@ class _QuestionPageState extends State<QuestionPage> {
         final firstQuestion = _gameData.values.first;
         final regScoreStr = firstQuestion['reg_score'] as String? ?? '1;0';
         final regParts = regScoreStr.split(';');
-        regScore = int.tryParse(regParts[0]) ?? 1;
-        regScoreTotal = int.tryParse(regParts.length > 1 ? regParts[1] : '0') ?? 0;
+        regScore = double.tryParse(regParts[0].trim()) ?? 1;
+        regScoreTotal =
+            double.tryParse(regParts.length > 1 ? regParts[1].trim() : '0') ?? 0;
         
         final bonusScoreStr = firstQuestion['bonus_score'] as String? ?? '0;0';
         final bonusParts = bonusScoreStr.split(';');
-        bonusScore = int.tryParse(bonusParts[0]) ?? 0;
-        bonusScoreTotal = int.tryParse(bonusParts.length > 1 ? bonusParts[1] : '0') ?? 0;
+        bonusScore = double.tryParse(bonusParts[0].trim()) ?? 0;
+        bonusScoreTotal =
+            double.tryParse(bonusParts.length > 1 ? bonusParts[1].trim() : '0') ?? 0;
         
         print('QuestionPage: Got reg_score and bonus_score from first question in game table (fallback): reg_score=$regScore/$regScoreTotal, bonus_score=$bonusScore/$bonusScoreTotal');
       }
@@ -1871,10 +2454,10 @@ class _QuestionPageState extends State<QuestionPage> {
                 wrongScoreNum = double.tryParse(wrongScore);
               }
               
-              // Overwrite reg_score with correct_score;wrong_score
+              // Overwrite display with stored pair (may be fractional)
               if (correctScoreNum != null && wrongScoreNum != null) {
-                regScore = correctScoreNum.toInt();
-                regScoreTotal = wrongScoreNum.toInt();
+                regScore = correctScoreNum;
+                regScoreTotal = wrongScoreNum;
                 print('QuestionPage: Overwritten reg_score from active_teams_answers: reg_score=$regScore/$regScoreTotal');
               }
             } else {
@@ -2107,13 +2690,28 @@ class _QuestionPageState extends State<QuestionPage> {
       final gameNameSafe = _currentGameNameForStorage.replaceAll(' ', '_').replaceAll('-', '_').toLowerCase();
       final storageKey = 'game_answers_${gameNameSafe}_team_$teamId';
       
-      // Convert answers to map keyed by question ID
+      // Merge with existing saved answers so classic mode (one question in _answers) keeps prior rows.
       final answersMap = <String, Map<String, dynamic>>{};
+      final existingJson = prefs.getString(storageKey);
+      if (existingJson != null && existingJson.isNotEmpty) {
+        try {
+          final existing = json.decode(existingJson) as Map<String, dynamic>;
+          for (final entry in existing.entries) {
+            if (entry.value is Map) {
+              answersMap[entry.key] = Map<String, dynamic>.from(entry.value as Map);
+            }
+          }
+        } catch (_) {}
+      }
       for (var answer in _answers) {
         final questionId = answer['id'] as int?;
         if (questionId != null) {
+          final ks = answer['slotCount'] as int? ?? 1;
+          final four = List<String>.from(_fourSlotValuesFromAnswerMap(answer));
           answersMap[questionId.toString()] = {
             'answer': answer['value'] as String? ?? '',
+            'slotValues': four,
+            'slotCount': ks,
             'selected': answer['selected'] as bool? ?? false,
           };
         }
@@ -2241,10 +2839,7 @@ class _QuestionPageState extends State<QuestionPage> {
         print('QuestionPage: Message content: $message');
         build_question_board(message).then((_) async {
           print('QuestionPage: build_question_board completed for START_TIMER');
-          final status = await getCurrentTimerStatus();
-          final start = status['start_timer_status'] as String? ?? 'Idle';
-          final last = status['last_timer_status'] as String? ?? 'Idle';
-          _updateAnswerEditability(start, last);
+          _updateAnswerEditability();
         }).catchError((e) {
           print('QuestionPage: Error in build_question_board for START_TIMER: $e');
         });
@@ -2252,20 +2847,11 @@ class _QuestionPageState extends State<QuestionPage> {
         
       case 'STOP_TIMER':
         print('QuestionPage: STOP_TIMER received');
-        // Timer already stopped globally, just update UI
-        setState(() {
-          timer_counter_down = 0;
-          _remainingTime = Duration.zero;
-          _isTimerRunning = false;
-          _timerStarted = false;
-        });
         _tick?.cancel();
-        // Re-evaluate editability: with final_timer>0, Rule 2 keeps all fields enabled until last_timer stops
-        getCurrentTimerStatus().then((status) {
-          _updateAnswerEditability(
-            status['start_timer_status'] as String? ?? 'Idle',
-            status['last_timer_status'] as String? ?? 'Idle',
-          );
+        // Reload UI from prefs + globals (round mode: LAST may still run; blind zero hides it)
+        _loadTimerStatus().then((_) async {
+          if (!mounted) return;
+          await _updateAnswerEditability();
         });
         break;
         
@@ -2308,10 +2894,7 @@ class _QuestionPageState extends State<QuestionPage> {
         print('QuestionPage: Message content: $message');
         build_question_board(message).then((_) async {
           print('QuestionPage: build_question_board completed for LAST_TIMER');
-          final status = await getCurrentTimerStatus();
-          final start = status['start_timer_status'] as String? ?? 'Idle';
-          final last = status['last_timer_status'] as String? ?? 'Idle';
-          _updateAnswerEditability(start, last);
+          _updateAnswerEditability();
         }).catchError((e) {
           print('QuestionPage: Error in build_question_board for LAST_TIMER: $e');
         });
@@ -2440,7 +3023,7 @@ class _QuestionPageState extends State<QuestionPage> {
                   ),
                 ),
                 Text(
-                  '$_regScore/$_regScoreTotal',
+                  '${_formatScoreDisplay(_regScore)}/${_formatScoreDisplay(_regScoreTotal)}',
                   style: const TextStyle(
                     fontSize: 16,
                     fontWeight: FontWeight.bold,
@@ -2460,7 +3043,7 @@ class _QuestionPageState extends State<QuestionPage> {
                   ),
                 ),
                 Text(
-                  '$_bonusScore/$_bonusScoreTotal',
+                  '${_formatScoreDisplay(_bonusScore)}/${_formatScoreDisplay(_bonusScoreTotal)}',
                   style: const TextStyle(
                     fontSize: 16,
                     fontWeight: FontWeight.bold,
@@ -2474,19 +3057,59 @@ class _QuestionPageState extends State<QuestionPage> {
     );
   }
 
+  /// Format comma-stored list picks for the answer row (list option order, "A + B + C").
+  String _formatListSelectionsForDisplay(String raw, List<String> options) {
+    final parts =
+        raw.split(',').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+    if (parts.isEmpty) {
+      return '';
+    }
+    if (options.isNotEmpty) {
+      final ordered = options.where((o) => parts.contains(o)).toList();
+      if (ordered.isNotEmpty) {
+        return ordered.join(' + ');
+      }
+    }
+    return parts.join(' + ');
+  }
+
   String _summaryLabelForAnswer(Map<String, dynamic> answer) {
     final inputType = answer['inputType'] as String? ?? 'text';
+    final sc = answer['slotCount'] as int? ?? 1;
+    final options = (answer['options'] as List?)
+            ?.map((e) => e.toString())
+            .toList() ??
+        <String>[];
+    if (sc > 1) {
+      final four = _fourSlotValuesFromAnswerMap(answer);
+      final parts =
+          four.take(sc).map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+      if (parts.isEmpty) {
+        return 'No answer yet';
+      }
+      if (inputType == 'list') {
+        final slotLabels = parts
+            .map((slot) => _formatListSelectionsForDisplay(slot, options))
+            .where((e) => e.isNotEmpty)
+            .toList();
+        if (slotLabels.isEmpty) {
+          return 'No answer yet';
+        }
+        return slotLabels.join(' · ');
+      }
+      return parts.join(' · ');
+    }
     final value = (answer['value'] as String? ?? '').trim();
     if (value.isEmpty) {
       return 'No answer yet';
     }
     switch (inputType) {
       case 'list':
-        final parts = value.split(',').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
-        if (parts.isEmpty) {
+        final formatted = _formatListSelectionsForDisplay(value, options);
+        if (formatted.isEmpty) {
           return 'No answer yet';
         }
-        return '${parts.length} selected';
+        return formatted;
       case 'radio':
       case 'text':
       default:
@@ -2500,7 +3123,7 @@ class _QuestionPageState extends State<QuestionPage> {
 
   /// When round uses shared list pool, which question id currently "owns" this option (if not [forQuestionId]).
   int? _listOptionOwnerQuestionId(String option, int forQuestionId) {
-    if (_roundTimer == 0) {
+    if (!_roundModeActive) {
       return null;
     }
     for (final a in _answers) {
@@ -2511,7 +3134,7 @@ class _QuestionPageState extends State<QuestionPage> {
       if (qid == null || qid == forQuestionId) {
         continue;
       }
-      final v = a['value'] as String? ?? '';
+      final v = _listRawForConflictCheck(a);
       final set = v.split(',').map((e) => e.trim()).where((e) => e.isNotEmpty).toSet();
       if (set.contains(option)) {
         return qid;
@@ -2545,24 +3168,24 @@ class _QuestionPageState extends State<QuestionPage> {
   /// Checkbox: persist reg_score pair (unchecked) or bonus pair (checked) to active_teams_answers.
   Future<AnswerPersistStatus> _persistAnswerWithCheckboxScores(
     int questionId,
-    String answerText,
+    List<String> slots,
     bool selected,
   ) async {
     final reg = _regWrongPairForQuestion(questionId);
     final bon = _bonusWrongPairForQuestion(questionId);
     final c = selected ? bon.c : reg.c;
     final w = selected ? bon.w : reg.w;
-    return _persistAnswerValue(
+    return _persistAnswerSlots(
       questionId,
-      answerText,
+      slots,
       correctScore: c,
       wrongScore: w,
     );
   }
 
-  Future<AnswerPersistStatus> _persistAnswerValue(
+  Future<AnswerPersistStatus> _persistAnswerSlots(
     int questionId,
-    String value, {
+    List<String> slots, {
     double? correctScore,
     double? wrongScore,
   }) async {
@@ -2580,8 +3203,18 @@ class _QuestionPageState extends State<QuestionPage> {
       return AnswerPersistStatus.failed;
     }
     final roundName = _roundName.isNotEmpty ? _roundName : null;
-    final rt = _roundTimer != 0 ? _roundTimer : null;
-    final item = <String, dynamic>{'question_id': questionId, 'answer': value};
+    final rt = _roundModeActive ? (_roundTimer != 0 ? _roundTimer : null) : null;
+    final pad = List<String>.from(slots.map((e) => e.trim()));
+    while (pad.length < 4) {
+      pad.add('');
+    }
+    final item = <String, dynamic>{
+      'question_id': questionId,
+      'player_answer1': pad[0],
+      'player_answer2': pad[1],
+      'player_answer3': pad[2],
+      'player_answer4': pad[3],
+    };
     if (correctScore != null && wrongScore != null) {
       item['correct_score'] = correctScore;
       item['wrong_score'] = wrongScore;
@@ -2598,7 +3231,9 @@ class _QuestionPageState extends State<QuestionPage> {
         setState(() {
           final idx = _answers.indexWhere((a) => a['id'] == questionId);
           if (idx >= 0) {
-            _answers[idx]['value'] = value;
+            final sc = _answers[idx]['slotCount'] as int? ?? 1;
+            _answers[idx]['slotValues'] = List<String>.from(pad);
+            _answers[idx]['value'] = _compositeValueFromSlots(pad, sc);
           }
         });
         _bumpAnswerPoolRevision();
@@ -2622,7 +3257,9 @@ class _QuestionPageState extends State<QuestionPage> {
         setState(() {
           final idx = _answers.indexWhere((a) => a['id'] == questionId);
           if (idx >= 0) {
-            _answers[idx]['value'] = value;
+            final sc = _answers[idx]['slotCount'] as int? ?? 1;
+            _answers[idx]['slotValues'] = List<String>.from(pad);
+            _answers[idx]['value'] = _compositeValueFromSlots(pad, sc);
           }
         });
         _bumpAnswerPoolRevision();
@@ -2648,12 +3285,18 @@ class _QuestionPageState extends State<QuestionPage> {
     }
     final numLabel = answer['num'];
     final sub = _roundName.isNotEmpty ? _roundName : _gameName;
-    final useSharedList = (answer['inputType'] as String? ?? '') == 'list' && _roundTimer != 0;
+    final useSharedList =
+        (answer['inputType'] as String? ?? '') == 'list' && _roundModeActive;
 
     showDialog<void>(
       context: context,
       barrierDismissible: true,
       builder: (ctx) {
+        final slotCount = answer['slotCount'] as int? ?? 1;
+        final k = slotCount.clamp(1, 4);
+        final initFour = _fourSlotValuesFromAnswerMap(answer);
+        final initSlots = List<String>.generate(k, (i) => initFour[i]);
+
         return AnswerEditorDialog(
           questionId: qId,
           questionNum: numLabel is int ? numLabel : int.tryParse(numLabel.toString()) ?? index + 1,
@@ -2662,7 +3305,8 @@ class _QuestionPageState extends State<QuestionPage> {
           options: List<String>.from(
             (answer['options'] as List?)?.map((e) => e.toString()) ?? <String>[],
           ),
-          initialValue: answer['value'] as String? ?? '',
+          slotCount: k,
+          initialSlotValues: initSlots,
           roundUsesSharedListPool: useSharedList,
           ownerQuestionIdForOption: useSharedList
               ? (opt) => _listOptionOwnerQuestionId(opt, qId)
@@ -2679,7 +3323,7 @@ class _QuestionPageState extends State<QuestionPage> {
             final en = _answers[i]['enabled'] as bool? ?? false;
             return _isWriter && en;
           },
-          onPersist: (v) => _persistAnswerValue(qId, v),
+          onPersistSlots: (slots) => _persistAnswerSlots(qId, slots),
         );
       },
     );
@@ -2794,8 +3438,9 @@ class _QuestionPageState extends State<QuestionPage> {
                                     setState(() {
                                       _answers[index]['selected'] = v;
                                     });
-                                    final txt = _answers[index]['value'] as String? ?? '';
-                                    await _persistAnswerWithCheckboxScores(id, txt, v);
+                                    final slots =
+                                        _slotValuesForPersist(_answers[index]);
+                                    await _persistAnswerWithCheckboxScores(id, slots, v);
                                     _triggerAutoSave();
                                   },
                           ),

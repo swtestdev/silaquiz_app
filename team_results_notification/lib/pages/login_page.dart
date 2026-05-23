@@ -1317,13 +1317,27 @@ class DatabaseService {
               (a) {
                 final m = <String, dynamic>{
                   'question_id': a['question_id'],
-                  'answer': a['answer'] ?? '',
                 };
+                final useSlots = a.containsKey('player_answer1');
+                if (useSlots) {
+                  m['player_answer1'] = a['player_answer1'] ?? '';
+                  m['player_answer2'] = a['player_answer2'] ?? '';
+                  m['player_answer3'] = a['player_answer3'] ?? '';
+                  m['player_answer4'] = a['player_answer4'] ?? '';
+                } else {
+                  m['answer'] = a['answer'] ?? '';
+                }
                 if (a['correct_score'] != null) {
                   m['correct_score'] = a['correct_score'];
                 }
                 if (a['wrong_score'] != null) {
                   m['wrong_score'] = a['wrong_score'];
+                }
+                if (a['lucky_bonus'] != null) {
+                  m['lucky_bonus'] = a['lucky_bonus'];
+                }
+                if (a.containsKey('final_score')) {
+                  m['final_score'] = a['final_score'];
                 }
                 return m;
               },

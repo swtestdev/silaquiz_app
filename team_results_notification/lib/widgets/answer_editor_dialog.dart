@@ -10,6 +10,9 @@ enum AnswerPersistStatus {
 }
 
 class AnswerEditorDialog extends StatefulWidget {
+  /// Max characters per text answer slot (shown in editor).
+  static const int textSlotMaxLength = 50;
+
   AnswerEditorDialog({
     super.key,
     required this.questionId,
@@ -17,15 +20,18 @@ class AnswerEditorDialog extends StatefulWidget {
     this.subtitle,
     required this.inputType,
     required this.options,
-    required this.initialValue,
+    required this.slotCount,
+    required this.initialSlotValues,
+    required this.onPersistSlots,
     required this.isEditable,
-    required this.onPersist,
     this.roundUsesSharedListPool = false,
     int? Function(String option)? ownerQuestionIdForOption,
     /// When non-null (shared list rounds), list checkboxes rebuild when answers/ownership change elsewhere.
     this.answerPoolRevision,
     this.debounce = const Duration(milliseconds: 500),
-  }) : ownerQuestionIdForOption = ownerQuestionIdForOption ?? _defaultListOwner;
+  })  : assert(slotCount >= 1 && slotCount <= 4),
+        assert(initialSlotValues.length == slotCount),
+        ownerQuestionIdForOption = ownerQuestionIdForOption ?? _defaultListOwner;
 
   static int? _defaultListOwner(String _) => null;
 
@@ -34,9 +40,11 @@ class AnswerEditorDialog extends StatefulWidget {
   final String? subtitle;
   final String inputType;
   final List<String> options;
-  final String initialValue;
+  /// How many answer cells are active (matches nonempty game answer1..answer4).
+  final int slotCount;
+  final List<String> initialSlotValues;
+  final Future<AnswerPersistStatus> Function(List<String> slots) onPersistSlots;
   final bool Function() isEditable;
-  final Future<AnswerPersistStatus> Function(String newValue) onPersist;
 
   /// When [roundTimer] != 0 list mode: an option is blocked if it appears on another question.
   final bool roundUsesSharedListPool;
@@ -49,20 +57,16 @@ class AnswerEditorDialog extends StatefulWidget {
 }
 
 class _AnswerEditorDialogState extends State<AnswerEditorDialog> {
-  late final TextEditingController _textController;
-  late final FocusNode _textFocusNode;
-  String _radioValue = '';
-  late Set<String> _listSelected;
+  late final List<TextEditingController> _textCtrls;
+  late final List<FocusNode> _textFocusNodes;
+  late List<String> _radioVals;
+  late List<Set<String>> _listSets;
   Timer? _debounceTimer;
   Timer? _pollTimer;
-  /// True while user-initiated or timer forced close is in progress — blocks focus recovery.
   bool _isClosingDialog = false;
-  /// True only while closing — updated without [setState] so autosave never rebuilds the input subtree.
   late final ValueNotifier<bool> _inputLocked;
-  /// "Saving…" / "Saved" / errors — isolated with [ValueListenableBuilder], not [setState].
   late final ValueNotifier<String> _statusLine;
-  String _lastPersisted = '';
-  /// Throttled one-shot re-focus when focus is lost unexpectedly (not on save/debounce).
+  late List<String> _lastPersistedSlots;
   Timer? _refocusRecoveryTimer;
   static const _refocusThrottle = Duration(milliseconds: 200);
 
@@ -71,22 +75,47 @@ class _AnswerEditorDialogState extends State<AnswerEditorDialog> {
     super.initState();
     _inputLocked = ValueNotifier<bool>(false);
     _statusLine = ValueNotifier<String>('');
-    _lastPersisted = widget.initialValue;
-    _textController = TextEditingController(text: widget.initialValue);
-    _textFocusNode = FocusNode();
-    _textFocusNode.addListener(_onTextFocusChanged);
-    _radioValue = widget.initialValue;
-    if (widget.inputType == 'radio' && _radioValue.isNotEmpty && !widget.options.contains(_radioValue)) {
-      _radioValue = '';
+
+    final init = widget.initialSlotValues;
+
+    _textCtrls = List.generate(
+      widget.slotCount,
+      (i) => TextEditingController(text: i < init.length ? init[i] : ''),
+    );
+    _textFocusNodes = List.generate(widget.slotCount, (_) => FocusNode());
+    _radioVals = List<String>.generate(widget.slotCount, (i) {
+      if (widget.inputType != 'radio') {
+        return '';
+      }
+      final v = i < init.length ? init[i].trim() : '';
+      if (v.isNotEmpty && !widget.options.contains(v)) {
+        return '';
+      }
+      return v;
+    });
+    _listSets = List<Set<String>>.generate(widget.slotCount, (i) {
+      if (widget.inputType != 'list') {
+        return <String>{};
+      }
+      final s = i < init.length ? init[i] : '';
+      return _parseListValue(s);
+    });
+
+    if (widget.inputType == 'text') {
+      for (final n in _textFocusNodes) {
+        n.addListener(_onAnyTextSlotFocusChanged);
+      }
     }
-    _listSelected = _parseListValue(widget.initialValue);
-    // Request focus once after first frame; do not use TextField.autofocus (avoids double request).
+
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted || _isClosingDialog) return;
       if (widget.inputType == 'text' && widget.isEditable()) {
-        _textFocusNode.requestFocus();
+        _textFocusNodes[0].requestFocus();
       }
     });
+
+    _lastPersistedSlots = List.from(_collectSlotsRaw());
+
     _pollTimer = Timer.periodic(const Duration(milliseconds: 400), (_) {
       if (!mounted) return;
       if (!widget.isEditable() && !_inputLocked.value && !_isClosingDialog) {
@@ -95,9 +124,11 @@ class _AnswerEditorDialogState extends State<AnswerEditorDialog> {
     });
   }
 
-  void _onTextFocusChanged() {
+  /// Recover focus after an accidental unfocus — but never steal focus from another slot.
+  void _onAnyTextSlotFocusChanged() {
     if (!mounted || widget.inputType != 'text') return;
-    if (_textFocusNode.hasFocus) {
+    final anyFocused = _textFocusNodes.any((n) => n.hasFocus);
+    if (anyFocused) {
       _refocusRecoveryTimer?.cancel();
       _refocusRecoveryTimer = null;
       return;
@@ -109,8 +140,8 @@ class _AnswerEditorDialogState extends State<AnswerEditorDialog> {
       _refocusRecoveryTimer = null;
       if (!mounted || _isClosingDialog || _inputLocked.value) return;
       if (widget.inputType != 'text' || !widget.isEditable()) return;
-      if (_textFocusNode.hasFocus) return;
-      _textFocusNode.requestFocus();
+      if (_textFocusNodes.any((n) => n.hasFocus)) return;
+      _textFocusNodes[0].requestFocus();
     });
   }
 
@@ -122,34 +153,54 @@ class _AnswerEditorDialogState extends State<AnswerEditorDialog> {
         .toSet();
   }
 
+  String _joinList(Set<String> sel) {
+    return widget.options.where((e) => sel.contains(e)).join(',');
+  }
+
+  List<String> _collectSlotsRaw() {
+    switch (widget.inputType) {
+      case 'radio':
+        return List<String>.from(_radioVals);
+      case 'list':
+        return List<String>.generate(widget.slotCount, (i) => _joinList(_listSets[i]));
+      case 'text':
+      default:
+        return List<String>.generate(widget.slotCount, (i) => _textCtrls[i].text);
+    }
+  }
+
   @override
   void dispose() {
     _refocusRecoveryTimer?.cancel();
-    _textFocusNode.removeListener(_onTextFocusChanged);
+    if (widget.inputType == 'text' && _textFocusNodes.isNotEmpty) {
+      for (final n in _textFocusNodes) {
+        n.removeListener(_onAnyTextSlotFocusChanged);
+      }
+    }
     _debounceTimer?.cancel();
     _pollTimer?.cancel();
     _inputLocked.dispose();
     _statusLine.dispose();
     FocusManager.instance.primaryFocus?.unfocus();
-    _textFocusNode.dispose();
-    _textController.dispose();
+    for (final n in _textFocusNodes) {
+      n.dispose();
+    }
+    for (final c in _textCtrls) {
+      c.dispose();
+    }
     super.dispose();
   }
 
-  String _listValueOrdered() {
-    return widget.options.where((e) => _listSelected.contains(e)).join(',');
-  }
-
-  String _currentValueString() {
-    switch (widget.inputType) {
-      case 'radio':
-        return _radioValue;
-      case 'list':
-        return _listValueOrdered();
-      case 'text':
-      default:
-        return _textController.text;
+  bool _slotsEqual(List<String> a, List<String> b) {
+    if (a.length != b.length) {
+      return false;
     }
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) {
+        return false;
+      }
+    }
+    return true;
   }
 
   Future<void> _onShouldClose() async {
@@ -159,32 +210,29 @@ class _AnswerEditorDialogState extends State<AnswerEditorDialog> {
     if (!mounted) return;
     _statusLine.value = 'Saving…';
     _inputLocked.value = true;
-    if (widget.inputType == 'text') {
-      _debounceTimer?.cancel();
-    }
-    await _doPersist(_currentValueString(), showStatus: false);
+    _debounceTimer?.cancel();
+    await _doPersist(_collectSlotsRaw(), showStatus: false);
     if (!mounted) return;
     FocusManager.instance.primaryFocus?.unfocus();
     Navigator.of(context).pop();
   }
 
-  Future<AnswerPersistStatus> _doPersist(String value, {bool showStatus = true}) async {
-    if (value == _lastPersisted) {
+  Future<AnswerPersistStatus> _doPersist(List<String> slots, {bool showStatus = true}) async {
+    if (_slotsEqual(slots, _lastPersistedSlots)) {
       if (showStatus) {
         _statusLine.value = 'Saved';
       }
       return AnswerPersistStatus.success;
     }
-    // Status line only: no setState, no _ioLocked — keeps TextField/FocusNode stable during autosave.
     if (showStatus) {
       _statusLine.value = 'Saving…';
     }
-    final st = await widget.onPersist(value);
+    final st = await widget.onPersistSlots(slots);
     if (!mounted) return st;
     if (!showStatus) {
       switch (st) {
         case AnswerPersistStatus.success:
-          _lastPersisted = value;
+          _lastPersistedSlots = List.from(slots);
           break;
         default:
           break;
@@ -194,7 +242,7 @@ class _AnswerEditorDialogState extends State<AnswerEditorDialog> {
     switch (st) {
       case AnswerPersistStatus.success:
         _statusLine.value = 'Saved';
-        _lastPersisted = value;
+        _lastPersistedSlots = List.from(slots);
         break;
       case AnswerPersistStatus.offline:
         _statusLine.value = 'Offline';
@@ -214,43 +262,40 @@ class _AnswerEditorDialogState extends State<AnswerEditorDialog> {
     _debounceTimer?.cancel();
     _debounceTimer = Timer(widget.debounce, () {
       if (mounted) {
-        unawaited(_doPersist(_textController.text));
+        unawaited(_doPersist(_collectSlotsRaw()));
       }
     });
   }
 
-  void _onRadioChanged(String? v) {
+  void _onRadioChanged(int slotIndex, String? v) {
     final s = v ?? '';
-    setState(() => _radioValue = s);
-    unawaited(_doPersist(s));
+    setState(() => _radioVals[slotIndex] = s);
+    unawaited(_doPersist(_collectSlotsRaw()));
   }
 
-  void _onListToggle(String option, bool? select) {
+  void _onListToggle(int slotIndex, String option, bool? select) {
     if (_inputLocked.value) return;
     final turnOn = select == true;
-    // Shared pool: conflicts are prevented in UI (disabled tiles); no SnackBar.
     if (turnOn && widget.roundUsesSharedListPool) {
       final owner = widget.ownerQuestionIdForOption(option);
       if (owner != null && owner != widget.questionId) {
         return;
       }
     }
-    final next = Set<String>.from(_listSelected);
+    final next = Set<String>.from(_listSets[slotIndex]);
     if (turnOn) {
       next.add(option);
     } else {
       next.remove(option);
     }
-    final v = widget.options.where((e) => next.contains(e)).join(',');
     setState(() {
-      _listSelected = next;
+      _listSets[slotIndex] = next;
     });
-    unawaited(_doPersist(v));
+    unawaited(_doPersist(_collectSlotsRaw()));
   }
 
   @override
   Widget build(BuildContext context) {
-    // Intentionally no [setState] for save/status/lock: [_statusLine] and [_inputLocked] are notifiers.
     return AlertDialog(
       title: Text(
         widget.subtitle != null && widget.subtitle!.isNotEmpty
@@ -280,7 +325,6 @@ class _AnswerEditorDialogState extends State<AnswerEditorDialog> {
                 );
               },
             ),
-            // Rebuilds input only when closing ([_inputLocked]), not on each debounced save.
             ValueListenableBuilder<bool>(
               valueListenable: _inputLocked,
               builder: (context, inputLocked, __) {
@@ -299,16 +343,11 @@ class _AnswerEditorDialogState extends State<AnswerEditorDialog> {
             _refocusRecoveryTimer?.cancel();
             _debounceTimer?.cancel();
             _inputLocked.value = true;
-            if (widget.inputType == 'text') {
-              FocusManager.instance.primaryFocus?.unfocus();
-              unawaited(_doPersist(_textController.text, showStatus: false).then((_) {
-                if (!mounted) return;
-                Navigator.of(context).pop();
-              }));
-            } else {
-              FocusManager.instance.primaryFocus?.unfocus();
+            FocusManager.instance.primaryFocus?.unfocus();
+            unawaited(_doPersist(_collectSlotsRaw(), showStatus: false).then((_) {
+              if (!mounted) return;
               Navigator.of(context).pop();
-            }
+            }));
           },
           child: const Text('Close'),
         ),
@@ -322,47 +361,71 @@ class _AnswerEditorDialogState extends State<AnswerEditorDialog> {
         if (widget.options.isEmpty) {
           return const Text('No options available');
         }
-        return Column(
-          mainAxisSize: MainAxisSize.min,
-          children: widget.options
-              .map(
-                (o) => RadioListTile<String>(
-                  title: Text(o, maxLines: 2, overflow: TextOverflow.ellipsis),
-                  value: o,
-                  groupValue: _radioValue.isNotEmpty && widget.options.contains(_radioValue) ? _radioValue : null,
-                  onChanged: enabled
-                      ? (v) {
-                          if (v != null) {
-                            _onRadioChanged(v);
-                          }
-                        }
-                      : null,
+        final tiles = <Widget>[];
+        for (var s = 0; s < widget.slotCount; s++) {
+          if (widget.slotCount > 1) {
+            tiles.add(
+              Padding(
+                padding: const EdgeInsets.only(top: 8, bottom: 4),
+                child: Text(
+                  'Answer ${s + 1}',
+                  style: Theme.of(context).textTheme.labelLarge,
                 ),
-              )
-              .toList(),
-        );
+              ),
+            );
+          }
+          for (final o in widget.options) {
+            final gv = _radioVals[s].isNotEmpty && widget.options.contains(_radioVals[s]) ? _radioVals[s] : null;
+            tiles.add(
+              RadioListTile<String>(
+                title: Text(o, maxLines: 2, overflow: TextOverflow.ellipsis),
+                value: o,
+                groupValue: gv,
+                onChanged: enabled
+                    ? (v) {
+                        if (v != null) {
+                          _onRadioChanged(s, v);
+                        }
+                      }
+                    : null,
+              ),
+            );
+          }
+        }
+        return Column(mainAxisSize: MainAxisSize.min, children: tiles);
       case 'list':
         if (widget.options.isEmpty) {
           return const Text('No options available');
         }
-        Widget listColumn() => Column(
-              mainAxisSize: MainAxisSize.min,
-              children: widget.options.map((o) {
-                final isOn = _listSelected.contains(o);
-                final int? owner =
-                    widget.roundUsesSharedListPool ? widget.ownerQuestionIdForOption(o) : null;
-                final usedElsewhere =
-                    owner != null && owner != widget.questionId;
-                final canToggle = enabled && (!usedElsewhere || isOn);
-                final theme = Theme.of(context);
-                final titleStyle = (usedElsewhere && !isOn)
-                    ? theme.textTheme.bodyLarge?.copyWith(color: theme.disabledColor)
-                    : null;
-                return CheckboxListTile(
+        Widget listColumn() {
+          final cols = <Widget>[];
+          for (var s = 0; s < widget.slotCount; s++) {
+            if (widget.slotCount > 1) {
+              cols.add(
+                Padding(
+                  padding: const EdgeInsets.only(top: 8, bottom: 4),
+                  child: Text(
+                    'Answer ${s + 1}',
+                    style: Theme.of(context).textTheme.labelLarge,
+                  ),
+                ),
+              );
+            }
+            for (final o in widget.options) {
+              final isOn = _listSets[s].contains(o);
+              final int? owner = widget.roundUsesSharedListPool ? widget.ownerQuestionIdForOption(o) : null;
+              final usedElsewhere = owner != null && owner != widget.questionId;
+              final canToggle = enabled && (!usedElsewhere || isOn);
+              final theme = Theme.of(context);
+              final titleStyle = (usedElsewhere && !isOn)
+                  ? theme.textTheme.bodyLarge?.copyWith(color: theme.disabledColor)
+                  : null;
+              cols.add(
+                CheckboxListTile(
                   value: isOn,
                   onChanged: canToggle
                       ? (v) {
-                          _onListToggle(o, v);
+                          _onListToggle(s, o, v);
                         }
                       : null,
                   title: Text(
@@ -380,9 +443,13 @@ class _AnswerEditorDialogState extends State<AnswerEditorDialog> {
                         )
                       : null,
                   controlAffinity: ListTileControlAffinity.leading,
-                );
-              }).toList(),
-            );
+                ),
+              );
+            }
+          }
+          return Column(mainAxisSize: MainAxisSize.min, children: cols);
+        }
+
         final rev = widget.answerPoolRevision;
         if (rev != null) {
           return ListenableBuilder(
@@ -393,16 +460,41 @@ class _AnswerEditorDialogState extends State<AnswerEditorDialog> {
         return listColumn();
       case 'text':
       default:
-        return TextField(
-          controller: _textController,
-          focusNode: _textFocusNode,
-          enabled: enabled,
-          minLines: 1,
-          maxLines: 6,
-          maxLength: 200,
-          keyboardType: TextInputType.multiline,
-          textInputAction: TextInputAction.newline,
-          onChanged: (_) => _scheduleTextPersist(),
+        if (widget.slotCount == 1) {
+          return TextField(
+            controller: _textCtrls[0],
+            focusNode: _textFocusNodes[0],
+            enabled: enabled,
+            minLines: 1,
+            maxLines: 6,
+            maxLength: AnswerEditorDialog.textSlotMaxLength,
+            keyboardType: TextInputType.multiline,
+            textInputAction: TextInputAction.newline,
+            onChanged: (_) => _scheduleTextPersist(),
+          );
+        }
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          children: List.generate(widget.slotCount, (i) {
+            return Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: TextField(
+                controller: _textCtrls[i],
+                focusNode: _textFocusNodes[i],
+                enabled: enabled,
+                minLines: 1,
+                maxLines: 4,
+                maxLength: AnswerEditorDialog.textSlotMaxLength,
+                decoration: InputDecoration(
+                  labelText: 'Answer ${i + 1}',
+                  border: const OutlineInputBorder(),
+                ),
+                keyboardType: TextInputType.multiline,
+                textInputAction: TextInputAction.newline,
+                onChanged: (_) => _scheduleTextPersist(),
+              ),
+            );
+          }),
         );
     }
   }
