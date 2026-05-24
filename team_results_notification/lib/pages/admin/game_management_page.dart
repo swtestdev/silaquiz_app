@@ -2,6 +2,21 @@ import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'dart:io';
 import '../login_page.dart'; // For DatabaseService
+import 'active_game_starting_settings_dialog.dart';
+
+class _ActiveGameSummary {
+  const _ActiveGameSummary({
+    required this.roundCount,
+    required this.questionCount,
+    required this.roundNames,
+    required this.teamNames,
+  });
+
+  final int roundCount;
+  final int questionCount;
+  final List<String> roundNames;
+  final List<String> teamNames;
+}
 
 class GameManagementPage extends StatefulWidget {
   const GameManagementPage({super.key});
@@ -12,11 +27,229 @@ class GameManagementPage extends StatefulWidget {
 
 class _GameManagementPageState extends State<GameManagementPage> {
   final ScrollController _scrollController = ScrollController();
+  List<Map<String, dynamic>> _activeGames = [];
+  Map<int, _ActiveGameSummary> _gameSummaries = {};
+  bool _isLoadingGames = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadActiveGamesList();
+  }
 
   @override
   void dispose() {
     _scrollController.dispose();
     super.dispose();
+  }
+
+  Future<void> _loadActiveGamesList() async {
+    setState(() {
+      _isLoadingGames = true;
+    });
+
+    try {
+      final games = await DatabaseService.getActiveGames();
+      final teams = await DatabaseService.getAllTeams();
+      final teamById = <String, String>{
+        for (final t in teams)
+          t['id'].toString(): (t['team_name'] as String? ?? 'Unknown Team'),
+      };
+
+      final summaries = <int, _ActiveGameSummary>{};
+      for (final game in games) {
+        final activeGameId = game['id'];
+        if (activeGameId is! int) {
+          continue;
+        }
+
+        final teamIds = _parseTeamIds(game['teams_ids']);
+        final teamNames = teamIds
+            .map((id) => teamById[id] ?? 'Team $id')
+            .toList(growable: false);
+
+        var roundCount = 0;
+        var questionCount = 0;
+        final roundNames = <String>[];
+
+        final fromApi = game['round_names'];
+        if (fromApi is List && fromApi.isNotEmpty) {
+          roundNames.addAll(
+            fromApi.map((e) => e.toString()).where((n) => n.trim().isNotEmpty),
+          );
+          roundCount = game['round_count'] is num
+              ? (game['round_count'] as num).toInt()
+              : roundNames.length;
+          questionCount = game['question_count'] is num
+              ? (game['question_count'] as num).toInt()
+              : 0;
+        } else {
+          final gameId = game['game_id'];
+          if (gameId != null) {
+            final idInt = gameId is int
+                ? gameId
+                : int.tryParse(gameId.toString());
+            if (idInt != null) {
+              final rounds = await DatabaseService.getAdminGameRounds(idInt);
+              if (rounds['success'] == true) {
+                roundNames.addAll(
+                  List<String>.from(rounds['round_names'] ?? []),
+                );
+                roundCount = rounds['round_count'] is num
+                    ? (rounds['round_count'] as num).toInt()
+                    : roundNames.length;
+                questionCount = rounds['question_count'] is num
+                    ? (rounds['question_count'] as num).toInt()
+                    : 0;
+              }
+            }
+          }
+        }
+
+        summaries[activeGameId] = _ActiveGameSummary(
+          roundCount: roundCount,
+          questionCount: questionCount,
+          roundNames: roundNames,
+          teamNames: teamNames,
+        );
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _activeGames = games;
+        _gameSummaries = summaries;
+        _isLoadingGames = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _isLoadingGames = false;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Error loading active games: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
+
+  List<String> _parseTeamIds(dynamic teamsIds) {
+    if (teamsIds == null) return const [];
+    return teamsIds
+        .toString()
+        .split(',')
+        .map((id) => id.trim())
+        .where((id) => id.isNotEmpty)
+        .toList(growable: false);
+  }
+
+  int _teamsCount(dynamic teamsIds) => _parseTeamIds(teamsIds).length;
+
+  String _getStatusText(String status) {
+    switch (status) {
+      case 'idle':
+        return 'Idle';
+      case 'active':
+        return 'Active';
+      case 'running':
+        return 'Running';
+      case 'paused':
+        return 'Paused';
+      default:
+        return status.isEmpty ? 'Unknown' : status;
+    }
+  }
+
+  Color _getStatusColor(String status) {
+    switch (status) {
+      case 'idle':
+        return Colors.orange;
+      case 'active':
+        return Colors.blue;
+      case 'running':
+        return Colors.green;
+      case 'paused':
+        return Colors.deepPurple;
+      default:
+        return Colors.grey;
+    }
+  }
+
+  void _showGameDetailsDialog(
+    Map<String, dynamic> game,
+    _ActiveGameSummary summary,
+  ) {
+    final gameName = game['game_name'] ?? 'Unknown Game';
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(gameName),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  'Status: ${_getStatusText(game['is_started']?.toString() ?? 'idle')}',
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(height: 16),
+                const Text(
+                  'Rounds',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 8),
+                if (summary.roundNames.isEmpty)
+                  const Text('No rounds found')
+                else
+                  ...summary.roundNames.map(
+                    (name) => Padding(
+                      padding: const EdgeInsets.only(bottom: 4),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text('• '),
+                          Expanded(child: Text(name)),
+                        ],
+                      ),
+                    ),
+                  ),
+                const SizedBox(height: 16),
+                const Text(
+                  'Teams',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 8),
+                if (summary.teamNames.isEmpty)
+                  const Text('No teams assigned')
+                else
+                  ...summary.teamNames.map(
+                    (name) => Padding(
+                      padding: const EdgeInsets.only(bottom: 4),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text('• '),
+                          Expanded(child: Text(name)),
+                        ],
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
@@ -26,6 +259,13 @@ class _GameManagementPageState extends State<GameManagementPage> {
         title: const Text('Game Management'),
         backgroundColor: Colors.blue,
         foregroundColor: Colors.white,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: _loadActiveGamesList,
+            tooltip: 'Refresh active games',
+          ),
+        ],
       ),
       body: Scrollbar(
         controller: _scrollController,
@@ -34,192 +274,81 @@ class _GameManagementPageState extends State<GameManagementPage> {
           controller: _scrollController,
           padding: const EdgeInsets.all(16),
           child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // Header
-            const Text(
-              'Manage Games',
-              style: TextStyle(
-                fontSize: 24,
-                fontWeight: FontWeight.bold,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Manage Games',
+                style: TextStyle(
+                  fontSize: 24,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
-            ),
-            const SizedBox(height: 8),
-            const Text(
-              'Create, monitor, and control active games and rounds',
-              style: TextStyle(
-                fontSize: 16,
-                color: Colors.grey,
+              const SizedBox(height: 8),
+              const Text(
+                'Load games and manage active game sessions',
+                style: TextStyle(
+                  fontSize: 16,
+                  color: Colors.grey,
+                ),
               ),
-            ),
-            const SizedBox(height: 24),
-            
-            // Quick Actions
-            Row(
-              children: [
-                Expanded(
-                  child: _buildActionCard(
-                    'Load New Game',
-                    Icons.upload_file,
-                    Colors.orange,
-                    () {
-                      _showLoadGameDialog();
-                    },
+              const SizedBox(height: 24),
+
+              Row(
+                children: [
+                  Expanded(
+                    child: _buildActionCard(
+                      'Load New Game',
+                      Icons.upload_file,
+                      Colors.orange,
+                      _showLoadGameDialog,
+                    ),
                   ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: _buildActionCard(
-                    'Active Games',
-                    Icons.sports_esports,
-                    Colors.blue,
-                    () {
-                      _showActiveGames();
-                    },
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: _buildActionCard(
+                      'Active Games',
+                      Icons.sports_esports,
+                      Colors.blue,
+                      _showActiveGames,
+                    ),
                   ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 16),
-            
-            // Game Statistics
-            Card(
-              elevation: 4,
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'Game Statistics',
-                      style: TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceAround,
-                      children: [
-                        _buildStatCard('Active Games', '3', Colors.green),
-                        _buildStatCard('Total Rounds', '45', Colors.blue),
-                        _buildStatCard('Completed', '12', Colors.orange),
-                        _buildStatCard('Players Online', '28', Colors.purple),
-                      ],
-                    ),
-                  ],
+                ],
+              ),
+              const SizedBox(height: 24),
+
+              const Text(
+                'Active Games',
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
                 ),
               ),
-            ),
-            const SizedBox(height: 16),
-            
-            // Current Round Control
-            Card(
-              elevation: 4,
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'Current Round Control',
-                      style: TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
-                      ),
+              const SizedBox(height: 8),
+              if (_isLoadingGames)
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 24),
+                  child: Center(child: CircularProgressIndicator()),
+                )
+              else if (_activeGames.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 24),
+                  child: Center(
+                    child: Text(
+                      'No active games found',
+                      style: TextStyle(fontSize: 16, color: Colors.grey),
                     ),
-                    const SizedBox(height: 12),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const Text('Round 3 of 10'),
-                              const SizedBox(height: 4),
-                              LinearProgressIndicator(
-                                value: 0.3,
-                                backgroundColor: Colors.grey[300],
-                                valueColor: const AlwaysStoppedAnimation<Color>(Colors.blue),
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(width: 16),
-                        ElevatedButton(
-                          onPressed: () => _nextRound(),
-                          child: const Text('Next Round'),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 12),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: OutlinedButton.icon(
-                            onPressed: () => _pauseGame(),
-                            icon: const Icon(Icons.pause),
-                            label: const Text('Pause Game'),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: OutlinedButton.icon(
-                            onPressed: () => _endGame(),
-                            icon: const Icon(Icons.stop),
-                            label: const Text('End Game'),
-                            style: OutlinedButton.styleFrom(
-                              foregroundColor: Colors.red,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
+                  ),
+                )
+              else
+                ListView.builder(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  itemCount: _activeGames.length,
+                  itemBuilder: (context, index) {
+                    final game = _activeGames[index];
+                    return _buildActiveGameListTile(game);
+                  },
                 ),
-              ),
-            ),
-            const SizedBox(height: 16),
-            
-            // Active Games List
-            const Text(
-              'Active Games',
-              style: TextStyle(
-                fontSize: 18,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            const SizedBox(height: 8),
-            ListView.builder(
-              shrinkWrap: true,
-              physics: const NeverScrollableScrollPhysics(),
-              itemCount: 3, // Mock data
-              itemBuilder: (context, index) {
-                  return Card(
-                    child: ListTile(
-                      leading: CircleAvatar(
-                        backgroundColor: Colors.green.shade100,
-                        child: const Icon(Icons.sports_esports, color: Colors.green),
-                      ),
-                      title: Text('Game ${index + 1}'),
-                      subtitle: Text('Round ${(index + 1) * 2} of 10 - 8 players'),
-                      trailing: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          IconButton(
-                            icon: const Icon(Icons.visibility),
-                            onPressed: () => _viewGame(index),
-                          ),
-                          IconButton(
-                            icon: const Icon(Icons.settings),
-                            onPressed: () => _gameSettings(index),
-                          ),
-                        ],
-                      ),
-                    ),
-                  );
-                },
-              ),
             ],
           ),
         ),
@@ -227,7 +356,121 @@ class _GameManagementPageState extends State<GameManagementPage> {
     );
   }
 
-  Widget _buildActionCard(String title, IconData icon, Color color, VoidCallback onTap) {
+  Widget _buildActiveGameListTile(Map<String, dynamic> game) {
+    final gameName = game['game_name'] ?? 'Unknown Game';
+    final status = game['is_started']?.toString() ?? 'idle';
+    final activeGameId = game['id'] is int ? game['id'] as int : null;
+    final summary = activeGameId != null ? _gameSummaries[activeGameId] : null;
+    final roundCount = summary?.roundCount ?? 0;
+    final questionCount = summary?.questionCount ?? 0;
+    final playersCount = _teamsCount(game['teams_ids']);
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 8),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 12),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    gameName,
+                    style: const TextStyle(
+                      fontSize: 17,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    'Status: ${_getStatusText(status)}',
+                    style: TextStyle(
+                      fontSize: 14,
+                      color: _getStatusColor(status),
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Rounds: $roundCount ($questionCount)',
+                    style: TextStyle(
+                      fontSize: 14,
+                      color: Colors.grey.shade700,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    'Players: $playersCount',
+                    style: TextStyle(
+                      fontSize: 14,
+                      color: Colors.grey.shade700,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            SizedBox(
+              width: 48,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  IconButton(
+                    tooltip: 'View rounds and teams',
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(
+                      minWidth: 40,
+                      minHeight: 40,
+                    ),
+                    onPressed: summary == null
+                        ? null
+                        : () => _showGameDetailsDialog(game, summary),
+                    icon: CircleAvatar(
+                      radius: 16,
+                      backgroundColor: Colors.blue.shade50,
+                      child: Icon(
+                        Icons.info_outline,
+                        size: 18,
+                        color: Colors.blue.shade700,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: 'Game settings',
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(
+                      minWidth: 40,
+                      minHeight: 40,
+                    ),
+                    onPressed: activeGameId == null
+                        ? null
+                        : () => ActiveGameStartingSettingsDialog.show(
+                              context,
+                              activeGameId: activeGameId,
+                              gameName: gameName,
+                            ),
+                    icon: Icon(
+                      Icons.settings,
+                      size: 22,
+                      color: Colors.grey.shade700,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildActionCard(
+    String title,
+    IconData icon,
+    Color color,
+    VoidCallback onTap,
+  ) {
     return Card(
       elevation: 2,
       child: InkWell(
@@ -254,120 +497,27 @@ class _GameManagementPageState extends State<GameManagementPage> {
     );
   }
 
-  Widget _buildStatCard(String label, String value, Color color) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        color: color.withOpacity(0.1),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: color.withOpacity(0.3)),
-      ),
-      child: Column(
-        children: [
-          Text(
-            value,
-            style: TextStyle(
-              fontSize: 20,
-              fontWeight: FontWeight.bold,
-              color: color,
-            ),
-          ),
-          Text(
-            label,
-            style: TextStyle(
-              fontSize: 12,
-              color: color,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _showStartGameDialog() {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Start New Game'),
-        content: const Text('Game creation functionality will be implemented here.'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Close'),
-          ),
-        ],
-      ),
-    );
-  }
-
   void _showLoadGameDialog() {
     showDialog(
       context: context,
       builder: (context) => LoadGameDialog(
         onGameLoaded: () {
-          // Refresh games list or show success message
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
               content: Text('Game loaded successfully!'),
               backgroundColor: Colors.green,
             ),
           );
+          _loadActiveGamesList();
         },
       ),
     );
   }
 
   void _showActiveGames() {
-    Navigator.pushNamed(context, '/admin/active-games');
-  }
-
-  void _nextRound() {
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Moving to next round...')),
-    );
-  }
-
-  void _pauseGame() {
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Game paused')),
-    );
-  }
-
-  void _endGame() {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('End Game'),
-        content: const Text('Are you sure you want to end this game?'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          TextButton(
-            onPressed: () {
-              Navigator.pop(context);
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Game ended')),
-              );
-            },
-            child: const Text('End Game'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _viewGame(int gameIndex) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Viewing Game ${gameIndex + 1}')),
-    );
-  }
-
-  void _gameSettings(int gameIndex) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Game ${gameIndex + 1} settings')),
-    );
+    Navigator.pushNamed(context, '/admin/active-games').then((_) {
+      _loadActiveGamesList();
+    });
   }
 }
 
@@ -386,7 +536,6 @@ class LoadGameDialog extends StatefulWidget {
 class _LoadGameDialogState extends State<LoadGameDialog> {
   bool _isLoading = false;
   String? _errorMessage;
-  String? _selectedFilePath;
   String? _fileName;
   List<int>? _selectedFileBytes;
 
@@ -406,7 +555,6 @@ class _LoadGameDialogState extends State<LoadGameDialog> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // Header
               Row(
                 children: [
                   const Icon(Icons.upload_file, color: Colors.orange, size: 28),
@@ -427,8 +575,6 @@ class _LoadGameDialogState extends State<LoadGameDialog> {
                 ],
               ),
               const SizedBox(height: 20),
-
-              // Instructions
               Container(
                 padding: const EdgeInsets.all(16),
                 decoration: BoxDecoration(
@@ -465,8 +611,6 @@ class _LoadGameDialogState extends State<LoadGameDialog> {
                 ),
               ),
               const SizedBox(height: 20),
-
-              // Error Message
               if (_errorMessage != null) ...[
                 Container(
                   padding: const EdgeInsets.all(12),
@@ -490,8 +634,6 @@ class _LoadGameDialogState extends State<LoadGameDialog> {
                 ),
                 const SizedBox(height: 16),
               ],
-
-              // File Selection
               Container(
                 width: double.infinity,
                 padding: const EdgeInsets.all(20),
@@ -540,8 +682,6 @@ class _LoadGameDialogState extends State<LoadGameDialog> {
                 ),
               ),
               const SizedBox(height: 24),
-
-              // Action Buttons
               Row(
                 mainAxisAlignment: MainAxisAlignment.end,
                 children: [
@@ -591,19 +731,14 @@ class _LoadGameDialogState extends State<LoadGameDialog> {
           _errorMessage = null;
         });
 
-        // Handle different platforms
         if (file.bytes != null) {
-          // Web platform - use bytes directly
           setState(() {
             _selectedFileBytes = file.bytes!;
-            _selectedFilePath = 'web_file'; // Placeholder for UI state
           });
         } else if (file.path != null) {
-          // Mobile/Desktop platform - read file from path
           final fileObj = File(file.path!);
           final bytes = await fileObj.readAsBytes();
           setState(() {
-            _selectedFilePath = file.path!;
             _selectedFileBytes = bytes;
           });
         } else {
@@ -628,10 +763,7 @@ class _LoadGameDialogState extends State<LoadGameDialog> {
     });
 
     try {
-      // Extract game name from filename (remove extension)
       final gameName = _fileName!.replaceAll(RegExp(r'\.(xlsx|xls)$'), '');
-      
-      // Call API to process the Excel file
       final result = await DatabaseService.loadGameFromExcel(
         gameName,
         _selectedFileBytes!,
@@ -640,46 +772,38 @@ class _LoadGameDialogState extends State<LoadGameDialog> {
       if (result['success'] == true) {
         if (mounted) {
           Navigator.pop(context);
-          if (widget.onGameLoaded != null) {
-            widget.onGameLoaded!();
-          }
-          
-          // Show detailed success message
+          widget.onGameLoaded?.call();
+
           final responseData = result['data'];
-          
-          String successMessage = 'Excel file processed successfully!\n';
+          var successMessage = 'Excel file processed successfully!\n';
           successMessage += '• File: $gameName\n';
-          
-          // Try to get detailed information from the response
+
           if (responseData != null) {
             final totalSheets = responseData['total_sheets'] ?? 0;
             final totalRows = responseData['total_rows'] ?? 0;
             final createdGames = responseData['created_games'] as List? ?? [];
-            final filename = responseData['filename'] ?? gameName;
-            
+
             successMessage += '• Games created: $totalSheets\n';
             successMessage += '• Total rows imported: $totalRows\n';
             successMessage += '• Each sheet became a separate game';
-            
-            // Add details about created games if available
+
             if (createdGames.isNotEmpty) {
               successMessage += '\n\nCreated games:';
-              for (var game in createdGames.take(3)) { // Show first 3 games
-                final gameName = game['game_name'] ?? 'Unknown';
+              for (var game in createdGames.take(3)) {
+                final gName = game['game_name'] ?? 'Unknown';
                 final rowCount = game['row_count'] ?? 0;
-                successMessage += '\n• $gameName ($rowCount rows)';
+                successMessage += '\n• $gName ($rowCount rows)';
               }
               if (createdGames.length > 3) {
                 successMessage += '\n• ... and ${createdGames.length - 3} more';
               }
             }
           } else {
-            // Fallback message if detailed data is not available
             successMessage += '• Games and tables created successfully\n';
             successMessage += '• Check the database for created tables\n';
             successMessage += '• Each sheet became a separate game';
           }
-          
+
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
               content: Text(successMessage),

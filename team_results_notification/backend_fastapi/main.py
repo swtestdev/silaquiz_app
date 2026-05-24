@@ -1204,6 +1204,175 @@ def _resolve_type_game_for_round(db: Session, game_table: str, round_name: str) 
         return 0
 
 
+def _fetch_game_rounds_summary(db: Session, game_table_name: str) -> Dict[str, Any]:
+    """Distinct round_name values and question counts from a Quze game table."""
+    try:
+        q = text(
+            f"""
+            SELECT round_name, COUNT(*) AS cnt
+            FROM `{game_table_name}`
+            WHERE round_name IS NOT NULL AND round_name != ''
+            GROUP BY round_name
+            ORDER BY MIN(id)
+            """
+        )
+        rows = db.execute(q).fetchall()
+        round_names = [str(r[0]) for r in rows]
+        question_count = sum(int(r[1]) for r in rows)
+        return {
+            "round_names": round_names,
+            "round_count": len(round_names),
+            "question_count": question_count,
+        }
+    except Exception as e:
+        logger.warning("Could not fetch rounds for game table %s: %s", game_table_name, e)
+        return {"round_names": [], "round_count": 0, "question_count": 0}
+
+
+def _resolve_game_table_for_list_entry(db: Session, game: GamesList) -> str:
+    """Resolve MySQL table for a games_list row (exact name, then sanitized LIKE)."""
+    candidates: List[str] = []
+    if game.game_name:
+        candidates.append(game.game_name)
+    safe = str(game.game_name or "").replace(" ", "_").replace("-", "_").lower()
+    if safe and safe not in candidates:
+        candidates.append(safe)
+    try:
+        result = db.execute(text(f"SHOW TABLES LIKE '{safe}%'"))
+        for row in result.fetchall():
+            t = row[0]
+            if t not in candidates:
+                candidates.append(t)
+    except Exception as e:
+        logger.warning("SHOW TABLES failed for game %s: %s", game.game_name, e)
+
+    for table_name in candidates:
+        try:
+            db.execute(text(f"SELECT 1 FROM `{table_name}` LIMIT 1")).fetchone()
+            return table_name
+        except Exception:
+            continue
+    return game.game_name
+
+
+def _question_ids_for_round_names(
+    db: Session, game: GamesList, round_names: List[str]
+) -> List[int]:
+    """All game-table question ids belonging to the given round_name values."""
+    if not round_names:
+        return []
+    table = _resolve_game_table_for_list_entry(db, game)
+    ids: List[int] = []
+    q = text(f"SELECT id FROM `{table}` WHERE round_name = :rn ORDER BY id")
+    for rn in round_names:
+        if not rn or not str(rn).strip():
+            continue
+        try:
+            rows = db.execute(q, {"rn": str(rn).strip()}).fetchall()
+            ids.extend(int(r[0]) for r in rows)
+        except Exception as e:
+            logger.warning(
+                "Could not load questions for round %s in %s: %s", rn, table, e
+            )
+    return ids
+
+
+def _question_meta_for_ids(
+    db: Session, game: GamesList, question_ids: List[int]
+) -> List[dict]:
+    """round_name and question_num for bonus option display."""
+    if not question_ids:
+        return []
+    table = _resolve_game_table_for_list_entry(db, game)
+    out: List[dict] = []
+    q = text(
+        f"SELECT id, round_name, question_num FROM `{table}` WHERE id = :qid LIMIT 1"
+    )
+    for qid in question_ids:
+        try:
+            row = db.execute(q, {"qid": int(qid)}).fetchone()
+            if not row:
+                continue
+            out.append(
+                {
+                    "id": int(row[0]),
+                    "round_name": str(row[1] or ""),
+                    "question_num": row[2],
+                }
+            )
+        except Exception:
+            continue
+    return out
+
+
+def _insert_bonus_option_score_rows(
+    db: Session,
+    scores_table_name: str,
+    game: GamesList,
+    team_id: str,
+    option: dict,
+) -> int:
+    """Insert one active_new_scores row per targeted question (tiers expand to all round questions)."""
+    selection_type = option.get("selection_type", "tier")
+    selected_tiers = option.get("selected_tiers") or []
+    selected_questions = option.get("selected_questions") or []
+    option_name = str(option.get("name") or "")
+    correct_score = option.get("correct_score", 1)
+    wrong_score = option.get("wrong_score", 0)
+
+    question_ids: List[int] = []
+    if selection_type == "tier":
+        question_ids = _question_ids_for_round_names(db, game, selected_tiers)
+    else:
+        for raw in selected_questions:
+            try:
+                question_ids.append(int(raw))
+            except (TypeError, ValueError):
+                continue
+
+    insert_sql = text(
+        f"""
+        INSERT INTO `{scores_table_name}`
+            (team_id, question_id, correct_score, wrong_score, option_name, selection_type)
+        VALUES
+            (:team_id, :question_id, :correct_score, :wrong_score, :option_name, :selection_type)
+        """
+    )
+    insert_sql_legacy = text(
+        f"""
+        INSERT INTO `{scores_table_name}`
+            (team_id, question_id, correct_score, wrong_score, option_name)
+        VALUES
+            (:team_id, :question_id, :correct_score, :wrong_score, :option_name)
+        """
+    )
+    inserted = 0
+    for qid in question_ids:
+        params = {
+            "team_id": int(team_id),
+            "question_id": qid,
+            "correct_score": correct_score,
+            "wrong_score": wrong_score,
+            "option_name": option_name,
+            "selection_type": selection_type,
+        }
+        try:
+            db.execute(insert_sql, params)
+        except Exception:
+            db.execute(
+                insert_sql_legacy,
+                {k: v for k, v in params.items() if k != "selection_type"},
+            )
+        inserted += 1
+    if selection_type == "tier" and selected_tiers and inserted == 0:
+        logger.warning(
+            "Tier bonus option %r matched no questions in rounds %s",
+            option_name,
+            selected_tiers,
+        )
+    return inserted
+
+
 def _validate_list_selections_per_question(round_rows, merged: Dict[int, str]) -> None:
     """Classic mode (type_game == 0): each list question uses its own option pool."""
     for row in round_rows:
@@ -2530,6 +2699,11 @@ async def get_active_games(db: Session = Depends(get_db)):
             game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
             game_name = game.game_name if game else f"Game ID: {active_game.game_id}"
             
+            rounds_summary = (
+                _fetch_game_rounds_summary(db, game_name)
+                if game
+                else {"round_names": [], "round_count": 0, "question_count": 0}
+            )
             game_data = {
                 "id": active_game.id,
                 "game_id": active_game.game_id,
@@ -2541,6 +2715,9 @@ async def get_active_games(db: Session = Depends(get_db)):
                 "timer_on_at": active_game.timer_on_at.isoformat() if active_game.timer_on_at else None,
                 "timer_off_at": active_game.timer_off_at.isoformat() if active_game.timer_off_at else None,
                 "team_ids_finished": active_game.team_ids_finished,
+                "round_names": rounds_summary["round_names"],
+                "round_count": rounds_summary["round_count"],
+                "question_count": rounds_summary["question_count"],
             }
             games_list.append(game_data)
         
@@ -2639,6 +2816,7 @@ async def create_active_game(game_data: ActiveGameCreate, db: Session = Depends(
         # Create temporary tables for the active game
         await _create_temp_tables_for_active_game(db, new_active_game, game, valid_team_ids, game_data.bonus_options)
         
+        rounds_summary = _fetch_game_rounds_summary(db, game.game_name)
         # Return created active game data
         active_game_result = {
             "id": new_active_game.id,
@@ -2650,6 +2828,9 @@ async def create_active_game(game_data: ActiveGameCreate, db: Session = Depends(
             "round_id": new_active_game.round_id,
             "timer_on_at": new_active_game.timer_on_at.isoformat() if new_active_game.timer_on_at else None,
             "timer_off_at": new_active_game.timer_off_at.isoformat() if new_active_game.timer_off_at else None,
+            "round_names": rounds_summary["round_names"],
+            "round_count": rounds_summary["round_count"],
+            "question_count": rounds_summary["question_count"],
         }
         
         return {"success": True, "message": "Active game created successfully", "active_game": active_game_result}
@@ -2764,6 +2945,7 @@ async def _create_temp_tables_for_active_game(db: Session, active_game: ActiveGa
             correct_score FLOAT DEFAULT 1,
             wrong_score FLOAT DEFAULT 0,
             option_name VARCHAR(255),
+            selection_type VARCHAR(32) DEFAULT NULL,
             player_approved INT DEFAULT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -2816,11 +2998,34 @@ async def _create_temp_tables_for_active_game(db: Session, active_game: ActiveGa
         """
         db.execute(text(results_table_sql))
         
+        # Table 3b: Active_teams_start_<game_name> — per-team starting settings
+        start_table_name = f"active_teams_start_{game_name}"
+        start_table_sql = f"""
+        CREATE TABLE `{start_table_name}` (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            team_id INT NOT NULL UNIQUE,
+            max_players INT NOT NULL DEFAULT 12,
+            play_players INT NOT NULL DEFAULT 0,
+            start_points FLOAT NOT NULL DEFAULT 0,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        )
+        """
+        db.execute(text(start_table_sql))
+        
         # Add question columns dynamically based on the game data
         await _add_question_columns_to_results_table(db, results_table_name, game)
         
         # Insert initial data for each team
+        start_insert_sql = text(
+            f"""
+            INSERT INTO `{start_table_name}`
+                (team_id, max_players, play_players, start_points)
+            VALUES
+                (:team_id, 12, 0, 0)
+            """
+        )
         for team_id in team_ids:
+            db.execute(start_insert_sql, {"team_id": int(team_id)})
             # Insert into results table
             results_insert_sql = f"""
             INSERT INTO `{results_table_name}` (team_id, total_score, correct_answers, wrong_answers, total_questions, question_ids)
@@ -2828,28 +3033,11 @@ async def _create_temp_tables_for_active_game(db: Session, active_game: ActiveGa
             """
             db.execute(text(results_insert_sql))
             
-            # Insert bonus options into scores table
+            # Insert bonus options into scores table (one row per question)
             for option in bonus_options:
-                selection_type = option.get('selection_type', 'tier')
-                selected_tiers = option.get('selected_tiers', [])
-                selected_questions = option.get('selected_questions', [])
-                
-                if selection_type == 'tier':
-                    # Insert one row per selected tier
-                    for tier_name in selected_tiers:
-                        scores_insert_sql = f"""
-                        INSERT INTO `{scores_table_name}` (team_id, question_id, correct_score, wrong_score, option_name)
-                        VALUES ({team_id}, 0, {option.get('correct_score', 1)}, {option.get('wrong_score', 0)}, '{option.get('name', '')}')
-                        """
-                        db.execute(text(scores_insert_sql))
-                elif selection_type == 'question':
-                    # Insert one row per selected question
-                    for question_id in selected_questions:
-                        scores_insert_sql = f"""
-                        INSERT INTO `{scores_table_name}` (team_id, question_id, correct_score, wrong_score, option_name)
-                        VALUES ({team_id}, {question_id}, {option.get('correct_score', 1)}, {option.get('wrong_score', 0)}, '{option.get('name', '')}')
-                        """
-                        db.execute(text(scores_insert_sql))
+                _insert_bonus_option_score_rows(
+                    db, scores_table_name, game, team_id, option
+                )
         
         # Table 4: backup_data_<game_name> - for storing rounds_info and last_timer_setting
         backup_table_name = f"backup_data_{game_name}"
@@ -3085,41 +3273,74 @@ async def get_active_game_bonus_options(active_game_id: int, db: Session = Depen
         game_name = game.game_name.replace(' ', '_').replace('-', '_').lower()
         scores_table_name = f"active_new_scores_{game_name}"
         
-        # Get bonus options from the scores table
-        result = db.execute(text(f"SELECT DISTINCT option_name, correct_score, wrong_score, question_id FROM `{scores_table_name}` WHERE option_name IS NOT NULL AND option_name != ''"))
-        rows = result.fetchall()
-        
-        # Group by option name to create bonus options
-        bonus_options = {}
+        # Get bonus options from the scores table (one row per question)
+        try:
+            result = db.execute(
+                text(
+                    f"""
+                    SELECT option_name, correct_score, wrong_score, question_id, selection_type
+                    FROM `{scores_table_name}`
+                    WHERE option_name IS NOT NULL AND option_name != ''
+                    ORDER BY option_name, question_id
+                    """
+                )
+            )
+            rows = result.fetchall()
+        except Exception:
+            result = db.execute(
+                text(
+                    f"""
+                    SELECT option_name, correct_score, wrong_score, question_id, NULL
+                    FROM `{scores_table_name}`
+                    WHERE option_name IS NOT NULL AND option_name != ''
+                    ORDER BY option_name, question_id
+                    """
+                )
+            )
+            rows = result.fetchall()
+
+        bonus_options: Dict[str, dict] = {}
         for row in rows:
             option_name = row[0]
             correct_score = row[1]
             wrong_score = row[2]
             question_id = row[3]
-            
+            row_selection_type = row[4] if len(row) > 4 else None
+
             if option_name not in bonus_options:
                 bonus_options[option_name] = {
-                    'name': option_name,
-                    'correct_score': correct_score,
-                    'wrong_score': wrong_score,
-                    'selection_type': 'question' if question_id > 0 else 'tier',
-                    'selected_tiers': [],
-                    'selected_questions': [],
-                    'question_count': 0
+                    "name": option_name,
+                    "correct_score": correct_score,
+                    "wrong_score": wrong_score,
+                    "selection_type": row_selection_type or "question",
+                    "selected_tiers": [],
+                    "selected_questions": [],
+                    "question_details": [],
+                    "question_count": 0,
                 }
-            
-            # Add question if it exists
-            if question_id and question_id > 0:
-                if str(question_id) not in bonus_options[option_name]['selected_questions']:
-                    bonus_options[option_name]['selected_questions'].append(str(question_id))
-        
-        # Convert to list and calculate question counts
+
+            opt = bonus_options[option_name]
+            if row_selection_type:
+                opt["selection_type"] = row_selection_type
+
+            if question_id and int(question_id) > 0:
+                qid_str = str(int(question_id))
+                if qid_str not in opt["selected_questions"]:
+                    opt["selected_questions"].append(qid_str)
+
         bonus_options_list = []
         for option in bonus_options.values():
-            if option['selection_type'] == 'tier':
-                option['question_count'] = len(option['selected_tiers'])
+            qids = [int(q) for q in option["selected_questions"]]
+            details = _question_meta_for_ids(db, game, qids)
+            option["question_details"] = details
+            round_names = sorted(
+                {d["round_name"] for d in details if d.get("round_name")}
+            )
+            if option["selection_type"] == "tier":
+                option["selected_tiers"] = round_names
+                option["question_count"] = len(details)
             else:
-                option['question_count'] = len(option['selected_questions'])
+                option["question_count"] = len(details)
             bonus_options_list.append(option)
         
         return {
@@ -3130,6 +3351,193 @@ async def get_active_game_bonus_options(active_game_id: int, db: Session = Depen
     except Exception as e:
         logger.error(f"Error getting bonus options: {e}")
         return {"success": False, "message": f"Error getting bonus options: {str(e)}"}
+
+
+def _active_teams_start_table_name(game: GamesList) -> str:
+    game_name = str(game.game_name).replace(" ", "_").replace("-", "_").lower()
+    return f"active_teams_start_{game_name}"
+
+
+def _compute_team_start_total(
+    max_players: int, play_players: int, start_points: float
+) -> float:
+    if max_players >= play_players:
+        return float(start_points)
+    return float(max_players - play_players + start_points)
+
+
+def _ensure_active_teams_start_table(
+    db: Session, game: GamesList, team_ids: List[str]
+) -> str:
+    """Create active_teams_start table and seed missing teams (legacy active games)."""
+    table_name = _active_teams_start_table_name(game)
+    create_sql = f"""
+    CREATE TABLE IF NOT EXISTS `{table_name}` (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        team_id INT NOT NULL UNIQUE,
+        max_players INT NOT NULL DEFAULT 12,
+        play_players INT NOT NULL DEFAULT 0,
+        start_points FLOAT NOT NULL DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )
+    """
+    db.execute(text(create_sql))
+    insert_sql = text(
+        f"""
+        INSERT INTO `{table_name}` (team_id, max_players, play_players, start_points)
+        VALUES (:team_id, 12, 0, 0)
+        """
+    )
+    for team_id in team_ids:
+        tid = int(team_id)
+        existing = db.execute(
+            text(f"SELECT team_id FROM `{table_name}` WHERE team_id = :tid LIMIT 1"),
+            {"tid": tid},
+        ).fetchone()
+        if not existing:
+            db.execute(insert_sql, {"team_id": tid})
+    db.commit()
+    return table_name
+
+
+def _load_active_teams_start_rows(
+    db: Session, game: GamesList, team_ids: List[str]
+) -> List[dict]:
+    if not team_ids:
+        return []
+    table_name = _ensure_active_teams_start_table(db, game, team_ids)
+    rows = db.execute(
+        text(
+            f"""
+            SELECT team_id, max_players, play_players, start_points
+            FROM `{table_name}`
+            WHERE team_id IN ({",".join(str(int(t)) for t in team_ids) if team_ids else "0"})
+            ORDER BY team_id
+            """
+        )
+    ).fetchall()
+    teams_out: List[dict] = []
+    for row in rows:
+        team = db.query(Teams).filter(Teams.id == int(row[0])).first()
+        max_p = int(row[1] if row[1] is not None else 12)
+        play_p = int(row[2] if row[2] is not None else 0)
+        start_p = float(row[3] if row[3] is not None else 0)
+        teams_out.append(
+            {
+                "team_id": int(row[0]),
+                "team_name": team.team_name if team else f"Team {row[0]}",
+                "max_players": max_p,
+                "play_players": play_p,
+                "start_points": start_p,
+                "total": _compute_team_start_total(max_p, play_p, start_p),
+            }
+        )
+    return teams_out
+
+
+class TeamStartSettingUpdate(BaseModel):
+    team_id: int
+    max_players: int = 12
+    play_players: int = 0
+    start_points: float = 0
+
+
+class ActiveGameTeamsStartUpdate(BaseModel):
+    teams: List[TeamStartSettingUpdate]
+
+
+@app.get("/api/admin/active-games/{active_game_id}/teams-start", response_model=dict)
+async def get_active_game_teams_start(active_game_id: int, db: Session = Depends(get_db)):
+    """Per-team starting settings (MaxPlayers, PlayPlayers, StartPoints)."""
+    try:
+        active_game = db.query(ActiveGame).filter(ActiveGame.id == active_game_id).first()
+        if not active_game:
+            return {"success": False, "message": "Active game not found"}
+        game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
+        if not game:
+            return {"success": False, "message": "Game not found"}
+        team_ids = [
+            t.strip()
+            for t in (active_game.teams_ids or "").split(",")
+            if t.strip()
+        ]
+        teams = _load_active_teams_start_rows(db, game, team_ids)
+        return {"success": True, "teams": teams}
+    except Exception as e:
+        logger.error(f"Error getting teams start settings: {e}")
+        return {"success": False, "message": f"Error getting teams start settings: {str(e)}"}
+
+
+@app.put("/api/admin/active-games/{active_game_id}/teams-start", response_model=dict)
+async def update_active_game_teams_start(
+    active_game_id: int,
+    payload: ActiveGameTeamsStartUpdate,
+    db: Session = Depends(get_db),
+):
+    """Update per-team starting settings for an active game."""
+    try:
+        active_game = db.query(ActiveGame).filter(ActiveGame.id == active_game_id).first()
+        if not active_game:
+            return {"success": False, "message": "Active game not found"}
+        game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
+        if not game:
+            return {"success": False, "message": "Game not found"}
+        allowed_team_ids = {
+            int(t.strip())
+            for t in (active_game.teams_ids or "").split(",")
+            if t.strip().isdigit()
+        }
+        if not allowed_team_ids:
+            return {"success": False, "message": "No teams assigned to this active game"}
+        table_name = _ensure_active_teams_start_table(
+            db, game, [str(t) for t in allowed_team_ids]
+        )
+        update_sql = text(
+            f"""
+            UPDATE `{table_name}`
+            SET max_players = :max_players,
+                play_players = :play_players,
+                start_points = :start_points
+            WHERE team_id = :team_id
+            """
+        )
+        updated: List[dict] = []
+        for item in payload.teams:
+            if item.team_id not in allowed_team_ids:
+                continue
+            max_p = int(item.max_players)
+            play_p = int(item.play_players)
+            start_p = float(item.start_points)
+            db.execute(
+                update_sql,
+                {
+                    "team_id": item.team_id,
+                    "max_players": max_p,
+                    "play_players": play_p,
+                    "start_points": start_p,
+                },
+            )
+            team = db.query(Teams).filter(Teams.id == item.team_id).first()
+            updated.append(
+                {
+                    "team_id": item.team_id,
+                    "team_name": team.team_name if team else f"Team {item.team_id}",
+                    "max_players": max_p,
+                    "play_players": play_p,
+                    "start_points": start_p,
+                    "total": _compute_team_start_total(max_p, play_p, start_p),
+                }
+            )
+        db.commit()
+        return {
+            "success": True,
+            "message": "Starting settings updated",
+            "teams": updated,
+        }
+    except Exception as e:
+        logger.error(f"Error updating teams start settings: {e}")
+        db.rollback()
+        return {"success": False, "message": f"Error updating teams start settings: {str(e)}"}
 
 
 @app.get("/api/admin/active-games/{active_game_id}/round-tracking", response_model=dict)
@@ -3722,155 +4130,62 @@ async def select_default_option(request: dict, db: Session = Depends(get_db)):
         logger.error(f"Error selecting default option: {e}")
         return {"success": False, "message": f"Error selecting default option: {str(e)}"}
 
-@app.get("/api/admin/games/{game_id}/structure", response_model=dict)
-async def get_game_structure(game_id: int, db: Session = Depends(get_db)):
-    """
-    Get the structure of a game (tiers and questions) for bonus option creation
-    """
+@app.get("/api/admin/games/{game_id}/rounds", response_model=dict)
+async def get_admin_game_rounds(game_id: int, db: Session = Depends(get_db)):
+    """Round names and question counts from the game table round_name column."""
     try:
-        # Get game from GamesList
         game = db.query(GamesList).filter(GamesList.id == game_id).first()
         if not game:
             return {"success": False, "message": "Game not found"}
-        
-        # Find the actual game table
-        game_table_name = f"{game.game_name}".replace(' ', '_').replace('-', '_').lower()
-        
-        # Try to find the actual game table by checking if it exists
-        result = db.execute(text(f"SHOW TABLES LIKE '{game_table_name}%'"))
-        tables = result.fetchall()
-        
-        if not tables:
-            return {"success": False, "message": f"No game tables found for game: {game.game_name}"}
-        
-        # Use the first table found (assuming it's the main game table)
-        actual_game_table = tables[0][0]
-        
-        # Get the structure of the game table
-        result = db.execute(text(f"DESCRIBE `{actual_game_table}`"))
-        columns = result.fetchall()
-        
-        # Analyze the table structure to identify tiers and questions
-        tiers = []
-        questions = []
-        
-        # Look for tier-related columns (usually contain tier names)
-        tier_columns = []
-        question_columns = []
-        
-        for column in columns:
-            column_name = column[0]
-            column_type = column[1]
-            
-            # Skip the id column
-            if column_name == 'id':
-                continue
-                
-            # Check if this might be a tier column
-            if any(keyword in column_name.lower() for keyword in ['tier', 'round', 'category', 'section']):
-                tier_columns.append(column_name)
-            # Check if this might be a question column
-            elif any(keyword in column_name.lower() for keyword in ['question', 'q', 'answer']):
-                question_columns.append(column_name)
-        
-        # If we found tier columns, get unique tier values
-        if tier_columns:
-            for tier_col in tier_columns:
-                try:
-                    result = db.execute(text(f"SELECT DISTINCT `{tier_col}` FROM `{actual_game_table}` WHERE `{tier_col}` IS NOT NULL AND `{tier_col}` != ''"))
-                    tier_values = result.fetchall()
-                    
-                    for tier_value in tier_values:
-                        tier_name = tier_value[0]
-                        if tier_name:
-                            # Count questions in this tier
-                            count_result = db.execute(text(f"SELECT COUNT(*) FROM `{actual_game_table}` WHERE `{tier_col}` = %s"), (tier_name,))
-                            question_count = count_result.fetchone()[0]
-                            
-                            tiers.append({
-                                'name': tier_name,
-                                'column': tier_col,
-                                'question_count': question_count
-                            })
-                except Exception as e:
-                    logger.warning(f"Could not process tier column {tier_col}: {e}")
-        
-        # If we found question columns, create question entries
-        if question_columns:
-            try:
-                # Get all data to understand question structure
-                result = db.execute(text(f"SELECT * FROM `{actual_game_table}`"))
-                all_rows = result.fetchall()
-                
-                # Get column names
-                column_names = [desc[0] for desc in result.description]
-                
-                for i, row in enumerate(all_rows):
-                    question_data = {}
-                    for j, value in enumerate(row):
-                        if j < len(column_names):
-                            question_data[column_names[j]] = value
-                    
-                    # Label for picker UI: prefer link / meta columns over generic cell scan
-                    question_text = ""
-                    for prefer_key in ("links_for_question", "comments"):
-                        vpref = question_data.get(prefer_key)
-                        if vpref is not None and str(vpref).strip():
-                            question_text = str(vpref).strip()
-                            break
-                    if not question_text:
-                        for col in question_columns:
-                            if col in question_data and question_data[col]:
-                                question_text = str(question_data[col])
-                                break
-                    
-                    questions.append({
-                        'id': i + 1,
-                        'preview': question_text or f"Question {i + 1}",
-                        'data': question_data
-                    })
-                    
-            except Exception as e:
-                logger.warning(f"Could not process questions: {e}")
-        
-        # If no specific tiers/questions found, create generic structure
-        if not tiers and not questions:
-            # Try to get row count to estimate questions
-            try:
-                result = db.execute(text(f"SELECT COUNT(*) FROM `{actual_game_table}`"))
-                row_count = result.fetchone()[0]
-                
-                # Create generic tier
-                tiers.append({
-                    'name': 'All Questions',
-                    'column': 'id',
-                    'question_count': row_count
-                })
-                
-                # Create generic questions for all rows
-                for i in range(row_count):
-                    questions.append({
-                        'id': i + 1,
-                        'preview': f"Question {i + 1}",
-                        'data': {}
-                    })
-                    
-            except Exception as e:
-                logger.warning(f"Could not get row count: {e}")
-        
+        summary = _fetch_game_rounds_summary(
+            db, _resolve_game_table_for_list_entry(db, game)
+        )
+        return {"success": True, **summary}
+    except Exception as e:
+        logger.error(f"Error getting admin game rounds: {e}")
+        return {"success": False, "message": f"Error getting game rounds: {str(e)}"}
+
+
+@app.get("/api/admin/games/{game_id}/structure", response_model=dict)
+async def get_game_structure(game_id: int, db: Session = Depends(get_db)):
+    """
+    Get the structure of a game (tiers/rounds and questions) for bonus option creation.
+    Uses round_name and primary-key id from the game table.
+    """
+    try:
+        game = db.query(GamesList).filter(GamesList.id == game_id).first()
+        if not game:
+            return {"success": False, "message": "Game not found"}
+
+        game_table_name = _resolve_game_table_for_list_entry(db, game)
+        tiers: List[dict] = []
+        questions: List[dict] = []
+        err_msg = ""
+        try:
+            tiers, questions = _load_game_structure_for_bonus(db, game_table_name)
+        except Exception as e:
+            err_msg = str(e)
+            logger.warning(
+                "Could not load Quze game structure for %s (table=%s): %s",
+                game.game_name,
+                game_table_name,
+                e,
+            )
+
         return {
             "success": True,
             "game_info": {
                 "id": game.id,
                 "name": game.game_name,
-                "table_name": actual_game_table
+                "table_name": game_table_name,
             },
             "tiers": tiers,
             "questions": questions,
             "total_tiers": len(tiers),
-            "total_questions": len(questions)
+            "total_questions": len(questions),
+            "message": err_msg if not questions else "",
         }
-        
+
     except Exception as e:
         logger.error(f"Error getting game structure: {e}")
         return {"success": False, "message": f"Error getting game structure: {str(e)}"}
@@ -3894,6 +4209,7 @@ async def _delete_temp_tables_for_active_game(db: Session, active_game: ActiveGa
             f"active_new_scores_{game_name}",
             f"active_teams_answers_{game_name}",
             f"active_teams_results_{game_name}",
+            f"active_teams_start_{game_name}",
             f"active_round_tracking_{game_name}",
         ]
         
@@ -4936,7 +5252,7 @@ async def _update_teams_answers_table(active_game: ActiveGame, db: Session):
             result = db.execute(text(f"""
                 SELECT team_id, question_id, correct_score, wrong_score 
                 FROM `{scores_table_name}` 
-                WHERE team_id IS NOT NULL AND question_id IS NOT NULL
+                WHERE team_id IS NOT NULL AND question_id IS NOT NULL AND question_id > 0
             """))
             for row in result.fetchall():
                 team_id = row[0]
@@ -5365,6 +5681,135 @@ def _fetch_game_question_rows_with_fallback(
     if last_exc is not None:
         raise last_exc
     return [], False, False
+
+
+def _question_preview_from_row_dict(qd: Dict[str, Any]) -> str:
+    for key in ("links_for_question", "comments", "answer1", "answer2"):
+        v = qd.get(key)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    qn = qd.get("question_num")
+    qid = qd.get("id")
+    if qn is not None and str(qn).strip():
+        return f"Question {qn}"
+    return f"Question {qid}"
+
+
+def _load_game_structure_for_bonus_minimal(
+    db: Session, game_table_name: str
+) -> List[dict]:
+    """Fallback when full column set is unavailable."""
+    col_sets = [
+        "id, round_name, question_num, comments, links_for_question",
+        "id, round_name, question_num, comments",
+        "id, round_name, question_num",
+        "id, round_name",
+    ]
+    for cols in col_sets:
+        try:
+            q = text(f"SELECT {cols} FROM `{game_table_name}` ORDER BY id")
+            rows = db.execute(q).fetchall()
+            if not rows:
+                continue
+            names = [c.strip() for c in cols.split(",")]
+            out: List[dict] = []
+            for row in rows:
+                rd = dict(zip(names, row))
+                qd = {
+                    "id": rd.get("id"),
+                    "round_name": rd.get("round_name") or "",
+                    "question_num": rd.get("question_num"),
+                    "comments": rd.get("comments"),
+                    "links_for_question": rd.get("links_for_question"),
+                }
+                out.append(
+                    {
+                        "id": qd["id"],
+                        "round_name": qd.get("round_name") or "",
+                        "question_num": qd.get("question_num"),
+                        "preview": _question_preview_from_row_dict(qd),
+                        "data": qd,
+                    }
+                )
+            return out
+        except Exception as e:
+            logger.debug("Minimal bonus question select (%s) failed: %s", cols, e)
+            continue
+    return []
+
+
+def _load_game_structure_for_bonus(
+    db: Session, game_table_name: str
+) -> tuple[List[dict], List[dict]]:
+    """Tiers (rounds) and questions from Quze game table round_name / id columns."""
+    tiers: List[dict] = []
+    questions: List[dict] = []
+
+    summary = _fetch_game_rounds_summary(db, game_table_name)
+    for rn in summary.get("round_names") or []:
+        tiers.append(
+            {
+                "name": rn,
+                "column": "round_name",
+                "question_count": 0,
+            }
+        )
+    if tiers:
+        count_q = text(
+            f"""
+            SELECT round_name, COUNT(*) AS cnt
+            FROM `{game_table_name}`
+            WHERE round_name IS NOT NULL AND round_name != ''
+            GROUP BY round_name
+            """
+        )
+        try:
+            counts = {str(r[0]): int(r[1]) for r in db.execute(count_q).fetchall()}
+            for t in tiers:
+                t["question_count"] = counts.get(t["name"], 0)
+        except Exception:
+            pass
+
+    try:
+        rows, has_a4, has_l = _fetch_game_question_rows_with_fallback(
+            db, game_table_name, "1=1 ORDER BY id", {}
+        )
+        for r in rows:
+            qd = _game_question_dict_one_row_round(tuple(r), has_a4, has_l)
+            questions.append(
+                {
+                    "id": qd["id"],
+                    "round_name": qd.get("round_name") or "",
+                    "question_num": qd.get("question_num"),
+                    "preview": _question_preview_from_row_dict(qd),
+                    "data": qd,
+                }
+            )
+    except Exception as e:
+        logger.warning(
+            "Full bonus question fetch failed for %s: %s",
+            game_table_name,
+            e,
+        )
+
+    if not questions:
+        questions = _load_game_structure_for_bonus_minimal(db, game_table_name)
+
+    if not tiers and questions:
+        by_round: Dict[str, int] = {}
+        for q in questions:
+            rn = (q.get("round_name") or "").strip() or "Unknown round"
+            by_round[rn] = by_round.get(rn, 0) + 1
+        tiers = [
+            {
+                "name": name,
+                "column": "round_name",
+                "question_count": cnt,
+            }
+            for name, cnt in by_round.items()
+        ]
+
+    return tiers, questions
 
 
 @app.get("/api/games/{game_name}/round/{round_name}")

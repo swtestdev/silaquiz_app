@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../login_page.dart'; // For DatabaseService
+import 'active_game_starting_settings_dialog.dart';
 
 class ActiveGamesPage extends StatefulWidget {
   const ActiveGamesPage({super.key});
@@ -189,6 +190,21 @@ class _ActiveGamesPageState extends State<ActiveGamesPage> {
                       ),
                     ),
                   ),
+                IconButton(
+                  tooltip: 'Game settings',
+                  onPressed: () {
+                    final id = game['id'];
+                    final activeGameId =
+                        id is int ? id : int.tryParse(id?.toString() ?? '');
+                    if (activeGameId == null) return;
+                    ActiveGameStartingSettingsDialog.show(
+                      context,
+                      activeGameId: activeGameId,
+                      gameName: gameName,
+                    );
+                  },
+                  icon: Icon(Icons.settings, color: Colors.grey.shade700),
+                ),
               ],
             ),
             const SizedBox(height: 12),
@@ -1112,9 +1128,8 @@ class _AddActiveGameDialogState extends State<AddActiveGameDialog> {
   Widget _buildBonusOptionCard(int index) {
     final option = _bonusOptions[index];
     final selectionType = option['selection_type'] ?? 'tier';
-    final selectedTiers = option['selected_tiers'] as List? ?? [];
-    final selectedQuestions = option['selected_questions'] as List? ?? [];
-    
+    final selectionLines = _formatBonusSelectionLines(option);
+
     return Card(
       margin: const EdgeInsets.symmetric(vertical: 4),
       child: Padding(
@@ -1147,22 +1162,25 @@ class _AddActiveGameDialogState extends State<AddActiveGameDialog> {
                 fontWeight: FontWeight.w500,
               ),
             ),
-            if (selectionType == 'tier' && selectedTiers.isNotEmpty) ...[
-              const SizedBox(height: 4),
-              Text(
-                'Tiers: ${selectedTiers.join(', ')}',
-                style: const TextStyle(fontSize: 12, color: Colors.grey),
+            if (selectionLines.isNotEmpty) ...[
+              const SizedBox(height: 6),
+              const Text(
+                'Applies to:',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
               ),
-            ],
-            if (selectionType == 'question' && selectedQuestions.isNotEmpty) ...[
-              const SizedBox(height: 4),
-              Text(
-                'Questions: ${selectedQuestions.join(', ')}',
-                style: const TextStyle(fontSize: 12, color: Colors.grey),
+              const SizedBox(height: 2),
+              ...selectionLines.map(
+                (line) => Padding(
+                  padding: const EdgeInsets.only(top: 2),
+                  child: Text(
+                    line,
+                    style: const TextStyle(fontSize: 12, color: Colors.grey),
+                  ),
+                ),
               ),
             ],
             Text(
-              'Total: ${option['question_count']} items',
+              'Total: ${option['question_count'] ?? selectionLines.length} question(s)',
               style: const TextStyle(fontSize: 12, color: Colors.grey),
             ),
           ],
@@ -1171,7 +1189,50 @@ class _AddActiveGameDialogState extends State<AddActiveGameDialog> {
     );
   }
 
+  List<String> _formatBonusSelectionLines(Map<String, dynamic> option) {
+    final rawDetails = option['question_details'];
+    if (rawDetails is List && rawDetails.isNotEmpty) {
+      final byRound = <String, List<String>>{};
+      for (final entry in rawDetails) {
+        if (entry is! Map) continue;
+        final detail = Map<String, dynamic>.from(entry);
+        final roundName =
+            detail['round_name']?.toString().trim().isNotEmpty == true
+                ? detail['round_name'].toString().trim()
+                : 'Unknown round';
+        final qNum = detail['question_num'];
+        final qLabel = qNum != null && '$qNum'.trim().isNotEmpty
+            ? 'Q$qNum'
+            : 'ID ${detail['id']}';
+        byRound.putIfAbsent(roundName, () => []).add(qLabel);
+      }
+      return byRound.entries
+          .map((e) => '${e.key}: ${e.value.join(', ')}')
+          .toList();
+    }
+
+    final selectionType = option['selection_type'] ?? 'tier';
+    final selectedTiers = option['selected_tiers'] as List? ?? [];
+    final selectedQuestions = option['selected_questions'] as List? ?? [];
+    if (selectionType == 'tier' && selectedTiers.isNotEmpty) {
+      return selectedTiers.map((t) => '$t (all questions)').cast<String>().toList();
+    }
+    if (selectionType == 'question' && selectedQuestions.isNotEmpty) {
+      return ['Questions: ${selectedQuestions.join(', ')}'];
+    }
+    return [];
+  }
+
   void _addBonusOption() {
+    if (_selectedGameId == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Please select a game before adding a bonus option.'),
+          backgroundColor: Colors.orange,
+        ),
+      );
+      return;
+    }
     showDialog(
       context: context,
       builder: (context) => AddBonusOptionDialog(
@@ -1280,6 +1341,7 @@ class _AddBonusOptionDialogState extends State<AddBonusOptionDialog> {
   List<String> _selectedQuestions = [];
   String _selectionType = 'tier'; // 'tier' or 'question'
   bool _isLoading = false;
+  String? _loadError;
 
   @override
   void initState() {
@@ -1289,28 +1351,71 @@ class _AddBonusOptionDialogState extends State<AddBonusOptionDialog> {
     }
   }
 
+  @override
+  void didUpdateWidget(covariant AddBonusOptionDialog oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.selectedGameId != widget.selectedGameId &&
+        widget.selectedGameId != null) {
+      _loadGameData();
+    }
+  }
+
   Future<void> _loadGameData() async {
     if (widget.selectedGameId == null) return;
     
     setState(() {
       _isLoading = true;
+      _loadError = null;
     });
 
     try {
-      // Get game structure to load tiers and questions
       final result = await DatabaseService.getGameStructure(widget.selectedGameId!);
       if (result['success'] == true) {
+        final tiers = <Map<String, dynamic>>[];
+        final questions = <Map<String, dynamic>>[];
+        final tiersRaw = result['tiers'];
+        final qRaw = result['questions'];
+        if (tiersRaw is List) {
+          for (final e in tiersRaw) {
+            if (e is Map) {
+              tiers.add(Map<String, dynamic>.from(e));
+            }
+          }
+        }
+        if (qRaw is List) {
+          for (final e in qRaw) {
+            if (e is Map) {
+              questions.add(Map<String, dynamic>.from(e));
+            }
+          }
+        }
         setState(() {
-          _availableTiers = List<Map<String, dynamic>>.from(result['tiers'] ?? []);
-          _availableQuestions = List<Map<String, dynamic>>.from(result['questions'] ?? []);
+          _availableTiers = tiers;
+          _availableQuestions = questions;
+          if (questions.isEmpty && tiers.isEmpty) {
+            final msg = result['message']?.toString().trim();
+            _loadError = (msg != null && msg.isNotEmpty)
+                ? msg
+                : 'No tiers or questions found for the selected game.';
+          }
+        });
+      } else {
+        setState(() {
+          _loadError =
+              result['message']?.toString() ?? 'Failed to load game structure';
         });
       }
     } catch (e) {
+      setState(() {
+        _loadError = 'Error loading game data: $e';
+      });
       print('Error loading game data: $e');
     } finally {
-      setState(() {
-        _isLoading = false;
-      });
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
     }
   }
 
@@ -1440,6 +1545,19 @@ class _AddBonusOptionDialogState extends State<AddBonusOptionDialog> {
                       _buildTierSelection()
                     else if (_selectionType == 'question' && _availableQuestions.isNotEmpty)
                       _buildQuestionSelection()
+                    else if (_loadError != null)
+                      Container(
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: Colors.orange.shade50,
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: Colors.orange.shade200),
+                        ),
+                        child: Text(
+                          _loadError!,
+                          style: TextStyle(color: Colors.orange.shade900),
+                        ),
+                      )
                     else if (widget.selectedGameId == null)
                       Container(
                         padding: const EdgeInsets.all(12),
@@ -1609,6 +1727,16 @@ class _AddBonusOptionDialogState extends State<AddBonusOptionDialog> {
               final preview =
                   question['preview']?.toString().trim() ?? '';
               final nested = question['data'];
+              final roundName = (question['round_name']?.toString().trim().isNotEmpty == true)
+                  ? question['round_name'].toString().trim()
+                  : (nested is Map<String, dynamic>
+                      ? (nested['round_name']?.toString().trim() ?? '')
+                      : '');
+              final qNum = question['question_num'];
+              final qId = question['id'];
+              final questionLabel = qNum != null && '$qNum'.trim().isNotEmpty
+                  ? 'Question $qNum'
+                  : 'Question $qId';
               final linkFromData = nested is Map<String, dynamic>
                   ? (nested['links_for_question']?.toString().trim() ?? '')
                   : '';
@@ -1624,17 +1752,36 @@ class _AddBonusOptionDialogState extends State<AddBonusOptionDialog> {
                           : 'No links or notes'));
               
               return CheckboxListTile(
-                dense: true, // More compact layout
-                title: Text(
-                  'Question ${question['id']}',
-                  style: TextStyle(
-                    fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                    fontSize: 14,
-                  ),
+                dense: true,
+                title: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        questionLabel,
+                        style: TextStyle(
+                          fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                          fontSize: 14,
+                        ),
+                      ),
+                    ),
+                    if (roundName.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(left: 8),
+                        child: Text(
+                          roundName,
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: Colors.blue.shade800,
+                            fontWeight: FontWeight.w600,
+                          ),
+                          textAlign: TextAlign.right,
+                        ),
+                      ),
+                  ],
                 ),
                 subtitle: Text(
                   subtitleText,
-                  maxLines: 2, // Balanced to show content but fit more items
+                  maxLines: 2,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(fontSize: 12),
                 ),
@@ -1690,20 +1837,68 @@ class _AddBonusOptionDialogState extends State<AddBonusOptionDialog> {
   void _addOption() {
     if (!_canAddOption()) return;
 
+    final questionDetails = _buildQuestionDetailsForSelection();
+
     final option = {
       'name': _nameController.text.trim(),
       'correct_score': int.tryParse(_correctScoreController.text) ?? 1,
       'wrong_score': int.tryParse(_wrongScoreController.text) ?? 0,
       'selection_type': _selectionType,
-      'selected_tiers': _selectedTiers,
-      'selected_questions': _selectedQuestions,
-      'question_count': _selectionType == 'tier' 
-          ? _selectedTiers.length 
-          : _selectedQuestions.length,
+      'selected_tiers': List<String>.from(_selectedTiers),
+      'selected_questions': questionDetails
+          .map((q) => q['id'].toString())
+          .toList(),
+      'question_details': questionDetails,
+      'question_count': questionDetails.length,
     };
 
     widget.onOptionAdded(option);
     Navigator.pop(context);
+  }
+
+  List<Map<String, dynamic>> _buildQuestionDetailsForSelection() {
+    final details = <Map<String, dynamic>>[];
+
+    String roundNameFor(Map<String, dynamic> question) {
+      final direct = question['round_name']?.toString().trim();
+      if (direct != null && direct.isNotEmpty) return direct;
+      final nested = question['data'];
+      if (nested is Map) {
+        return nested['round_name']?.toString().trim() ?? '';
+      }
+      return '';
+    }
+
+    if (_selectionType == 'tier') {
+      for (final question in _availableQuestions) {
+        final roundName = roundNameFor(question);
+        if (_selectedTiers.contains(roundName)) {
+          details.add({
+            'id': question['id'],
+            'round_name': roundName,
+            'question_num': question['question_num'],
+          });
+        }
+      }
+      return details;
+    }
+
+    for (final qid in _selectedQuestions) {
+      Map<String, dynamic>? question;
+      for (final q in _availableQuestions) {
+        if (q['id'].toString() == qid) {
+          question = q;
+          break;
+        }
+      }
+      if (question == null) continue;
+      details.add({
+        'id': question['id'],
+        'round_name': roundNameFor(question),
+        'question_num': question['question_num'],
+      });
+    }
+    return details;
   }
 
   @override

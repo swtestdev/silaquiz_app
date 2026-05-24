@@ -984,6 +984,35 @@ class DatabaseService {
     }
   }
 
+  /// Admin: round names and counts from game table round_name column.
+  static Future<Map<String, dynamic>> getAdminGameRounds(int gameId) async {
+    try {
+      final response = await http.get(
+        Uri.parse('$_baseUrl/admin/games/$gameId/rounds'),
+        headers: {'Content-Type': 'application/json'},
+      );
+      final data = jsonDecode(response.body);
+      if (response.statusCode == 200 && data['success'] == true) {
+        return {
+          'success': true,
+          'round_names': List<String>.from(data['round_names'] ?? []),
+          'round_count': data['round_count'] ?? 0,
+          'question_count': data['question_count'] ?? 0,
+        };
+      }
+      return {
+        'success': false,
+        'message': data['message'] ?? 'Failed to get game rounds',
+      };
+    } catch (e) {
+      print('Error getting admin game rounds: $e');
+      return {
+        'success': false,
+        'message': 'Connection failed: ${e.toString()}',
+      };
+    }
+  }
+
   static Future<Map<String, dynamic>> getGameStructure(String gameId) async {
     try {
       final response = await http.get(
@@ -998,7 +1027,8 @@ class DatabaseService {
           'success': true,
           'tiers': data['tiers'],
           'questions': data['questions'],
-          'game_info': data['game_info']
+          'game_info': data['game_info'],
+          'message': data['message'],
         };
       } else {
         return {
@@ -1040,6 +1070,61 @@ class DatabaseService {
       return {
         'success': false,
         'message': 'Connection failed: ${e.toString()}'
+      };
+    }
+  }
+
+  static Future<Map<String, dynamic>> getActiveGameTeamsStart(int activeGameId) async {
+    try {
+      final response = await http.get(
+        Uri.parse('$_baseUrl/admin/active-games/$activeGameId/teams-start'),
+        headers: {'Content-Type': 'application/json'},
+      );
+      final data = jsonDecode(response.body);
+      if (response.statusCode == 200 && data['success'] == true) {
+        return {
+          'success': true,
+          'teams': List<Map<String, dynamic>>.from(data['teams'] ?? []),
+        };
+      }
+      return {
+        'success': false,
+        'message': data['message'] ?? 'Failed to load starting settings',
+      };
+    } catch (e) {
+      return {
+        'success': false,
+        'message': 'Connection failed: ${e.toString()}',
+      };
+    }
+  }
+
+  static Future<Map<String, dynamic>> updateActiveGameTeamsStart(
+    int activeGameId,
+    List<Map<String, dynamic>> teams,
+  ) async {
+    try {
+      final response = await http.put(
+        Uri.parse('$_baseUrl/admin/active-games/$activeGameId/teams-start'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'teams': teams}),
+      );
+      final data = jsonDecode(response.body);
+      if (response.statusCode == 200 && data['success'] == true) {
+        return {
+          'success': true,
+          'message': data['message'],
+          'teams': List<Map<String, dynamic>>.from(data['teams'] ?? []),
+        };
+      }
+      return {
+        'success': false,
+        'message': data['message'] ?? 'Failed to update starting settings',
+      };
+    } catch (e) {
+      return {
+        'success': false,
+        'message': 'Connection failed: ${e.toString()}',
       };
     }
   }
@@ -2954,7 +3039,7 @@ class _EnvSelectorState extends State<_EnvSelector> {
           groupValue: _selected,
           onChanged: (v) {
             if (v == null) return;
-            _apply('http://localhost:8000/api');
+            _apply('http://DESKTOP-638BFEB:8000/api');
           },
         ),
         RadioListTile<String>(
