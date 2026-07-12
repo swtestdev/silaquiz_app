@@ -1,0 +1,36 @@
+---
+description: FastAPI backend conventions for Quze
+globs: team_results_notification/backend_fastapi/**/*.py
+alwaysApply: false
+---
+
+# Backend / FastAPI Rules
+
+## Configuration
+
+- Load config from env: `os.getenv("VAR", "default")`
+- Use `python-dotenv`; document vars in `.env.example`
+- Required: `DATABASE_URL`, `SECRET_KEY` (production), `CORS_ORIGINS`
+
+```python
+from dotenv import load_dotenv
+load_dotenv()
+DATABASE_URL = os.getenv("DATABASE_URL", "mysql+pymysql://...")
+SECRET_KEY = os.getenv("SECRET_KEY", "dev-default")
+```
+
+## API Conventions
+
+- Routes under `/api/` (e.g. `/api/auth/login`, `/api/admin/teams`)
+- Use Pydantic models for request/response
+- Protect admin routes with `get_current_user` and role check
+
+## Database
+
+- SQLAlchemy models in `main.py`; use `SessionLocal` via `Depends(get_db)`
+- Game content tables are dynamic (created when loading Excel)
+
+## Security
+
+- Set `CORS_ORIGINS` in production (comma-separated, not `*`)
+- Never commit `.env`; add to `.gitignore`

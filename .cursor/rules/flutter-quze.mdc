@@ -1,0 +1,39 @@
+---
+description: Flutter/Dart conventions for Quze PWA
+globs: team_results_notification/**/*.dart
+alwaysApply: false
+---
+
+# Flutter / Quze PWA Rules
+
+## Layout and Responsiveness
+
+- Use `ResponsiveBreakpoints` from `lib/widgets/responsive_layout.dart` for breakpoints
+- Phone: < 600px | Tablet: 600-1024px | Desktop: >= 1024px
+- Use `kMinTouchTargetSize` (44.0) for buttons, list tiles, checkboxes
+
+```dart
+// Use ResponsiveBreakpoints for layout
+if (ResponsiveBreakpoints.isPhone(context)) { ... }
+final isSmallScreen = MediaQuery.sizeOf(context).width < 600;
+
+// Min touch target for interactive elements
+SizedBox(height: kMinTouchTargetSize, child: ElevatedButton(...));
+```
+
+## API and Config
+
+- API base URL: use `ApiConfigService.getApiBaseUrl()` / `ApiConfigService.setApiBaseUrl()`
+- All HTTP calls go through `DatabaseService` in `login_page.dart`; use `DatabaseService.baseUrl`
+- WebSocket URL: `DatabaseService.getWebSocketUrl(userId)`
+
+## Structure
+
+- Pages in `lib/pages/`, admin pages in `lib/pages/admin/`
+- Services in `lib/services/` (e.g. `UserDataService`, `ApiConfigService`)
+- Shared widgets in `lib/widgets/`
+
+## PWA
+
+- Brand: Quze in `web/manifest.json`, `web/index.html`, `lib/main.dart`
+- Manifest: include `display_override: ["standalone", "minimal-ui"]`

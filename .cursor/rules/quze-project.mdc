@@ -1,0 +1,20 @@
+---
+description: Quze game PWA - core project conventions
+alwaysApply: true
+---
+
+# Quze Project Rules
+
+## Project Overview
+
+Quze is a team-based quiz PWA (Flutter + FastAPI + MySQL). Primary targets: mobile and tablet.
+
+- **Frontend**: `team_results_notification/` - Flutter/Dart, PWA
+- **Backend**: `team_results_notification/backend_fastapi/` - Python FastAPI, MySQL
+
+## General
+
+- Use app name **Quze** (not "Quiz Сила Мысли" or "Quiz PWA")
+- Prefer mobile-first layouts; touch targets min 44px
+- Store secrets and config via env vars (backend) / SharedPreferences (Flutter)
+- Document deployment and setup in project root or backend_fastapi
