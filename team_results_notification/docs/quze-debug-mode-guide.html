@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Quze — Debug Mode Guide</title>
+  <style>
+    @page { size: A4; margin: 2cm; }
+    body {
+      font-family: "Segoe UI", Arial, sans-serif;
+      color: #1a1a2e;
+      line-height: 1.55;
+      font-size: 11pt;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    h1 {
+      color: #16213e;
+      border-bottom: 3px solid #0f3460;
+      padding-bottom: 8px;
+      font-size: 22pt;
+      margin-top: 0;
+    }
+    h2 {
+      color: #0f3460;
+      font-size: 14pt;
+      margin-top: 28px;
+      border-left: 4px solid #e94560;
+      padding-left: 10px;
+    }
+    h3 {
+      color: #16213e;
+      font-size: 12pt;
+      margin-top: 18px;
+    }
+    p { margin: 8px 0; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0 18px;
+      font-size: 10pt;
+    }
+    th, td {
+      border: 1px solid #c8d0dc;
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #0f3460;
+      color: #fff;
+      font-weight: 600;
+    }
+    tr:nth-child(even) td { background: #f4f6fa; }
+    code, .url {
+      font-family: Consolas, "Courier New", monospace;
+      background: #eef1f6;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-size: 9.5pt;
+      word-break: break-all;
+    }
+    pre {
+      background: #1a1a2e;
+      color: #e8e8e8;
+      padding: 14px 16px;
+      border-radius: 6px;
+      font-size: 9.5pt;
+      line-height: 1.45;
+      overflow-wrap: break-word;
+      white-space: pre-wrap;
+    }
+    .note {
+      background: #fff8e6;
+      border-left: 4px solid #f0a500;
+      padding: 10px 14px;
+      margin: 14px 0;
+      font-size: 10pt;
+    }
+    .steps {
+      background: #e8f4fd;
+      border: 1px solid #b8d4ef;
+      padding: 14px 16px;
+      border-radius: 6px;
+      margin: 20px 0;
+    }
+    ul { margin: 8px 0; padding-left: 22px; }
+    li { margin: 4px 0; }
+    .footer {
+      margin-top: 36px;
+      padding-top: 12px;
+      border-top: 1px solid #ccc;
+      font-size: 9pt;
+      color: #666;
+      text-align: center;
+    }
+    .subtitle { color: #555; font-size: 12pt; margin-top: -8px; }
+  </style>
+</head>
+<body>
+
+  <h1>Quze — Debug Mode (Web)</h1>
+  <p class="subtitle">On-screen debug console for troubleshooting</p>
+
+  <h2>How debug is enabled</h2>
+  <p>Debug mode on the web app is controlled by a <strong>URL query parameter</strong>, not a separate build flag.</p>
+  <p>In <code>main.dart</code>, debug is enabled when:</p>
+  <pre>kIsWeb &amp;&amp; Uri.base.queryParameters['debug']?.toLowerCase() == 'true'</pre>
+  <p>That turns on an on-screen <strong>Debug console</strong> overlay (logs, errors, <code>print()</code> output).</p>
+
+  <h2>URL to send / open</h2>
+  <p>Same app URL as before, with <code>?debug=true</code>:</p>
+  <table>
+    <tr>
+      <th>Setup</th>
+      <th>URL</th>
+    </tr>
+    <tr>
+      <td>HTTP (LAN)</td>
+      <td><span class="url">http://YOUR_PC_IP:8080/?debug=true</span></td>
+    </tr>
+    <tr>
+      <td>HTTPS (LAN)</td>
+      <td><span class="url">https://YOUR_PC_IP:8080/?debug=true</span></td>
+    </tr>
+    <tr>
+      <td>Production</td>
+      <td><span class="url">https://yourdomain.com/?debug=true</span></td>
+    </tr>
+  </table>
+  <p><strong>Examples:</strong></p>
+  <ul>
+    <li><span class="url">http://192.168.2.10:8080/?debug=true</span></li>
+    <li><span class="url">http://192.168.2.10:8080/login?debug=true</span> (also works if you land on login)</li>
+  </ul>
+  <div class="note">
+    <strong>Database Info API URL is unchanged</strong> — still e.g. <span class="url">http://YOUR_PC_IP:8000/api</span> on first use.
+  </div>
+
+  <h2>How to run it locally</h2>
+  <table>
+    <tr>
+      <th>Step</th>
+      <th>Command / action</th>
+    </tr>
+    <tr>
+      <td>Backend</td>
+      <td><code>python backend_fastapi/start_server.py</code> (port 8000)</td>
+    </tr>
+    <tr>
+      <td>Web app</td>
+      <td>Serve <code>build/web</code> on port 8080, or <code>flutter run -d chrome --web-port=8080</code></td>
+    </tr>
+    <tr>
+      <td>Open</td>
+      <td><span class="url">http://YOUR_PC_IP:8080/?debug=true</span> (PC or phone)</td>
+    </tr>
+  </table>
+
+  <h3>During development</h3>
+  <pre>cd team_results_notification
+flutter run -d chrome --web-port=8080</pre>
+  <p>Then in the browser add <code>?debug=true</code> to the address bar (e.g. <span class="url">http://localhost:8080/?debug=true</span>).</p>
+
+  <h2>Notes</h2>
+  <table>
+    <tr>
+      <th>Topic</th>
+      <th>Detail</th>
+    </tr>
+    <tr>
+      <td><strong>Web only</strong></td>
+      <td><code>debug=true</code> has no effect on Android/iOS native builds.</td>
+    </tr>
+    <tr>
+      <td><strong>Installed PWA</strong></td>
+      <td>Home-screen icon usually opens without <code>?debug=true</code> (manifest <code>start_url</code> is <code>.</code>). For debug, open the browser link with <code>?debug=true</code> each time.</td>
+    </tr>
+    <tr>
+      <td><strong>Not Flutter “Debug” banner</strong></td>
+      <td><code>debugShowCheckedModeBanner</code> is off; you get the custom overlay in the bottom-right instead.</td>
+    </tr>
+    <tr>
+      <td><strong>Normal players</strong></td>
+      <td>Use release build <strong>without</strong> <code>?debug=true</code>.</td>
+    </tr>
+    <tr>
+      <td><strong>Troubleshooting</strong></td>
+      <td>Use <code>?debug=true</code> only when diagnosing issues.</td>
+    </tr>
+  </table>
+
+  <div class="steps">
+    <strong>Quick test link (replace IP)</strong>
+    <ol>
+      <li>Open: <span class="url">http://192.168.2.10:8080/?debug=true</span></li>
+      <li>Set API in <strong>Database Info</strong> → Save</li>
+      <li>Log in</li>
+      <li>Debug panel should appear on screen</li>
+    </ol>
+  </div>
+
+  <p class="footer">Quze — team-based quiz PWA</p>
+
+</body>
+</html>

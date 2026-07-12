@@ -195,6 +195,7 @@ class DatabaseService {
           'success': responseData['success'] ?? false,
           'message': responseData['message'] ?? 'Unknown response',
           'should_logout': responseData['should_logout'] ?? false,
+          'logout_reason': responseData['logout_reason'],
           'visible_connected': responseData['visible_connected'] ?? 0,
           'writer_status': responseData['writer_status'] ?? null,
         };
@@ -309,7 +310,7 @@ class DatabaseService {
   }
 
   // Method to logout user
-  static Future<Map<String, dynamic>> logoutUser() async {
+  static Future<Map<String, dynamic>> logoutUser({bool clearLocalData = true}) async {
     try {
       final userData = await UserDataService.getUserData();
       if (userData == null || userData['access_token'] == null) {
@@ -328,8 +329,9 @@ class DatabaseService {
       );
 
       if (response.statusCode == 200) {
-        // Clear local user data
-        await UserDataService.clearUserData();
+        if (clearLocalData) {
+          await UserDataService.clearUserData();
+        }
         return {
           'success': true,
           'message': 'Logout successful'

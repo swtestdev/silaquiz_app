@@ -447,7 +447,12 @@ async def _emit_server_stop_timer(
             _server_fired_stop_ids.clear()
 
         _clear_server_answer_window()
-        _clear_round_track_window()
+        if (
+            _round_track_active
+            and _round_track_ends_at is not None
+            and _utc_now() >= _round_track_ends_at
+        ):
+            _clear_round_track_window()
         now = _utc_now()
         stop_event_id = str(uuid.uuid4())
         payload = {
@@ -1548,24 +1553,34 @@ def _team_answer_item_normalized_slots(it: TeamAnswerItem) -> Tuple[str, str, st
     return (s1, s2, s3, s4)
 
 
+def _normalize_answer_text(raw) -> str:
+    """Trim, collapse internal whitespace, case-fold for answer comparison."""
+    if raw is None:
+        return ""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    return " ".join(s.split()).casefold()
+
+
 def _cell_player_matches_expected(kind: str, expected_cell: str, pv: str) -> bool:
-    pv = (pv or "").strip()
-    if not pv:
+    norm_pv = _normalize_answer_text(pv)
+    if not norm_pv:
         return False
     if kind == "radio":
-        return pv == expected_cell.strip()
+        return norm_pv == _normalize_answer_text(expected_cell)
     if kind == "list":
         # One list pick per answer slot; answer# holds synonym variants separated by ;
-        tokens = [x.strip() for x in pv.split(",") if x.strip()]
+        tokens = [x.strip() for x in str(pv or "").split(",") if x.strip()]
         if len(tokens) != 1:
             return False
-        pick = tokens[0]
+        norm_pick = _normalize_answer_text(tokens[0])
         for syn in _split_synonyms(expected_cell):
-            if pick.casefold() == syn.casefold():
+            if norm_pick == _normalize_answer_text(syn):
                 return True
         return False
     for syn in _split_synonyms(expected_cell):
-        if pv.casefold() == syn.casefold():
+        if norm_pv == _normalize_answer_text(syn):
             return True
     return False
 
@@ -1966,9 +1981,30 @@ async def login_user(user_credentials: UserLogin, db: Session = Depends(get_db))
     }
 
 @app.post("/api/auth/logout")
-async def logout_user(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Logout user and invalidate session token"""
+async def logout_user(
+        credentials: HTTPAuthorizationCredentials = Depends(security),
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)):
+    """Logout user and invalidate session token (only for the active session owner)."""
     try:
+        jwt_session_token = None
+        try:
+            payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+            jwt_session_token = payload.get("session_token")
+        except jwt.PyJWTError:
+            pass
+
+        stored_token = current_user.session_token
+        if stored_token and jwt_session_token and stored_token != jwt_session_token:
+            logger.info(
+                f"Logout skipped for {current_user.email}: stale client session "
+                f"(active session belongs to another login)"
+            )
+            return {
+                "message": "Session already superseded",
+                "skipped": True,
+            }
+
         user_id = current_user.id
         
         # Force disconnect WebSocket connection if user is connected
@@ -1985,7 +2021,7 @@ async def logout_user(current_user: User = Depends(get_current_user), db: Sessio
         
         logger.info(f"User {current_user.email} logged out, session token cleared and marked as not visible/connected")
         
-        return {"message": "Logout successful"}
+        return {"message": "Logout successful", "skipped": False}
         
     except Exception as e:
         logger.error(f"Error during logout: {e}")
@@ -4993,7 +5029,10 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
             _question_track_round_name = round_name
         elif timer_action in ("STOP_TIMER", "PAUSE_TIMER"):
             _clear_server_answer_window()
-            _clear_round_track_window()
+            # Per-slide STOP: keep round tracking open between questions (type_game != 0).
+            # Clear round window only when LAST countdown was active (STOP ends the round early).
+            if _round_track_active and _round_track_ends_at is not None:
+                _clear_round_track_window()
         elif timer_action == "LAST_TIMER":
             _clear_server_answer_window()
 
@@ -6504,7 +6543,8 @@ async def echo_session(
             return {
                 "success": False,
                 "message": "Session token mismatch",
-                "should_logout": True
+                "should_logout": True,
+                "logout_reason": "session_superseded",
             }
         
         # Update last seen timestamp and visible_connected status
@@ -6525,6 +6565,9 @@ async def echo_session(
                 and visibility_reason not in ("connection", "disconnection")
             ):
                 _try_record_player_tracking_event(db, current_user, visibility_reason)
+            elif source == "periodic":
+                periodic_reason = "visible" if app_visible else "invisible"
+                _try_record_player_tracking_event(db, current_user, periodic_reason)
 
             _prev_echo_app_visible[current_user.id] = app_visible
             _echo_app_visible[current_user.id] = app_visible

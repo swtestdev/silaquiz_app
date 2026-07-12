@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Quze — Player Setup Guide</title>
+  <style>
+    @page { size: A4; margin: 2cm; }
+    body {
+      font-family: "Segoe UI", Arial, sans-serif;
+      color: #1a1a2e;
+      line-height: 1.55;
+      font-size: 11pt;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    h1 {
+      color: #16213e;
+      border-bottom: 3px solid #0f3460;
+      padding-bottom: 8px;
+      font-size: 22pt;
+      margin-top: 0;
+    }
+    h2 {
+      color: #0f3460;
+      font-size: 14pt;
+      margin-top: 28px;
+      border-left: 4px solid #e94560;
+      padding-left: 10px;
+    }
+    h3 {
+      color: #16213e;
+      font-size: 12pt;
+      margin-top: 18px;
+    }
+    p { margin: 8px 0; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0 18px;
+      font-size: 10pt;
+    }
+    th, td {
+      border: 1px solid #c8d0dc;
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #0f3460;
+      color: #fff;
+      font-weight: 600;
+    }
+    tr:nth-child(even) td { background: #f4f6fa; }
+    code, .url {
+      font-family: Consolas, "Courier New", monospace;
+      background: #eef1f6;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-size: 9.5pt;
+      word-break: break-all;
+    }
+    pre {
+      background: #1a1a2e;
+      color: #e8e8e8;
+      padding: 14px 16px;
+      border-radius: 6px;
+      font-size: 9.5pt;
+      line-height: 1.45;
+      overflow-wrap: break-word;
+      white-space: pre-wrap;
+    }
+    .note {
+      background: #fff8e6;
+      border-left: 4px solid #f0a500;
+      padding: 10px 14px;
+      margin: 14px 0;
+      font-size: 10pt;
+    }
+    .summary {
+      background: #e8f4fd;
+      border: 1px solid #b8d4ef;
+      padding: 14px 16px;
+      border-radius: 6px;
+      margin: 20px 0;
+    }
+    ul { margin: 8px 0; padding-left: 22px; }
+    li { margin: 4px 0; }
+    .footer {
+      margin-top: 36px;
+      padding-top: 12px;
+      border-top: 1px solid #ccc;
+      font-size: 9pt;
+      color: #666;
+      text-align: center;
+    }
+    .subtitle { color: #555; font-size: 12pt; margin-top: -8px; }
+  </style>
+</head>
+<body>
+
+  <h1>Quze — Player Setup Guide</h1>
+  <p class="subtitle">How to open the game and connect to the server</p>
+
+  <h2>Two URLs — you need both</h2>
+  <p>Quze uses two separate addresses. Players often need both on first launch.</p>
+  <table>
+    <tr>
+      <th>Purpose</th>
+      <th>What it is</th>
+    </tr>
+    <tr>
+      <td><strong>App URL</strong></td>
+      <td>Flutter web PWA — open the game in the browser</td>
+    </tr>
+    <tr>
+      <td><strong>API URL</strong></td>
+      <td>FastAPI backend — set once in <strong>Database Info</strong> on login</td>
+    </tr>
+  </table>
+
+  <h2>1. App URL (open the game in the browser)</h2>
+  <p>This is the <strong>Flutter web PWA</strong>, not the API.</p>
+
+  <h3>Local network (your PC hosts the game)</h3>
+  <p>After building and serving <code>build/web</code>:</p>
+  <table>
+    <tr>
+      <th>Setup</th>
+      <th>URL to give players</th>
+    </tr>
+    <tr>
+      <td>HTTP (e.g. <code>python -m http.server 8080 --bind 0.0.0.0</code>)</td>
+      <td><span class="url">http://YOUR_PC_IP:8080/</span></td>
+    </tr>
+    <tr>
+      <td>HTTPS (recommended on phones)</td>
+      <td><span class="url">https://YOUR_PC_IP:8080/</span></td>
+    </tr>
+  </table>
+  <p>Replace <strong>YOUR_PC_IP</strong> with the PC’s LAN address from <code>ipconfig</code> (e.g. <code>192.168.2.10</code>).</p>
+  <div class="note">
+    <strong>Important:</strong> Do not send <code>localhost</code> or <code>127.0.0.1</code> — that only works on the PC itself.
+  </div>
+  <p><strong>Install on phone:</strong> open that URL → <strong>Add to Home screen</strong> / <strong>Install app</strong> (not browser “Download”).</p>
+
+  <h3>Production / cloud</h3>
+  <p>Use your hosted PWA URL, for example:</p>
+  <p><span class="url">https://quze.yourdomain.com/</span></p>
+  <p>(Firebase, Netlify, Nginx, etc. — see <code>CLOUD_DEPLOYMENT.md</code> in the project.)</p>
+
+  <h2>2. API URL (Database Info on login)</h2>
+  <p>The app talks to FastAPI separately. Default is <code>http://localhost:8000/api</code>, which <strong>does not work on a phone</strong>.</p>
+  <p>On the login screen → <strong>Database Info</strong>, set:</p>
+  <table>
+    <tr>
+      <th>Setup</th>
+      <th>API URL</th>
+    </tr>
+    <tr>
+      <td>Local LAN</td>
+      <td><span class="url">http://YOUR_PC_IP:8000/api</span></td>
+    </tr>
+    <tr>
+      <td>HTTPS backend</td>
+      <td><span class="url">https://YOUR_PC_IP:8000/api</span></td>
+    </tr>
+    <tr>
+      <td>Production (same domain)</td>
+      <td><span class="url">https://yourdomain.com/api</span></td>
+    </tr>
+  </table>
+  <p>Backend must run on <code>0.0.0.0:8000</code> and port <strong>8000</strong> must be reachable (firewall).</p>
+
+  <h2>What to send users (typical LAN setup)</h2>
+  <p><strong>Message example:</strong></p>
+  <pre>Open: http://192.168.2.10:8080/  (or https://... if using HTTPS)
+
+On first launch → Database Info → Server URL:
+http://192.168.2.10:8000/api → Save
+
+Log in and play.</pre>
+  <p>Optional: QR code for the app URL (<code>:8080</code>).</p>
+
+  <h2>Single URL (production, optional)</h2>
+  <p>If Nginx/Caddy serves the PWA at <code>/</code> and proxies <code>/api</code> to FastAPI on the same domain, you can send only:</p>
+  <p><span class="url">https://yourdomain.com/</span></p>
+  <p>API may still need to be set in Database Info unless the app is configured to use the same origin automatically (default is still <code>localhost:8000</code> until the user saves a custom URL).</p>
+
+  <div class="summary">
+    <strong>Summary</strong>
+    <ul>
+      <li>Send players the <strong>:8080</strong> app link.</li>
+      <li>They must set the <strong>:8000/api</strong> server in Database Info on first use.</li>
+      <li>Exception: both deployed under one HTTPS domain with proper config.</li>
+    </ul>
+  </div>
+
+  <h2>Host setup (organizer)</h2>
+  <ol>
+    <li><strong>Backend:</strong> <code>python backend_fastapi/start_server.py</code> (port 8000)</li>
+    <li><strong>Web app:</strong> serve <code>build/web</code> on port 8080:
+      <pre>cd team_results_notification/build/web
+python -m http.server 8080 --bind 0.0.0.0</pre>
+    </li>
+    <li>Share <span class="url">http://YOUR_PC_IP:8080/</span> and <span class="url">http://YOUR_PC_IP:8000/api</span></li>
+  </ol>
+
+  <p class="footer">Quze — team-based quiz PWA</p>
+
+</body>
+</html>

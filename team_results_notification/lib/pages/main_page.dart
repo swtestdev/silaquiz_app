@@ -7,6 +7,7 @@ import '../widgets/user_info_widget.dart';
 import '../services/api_config_service.dart';
 import '../services/user_data_service.dart';
 import '../services/strict_visibility_service.dart';
+import '../services/logout_notice.dart';
 import 'login_page.dart'; // For DatabaseService
 import 'question_page.dart' as question_page; // For timer message forwarding and initializeTimerStatus
 
@@ -27,6 +28,9 @@ class _MainPageState extends State<MainPage> {
   bool _eligibleForActiveGame = false;
   bool _sessionValidationInProgress = false;
   bool _disconnectionHandlerRunning = false;
+  bool _suppressWebSocketReconnect = false;
+  bool _logoutInProgress = false;
+  int _webSocketSessionId = 0;
   Timer? _echoTimer;
   bool _hasShownNotification = false;
   
@@ -100,6 +104,8 @@ class _MainPageState extends State<MainPage> {
 
   Future<void> _loadUserData() async {
     print('=== _loadUserData START ===');
+    _suppressWebSocketReconnect = false;
+    _logoutInProgress = false;
     
     try {
       // Add overall timeout to prevent hanging
@@ -202,7 +208,7 @@ class _MainPageState extends State<MainPage> {
       final timerSettingResult = await DatabaseService.getLastTimerSetting();
       if (timerSettingResult['success'] == true && timerSettingResult['data'] != null) {
         final timerData = timerSettingResult['data'] as Map<String, dynamic>;
-        // Convert to the format expected by _handleGlobalTimer
+        // Convert to the format expected by TimerStore.applyTrigger
         final timerMessage = {
           'type': 'timer_trigger',
           'timer_action': timerData['timer_action'],
@@ -211,10 +217,13 @@ class _MainPageState extends State<MainPage> {
           'timer_start': timerData['timer_start'],
           'question_id': timerData['question_id'],
           'final_timer': timerData['final_timer'],
-          'question_timer': timerData['question_timer']
+          'question_timer': timerData['question_timer'],
+          'event_id': timerData['event_id'],
+          'duration_seconds': timerData['duration_seconds'],
+          'timer_end': timerData['timer_end'],
         };
         // Activate the timer with the retrieved data
-        question_page.forwardTimerMessage(timerMessage);
+        await question_page.forwardTimerMessage(timerMessage);
         print('MainPage: Retrieved and activated last timer setting from server');
       } else {
         print('MainPage: No timer setting available from server');
@@ -631,6 +640,8 @@ class _MainPageState extends State<MainPage> {
           IconButton(
             icon: const Icon(Icons.logout),
             onPressed: () async {
+              _suppressWebSocketReconnect = true;
+              _webSocketSessionId++;
               // Call backend logout API to set visible_connected = 0
               try {
                 await DatabaseService.logoutUser();
@@ -640,7 +651,10 @@ class _MainPageState extends State<MainPage> {
               }
               
               // Close WebSocket connection
-              _channel?.sink.close();
+              try {
+                _channel?.sink.close();
+              } catch (_) {}
+              _channel = null;
               _echoTimer?.cancel();
               
               // Clear timer status on logout
@@ -932,6 +946,7 @@ class _MainPageState extends State<MainPage> {
 
   // WebSocket and Timer Management
   void _connectWebSocket() {
+    if (_suppressWebSocketReconnect || _logoutInProgress) return;
     if (_userId.isEmpty || _userRole != 'player') return;
     
     try {
@@ -1034,6 +1049,7 @@ class _MainPageState extends State<MainPage> {
 
   // Ensure WebSocket is connected, reconnect if needed
   void _ensureWebSocketConnected() {
+    if (_suppressWebSocketReconnect || _logoutInProgress) return;
     if (_userId.isEmpty || _userRole != 'player') return;
     
     // Check if WebSocket is null or closed
@@ -1068,12 +1084,17 @@ class _MainPageState extends State<MainPage> {
 
   // Handle WebSocket disconnection
   void _handleWebSocketDisconnection() {
+    if (_suppressWebSocketReconnect || _logoutInProgress) {
+      print('WebSocket reconnect suppressed (logout in progress)');
+      return;
+    }
     if (_disconnectionHandlerRunning) {
       print('Disconnection handler already running, skipping...');
       return;
     }
     
     _disconnectionHandlerRunning = true;
+    final reconnectSessionId = _webSocketSessionId;
     // Backoff: 1s, 2s, 4s, 8s, 16s, 30s... to avoid reconnect spam when URL is wrong
     final baseUrl = DatabaseService.baseUrl;
     final useBackoff = kIsWeb && baseUrl.contains('localhost');
@@ -1084,7 +1105,10 @@ class _MainPageState extends State<MainPage> {
     print('WebSocket disconnected, reconnecting in ${delaySeconds}s (attempt $_webSocketReconnectAttempts)...');
     
     Future.delayed(Duration(seconds: delaySeconds), () async {
-      if (!mounted) {
+      if (!mounted ||
+          _suppressWebSocketReconnect ||
+          _logoutInProgress ||
+          reconnectSessionId != _webSocketSessionId) {
         _disconnectionHandlerRunning = false;
         return;
       }
@@ -1098,7 +1122,10 @@ class _MainPageState extends State<MainPage> {
       
       // Also check login status with backend (more thorough)
       Future.delayed(const Duration(seconds: 1), () async {
-        if (!mounted) {
+        if (!mounted ||
+            _suppressWebSocketReconnect ||
+            _logoutInProgress ||
+            reconnectSessionId != _webSocketSessionId) {
           _disconnectionHandlerRunning = false;
           return;
         }
@@ -1118,7 +1145,7 @@ class _MainPageState extends State<MainPage> {
               }
             } else {
               print('No valid local data, logging out user');
-              await _logoutUser();
+              await _logoutUser(reason: LogoutReason.signedOut);
             }
           } else {
             print('User still logged in after WebSocket disconnection, ensuring WebSocket is connected...');
@@ -1138,7 +1165,7 @@ class _MainPageState extends State<MainPage> {
             }
           } else {
             print('No valid local data and network error, logging out user');
-            await _logoutUser();
+            await _logoutUser(reason: LogoutReason.signedOut);
           }
         }
         
@@ -1148,46 +1175,83 @@ class _MainPageState extends State<MainPage> {
   }
 
   // Logout user and redirect to login
-  Future<void> _logoutUser() async {
+  Future<void> _logoutUser({
+    LogoutReason reason = LogoutReason.signedOut,
+    String? backendMessage,
+  }) async {
+    if (_logoutInProgress) return;
+    _logoutInProgress = true;
+    _suppressWebSocketReconnect = true;
+    _webSocketSessionId++;
+
+    _echoTimer?.cancel();
     try {
-      // Call backend logout API to set visible_connected = 0
-      try {
-        await DatabaseService.logoutUser();
-      } catch (e) {
-        print('Error calling logout API: $e');
-        // Continue with logout even if API call fails
-      }
-      
-      // Close WebSocket connection
       _channel?.sink.close();
-      
-      // Cancel timers
-      _echoTimer?.cancel();
-      
-      // Clear timer status on logout
-      await question_page.initializeTimerStatus();
-      
-      // Clear user data
-      await UserDataService.clearUserData();
-      
-      // Show logout message
+    } catch (e) {
+      print('Error closing WebSocket during logout: $e');
+    }
+    _channel = null;
+
+    final title = LogoutNotice.titleFor(reason);
+    final userMessage = LogoutNotice.userMessage(
+      reason: reason,
+      backendMessage: backendMessage,
+    );
+
+    try {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('You have been logged out due to login from another device'),
-            backgroundColor: Colors.orange,
-            duration: Duration(seconds: 3),
+        await showDialog<void>(
+          context: context,
+          barrierDismissible: false,
+          builder: (dialogContext) => AlertDialog(
+            icon: Icon(
+              reason == LogoutReason.sessionTakenElsewhere
+                  ? Icons.devices_other
+                  : Icons.logout,
+              color: Colors.orange.shade700,
+              size: 32,
+            ),
+            title: Text(title),
+            content: Text(userMessage),
+            actions: [
+              FilledButton(
+                onPressed: () => Navigator.of(dialogContext).pop(),
+                child: const Text('Sign in again'),
+              ),
+            ],
           ),
         );
-        
-        // Redirect to login page
-        Navigator.pushReplacementNamed(context, '/login');
       }
-    } catch (e) {
-      print('Error during logout: $e');
-      // Even if there's an error, redirect to login
-      if (mounted) {
-        Navigator.pushReplacementNamed(context, '/login');
+
+      try {
+        // Superseded sessions must not call server logout — that would invalidate
+        // the active session on the device that logged in most recently.
+        if (reason != LogoutReason.sessionTakenElsewhere) {
+          try {
+            await DatabaseService.logoutUser(clearLocalData: false);
+          } catch (e) {
+            print('Error calling logout API: $e');
+          }
+        } else {
+          print('Forced logout (session superseded): skipping server logout API');
+        }
+
+        await question_page.initializeTimerStatus();
+        await UserDataService.clearUserData();
+
+        if (mounted) {
+          Navigator.pushReplacementNamed(context, '/login');
+        }
+      } catch (e) {
+        print('Error during logout: $e');
+        if (mounted) {
+          Navigator.pushReplacementNamed(context, '/login');
+        }
+      }
+    } finally {
+      // Keep the guard active until this route is gone (prevents duplicate logout UI).
+      if (!mounted) {
+        _logoutInProgress = false;
       }
     }
   }
@@ -1411,7 +1475,14 @@ class _MainPageState extends State<MainPage> {
         if (echoResult['should_logout'] == true) {
           print('ECHO call indicates session invalid, logging out user');
           timer.cancel();
-          await _logoutUser();
+          final backendMsg = echoResult['message'] as String?;
+          final logoutReason = echoResult['logout_reason'] as String?;
+          final reason = LogoutNotice.reasonFromBackendMessage(
+                backendMsg,
+                logoutReason: logoutReason,
+              ) ??
+              LogoutReason.sessionTakenElsewhere;
+          await _logoutUser(reason: reason, backendMessage: backendMsg);
         } else if (echoResult['success'] == true) {
           // ECHO call successful, ensure WebSocket is connected
           if (_userRole == 'player') {
@@ -1471,7 +1542,10 @@ class _MainPageState extends State<MainPage> {
         if (sessionResult['success'] == false) {
           print('Periodic session validation failed, logging out user');
           timer.cancel();
-          await _logoutUser();
+          final backendMsg = sessionResult['message'] as String?;
+          final reason = LogoutNotice.reasonFromBackendMessage(backendMsg) ??
+              LogoutReason.sessionExpired;
+          await _logoutUser(reason: reason, backendMessage: backendMsg);
         } else {
           print('Periodic session validation successful');
         }
