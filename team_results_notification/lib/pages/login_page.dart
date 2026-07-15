@@ -196,6 +196,7 @@ class DatabaseService {
           'message': responseData['message'] ?? 'Unknown response',
           'should_logout': responseData['should_logout'] ?? false,
           'logout_reason': responseData['logout_reason'],
+          'active_timers': responseData['active_timers'],
           'visible_connected': responseData['visible_connected'] ?? 0,
           'writer_status': responseData['writer_status'] ?? null,
         };
@@ -347,6 +348,38 @@ class DatabaseService {
       return {
         'success': false,
         'message': 'Logout failed: ${e.toString()}'
+      };
+    }
+  }
+
+  // Get active timer windows from server (Option C)
+  static Future<Map<String, dynamic>> getActiveTimers() async {
+    try {
+      final result = await _makeApiCall('/timer/active');
+      if (result['success'] == true && result['data'] != null) {
+        final backendResponse = result['data'] as Map<String, dynamic>;
+        if (backendResponse['success'] == true && backendResponse['data'] != null) {
+          return {
+            'success': true,
+            'data': backendResponse['data'] as Map<String, dynamic>,
+          };
+        }
+        return {
+          'success': false,
+          'message': backendResponse['message'] ?? 'No active timer snapshot',
+          'data': null,
+        };
+      }
+      return {
+        'success': false,
+        'message': result['message'] ?? 'No active timer snapshot',
+        'data': null,
+      };
+    } catch (e) {
+      return {
+        'success': false,
+        'message': 'Error getting active timers: ${e.toString()}',
+        'data': null,
       };
     }
   }

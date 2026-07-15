@@ -293,6 +293,159 @@ class TimerStore {
     }
   }
 
+  static const int driftThresholdSeconds = 2;
+
+  int _remainingFromWindow(Map<String, dynamic>? window) {
+    if (window == null || window['active'] != true) return 0;
+    final ends = parseUtc(window['timer_end'] as String?);
+    if (ends == null) return 0;
+    final sec = ends.difference(DateTime.now().toUtc()).inSeconds;
+    return sec < 0 ? 0 : sec;
+  }
+
+  TimerSession? _sessionFromWindow(
+    Map<String, dynamic>? window,
+    TimerSessionKind kind,
+  ) {
+    if (window == null || window['active'] != true) return null;
+    final ends = parseUtc(window['timer_end'] as String?);
+    final started = parseUtc(window['timer_start'] as String?);
+    if (ends == null || started == null) return null;
+    if (!ends.isAfter(DateTime.now().toUtc())) return null;
+    final duration = parseInt(window['duration_seconds']);
+    final total = duration > 0 ? duration : ends.difference(started).inSeconds;
+    return TimerSession(
+      eventId: window['event_id']?.toString() ?? '',
+      kind: kind,
+      roundName: window['round_name']?.toString() ?? '',
+      startedAtUtc: started,
+      endsAtUtc: ends,
+      totalSeconds: total,
+    );
+  }
+
+  /// Fallback when [round_final_window] is inactive but [last_trigger] is a live LAST.
+  TimerSession? _sessionFromLastTrigger(
+    Map<String, dynamic>? lastTrigger,
+    TimerSessionKind kind,
+  ) {
+    if (lastTrigger == null || kind != TimerSessionKind.roundFinal) return null;
+    if (lastTrigger['timer_action'] != 'LAST_TIMER') return null;
+    final now = DateTime.now().toUtc();
+    final ends = parseUtc(lastTrigger['timer_end'] as String?);
+    if (ends == null || !ends.isAfter(now)) return null;
+    final started = parseUtc(lastTrigger['timer_start'] as String?);
+    final duration = parseInt(lastTrigger['duration_seconds']);
+    final ft = parseInt(lastTrigger['final_timer']);
+    final total = duration > 0 ? duration : ft.abs();
+    if (total <= 0) return null;
+    final start = started ?? ends.subtract(Duration(seconds: total));
+    return TimerSession(
+      eventId: lastTrigger['event_id']?.toString() ?? '',
+      kind: kind,
+      roundName: lastTrigger['round_name']?.toString() ?? '',
+      startedAtUtc: start,
+      endsAtUtc: ends,
+      totalSeconds: total,
+    );
+  }
+
+  TimerSession? _mergeRoundSessionFromSnapshot(
+    Map<String, dynamic> snapshot,
+    DateTime now, {
+    required bool force,
+  }) {
+    final rWin = snapshot['round_final_window'] as Map<String, dynamic>?;
+    final fromWindow =
+        _sessionFromWindow(rWin, TimerSessionKind.roundFinal);
+    if (fromWindow != null) return fromWindow;
+
+    final lastTrigger = snapshot['last_trigger'];
+    if (lastTrigger is Map<String, dynamic>) {
+      final fromTrigger =
+          _sessionFromLastTrigger(lastTrigger, TimerSessionKind.roundFinal);
+      if (fromTrigger != null) return fromTrigger;
+    }
+
+    if (!force && _roundFinalSession?.isActiveAt(now) == true) {
+      return _roundFinalSession;
+    }
+    return null;
+  }
+
+  /// True when local sessions differ from server or drift exceeds [driftThresholdSeconds].
+  Future<bool> needsSyncFromActiveSnapshot(Map<String, dynamic> snapshot) async {
+    await _expireSessionsIfNeeded();
+    final now = DateTime.now().toUtc();
+
+    final qWin = snapshot['question_window'] as Map<String, dynamic>?;
+    final rWin = snapshot['round_final_window'] as Map<String, dynamic>?;
+    final serverQActive = qWin?['active'] == true;
+    final serverRActive = rWin?['active'] == true;
+    final localQActive = _questionSession?.isActiveAt(now) ?? false;
+    final localRActive = _roundFinalSession?.isActiveAt(now) ?? false;
+
+    if (serverQActive != localQActive) return true;
+    if (serverRActive != localRActive) return true;
+
+    if (serverQActive) {
+      final serverRem = _remainingFromWindow(qWin);
+      final localRem = _questionSession?.remainingSecondsAt(now) ?? 0;
+      if ((serverRem - localRem).abs() > driftThresholdSeconds) return true;
+    }
+    if (serverRActive) {
+      final serverRem = _remainingFromWindow(rWin);
+      final localRem = _roundFinalSession?.remainingSecondsAt(now) ?? 0;
+      if ((serverRem - localRem).abs() > driftThresholdSeconds) return true;
+    }
+    return false;
+  }
+
+  /// Apply server dual-window snapshot (Option C). Use [force] on login/resume/main load.
+  Future<void> syncFromActiveSnapshot(
+    Map<String, dynamic> snapshot, {
+    bool force = false,
+  }) async {
+    if (!force && !await needsSyncFromActiveSnapshot(snapshot)) return;
+
+    final now = DateTime.now().toUtc();
+    final qWin = snapshot['question_window'] as Map<String, dynamic>?;
+
+    var newQuestion =
+        _sessionFromWindow(qWin, TimerSessionKind.question);
+    if (newQuestion == null &&
+        !force &&
+        (_questionSession?.isActiveAt(now) ?? false)) {
+      newQuestion = _questionSession;
+    }
+    _questionSession = newQuestion;
+    _roundFinalSession = _mergeRoundSessionFromSnapshot(
+      snapshot,
+      now,
+      force: force,
+    );
+
+    final prefs = await SharedPreferences.getInstance();
+    final lastTrigger = snapshot['last_trigger'];
+    if (lastTrigger is Map<String, dynamic>) {
+      await prefs.setString('last_timer_action_data', jsonEncode(lastTrigger));
+      final ft = parseInt(lastTrigger['final_timer']);
+      if (ft != 0) {
+        await prefs.setInt('cached_round_timer', ft);
+      }
+    }
+
+    await _persistSessions();
+    await _syncLegacyPrefs();
+    if ((_questionSession?.isActiveAt(DateTime.now().toUtc()) ?? false) ||
+        (_roundFinalSession?.isActiveAt(DateTime.now().toUtc()) ?? false)) {
+      _ensureTicker();
+    } else {
+      _stopTickerIfIdle();
+    }
+    _notify();
+  }
+
   Map<String, dynamic>? _decodeJson(String? raw) {
     if (raw == null || raw.isEmpty) return null;
     try {

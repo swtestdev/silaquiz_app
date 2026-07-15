@@ -62,6 +62,13 @@ Future<Map<String, dynamic>> getCurrentTimerStatus() async {
   }
 }
 
+Future<void> applyActiveTimersSnapshot(
+  Map<String, dynamic> snapshot, {
+  bool force = false,
+}) async {
+  await TimerStore.instance.syncFromActiveSnapshot(snapshot, force: force);
+}
+
 Future<void> forwardTimerMessage(Map<String, dynamic> message) async {
   await TimerStore.instance.applyTrigger(message);
 
@@ -274,6 +281,9 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
   
   // Auto-save timer (debounced)
   Timer? _autoSaveTimer;
+
+  /// When true, the next [build_question_board] seeds answer fields from the server DB.
+  bool _seedAnswersFromDbOnNextBuild = true;
   
   @override
   void initState() {
@@ -281,22 +291,11 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
     WidgetsBinding.instance.addObserver(this);
 
     StrictVisibilityService.instance.init();
-
-    // Check if page was refreshed
-    // If so, navigate to main page (same as back button behavior)
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted && !Navigator.canPop(context)) {
-        print('QuestionPage: Page refreshed (no navigation history), redirecting to main page');
-        Navigator.pushReplacementNamed(context, '/main');
-        return;
-      }
-    });
     
     unawaited(TimerStore.instance.loadFromPrefs().then((_) {
       if (mounted) _syncUiFromTimerStore();
     }));
     TimerStore.instance.addListener(_onTimerStoreUpdate);
-    _loadUserData();
     _initializeAnswers(1); // Default to 1 answer
     _startWriterStatusCheck();
     
@@ -304,8 +303,60 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
     _globalTimerMessageHandler = _handleTimerTrigger;
     print('QuestionPage: Registered for timer messages');
     
-    // Try to load question board from last_timer_setting if available
-    _loadQuestionBoardFromLastTimer();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(_verifyWriterAccessAndInit());
+    });
+  }
+
+  /// Writers only. Non-writers are sent back to Main; writers load the board (DB seed on first open).
+  Future<void> _verifyWriterAccessAndInit() async {
+    try {
+      final userData = await UserDataService.getUserData();
+      final isWriter = userData?['writer'] == true;
+      if (!mounted) return;
+
+      if (!isWriter) {
+        print('QuestionPage: Non-writer blocked from quiz page');
+        _redirectNonWriterToMain(
+          'Only the team writer can access the quiz page. Use View Results to review answers.',
+        );
+        return;
+      }
+
+      setState(() {
+        _isWriter = true;
+      });
+      await _loadQuestionBoardFromLastTimer();
+    } catch (e) {
+      print('QuestionPage: _verifyWriterAccessAndInit failed: $e');
+    }
+  }
+
+  void _redirectNonWriterToMain(String message) {
+    if (!mounted) return;
+    _globalTimerMessageHandler = null;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        duration: const Duration(seconds: 4),
+        backgroundColor: Colors.orange,
+      ),
+    );
+    Navigator.pushReplacementNamed(context, '/main');
+  }
+
+  Future<void> _reloadAnswersFromDb({bool showSnackBar = false}) async {
+    _seedAnswersFromDbOnNextBuild = true;
+    await _handleRefresh(quiet: !showSnackBar, seedFromDb: true);
+    if (showSnackBar && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Answers loaded from team server'),
+          duration: Duration(seconds: 3),
+          backgroundColor: Colors.green,
+        ),
+      );
+    }
   }
 
   @override
@@ -323,6 +374,13 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
         return;
       }
       await TimerStore.instance.getCurrentTimerStatus();
+      final activeResult = await DatabaseService.getActiveTimers();
+      if (activeResult['success'] == true && activeResult['data'] != null) {
+        await TimerStore.instance.syncFromActiveSnapshot(
+          activeResult['data'] as Map<String, dynamic>,
+          force: true,
+        );
+      }
       if (mounted) _syncUiFromTimerStore();
       await _updateAnswerEditability();
     } catch (e) {
@@ -546,19 +604,6 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
     });
   }
 
-  Future<void> _loadUserData() async {
-    try {
-      final userData = await UserDataService.getUserData();
-      if (userData != null) {
-        setState(() {
-          _isWriter = userData['writer'] == true;
-        });
-      }
-    } catch (e) {
-      print('Error loading user data: $e');
-    }
-  }
-
   void _startWriterStatusCheck() {
     // Check writer status every 5 seconds
     _writerStatusCheckTimer = Timer.periodic(const Duration(seconds: 5), (_) {
@@ -574,35 +619,24 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
       );
       
       if (echoResult['success'] == true) {
-        // Handle writer status changes
         final writerStatus = echoResult['writer_status'];
         if (writerStatus != null) {
           final isWriter = writerStatus['is_writer'] ?? false;
           
-          // Update writer status if it changed
           if (mounted && _isWriter != isWriter) {
+            final wasWriter = _isWriter;
             setState(() {
               _isWriter = isWriter;
             });
+            unawaited(UserDataService.setWriterFlag(isWriter));
             print('QuestionPage: Writer status updated to: $_isWriter');
-            
-            // Show notification if writer status changed
-            if (isWriter) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text('You are now the writer for your team'),
-                  duration: Duration(seconds: 3),
-                  backgroundColor: Colors.green,
-                ),
+
+            if (!isWriter) {
+              _redirectNonWriterToMain(
+                'Writer privilege has been turned OFF. Returning to main page.',
               );
-            } else {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text('Writer privilege has been turned OFF'),
-                  duration: Duration(seconds: 3),
-                  backgroundColor: Colors.orange,
-                ),
-              );
+            } else if (!wasWriter) {
+              unawaited(_reloadAnswersFromDb(showSnackBar: true));
             }
           }
         }
@@ -860,7 +894,19 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
 
       // Build answers list from game data and saved answers
       print('QuestionPage: Building answers from game data...');
-      await _buildAnswersFromGameData(roundName, questionId, savedAnswers, effectiveActiveGame, teamAnswersFromDb);
+      final seedFromDb = _seedAnswersFromDbOnNextBuild;
+      if (seedFromDb) {
+        _seedAnswersFromDbOnNextBuild = false;
+        print('QuestionPage: Seeding answer fields from server DB');
+      }
+      await _buildAnswersFromGameData(
+        roundName,
+        questionId,
+        savedAnswers,
+        effectiveActiveGame,
+        teamAnswersFromDb,
+        seedAnswersFromDb: seedFromDb,
+      );
       print('QuestionPage: Built ${_answers.length} answers');
       
       // Update game info with specific question data
@@ -1005,8 +1051,9 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
     dynamic questionId,
     Map<int, Map<String, dynamic>> savedAnswers,
     Map<String, dynamic> activeGame,
-    List<Map<String, dynamic>> teamAnswersFromDb,
-  ) async {
+    List<Map<String, dynamic>> teamAnswersFromDb, {
+    bool seedAnswersFromDb = false,
+  }) async {
     // Get game name for saving answers
     final gameName = activeGame['game_name'] as String? ?? 'Current Game';
     try {
@@ -1249,13 +1296,6 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
 
         final slotVals = ['', '', '', ''];
 
-        if (teamAnswerRow.isNotEmpty) {
-          for (var i = 0; i < 4; i++) {
-            final pk = 'player_answer${i + 1}';
-            slotVals[i] = teamAnswerRow[pk]?.toString() ?? '';
-          }
-        }
-
         void applySerializedToSlots(String s) {
           if (kSlots <= 1) {
             slotVals[0] = s;
@@ -1267,8 +1307,17 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
           }
         }
 
+        void applyDbRowToSlots() {
+          if (teamAnswerRow.isEmpty) return;
+          for (var i = 0; i < 4; i++) {
+            final pk = 'player_answer${i + 1}';
+            slotVals[i] = teamAnswerRow[pk]?.toString() ?? '';
+          }
+        }
+
         bool isSelected = savedAnswer?['selected'] as bool? ?? false;
 
+        // Layer 1: local prefs (offline draft fallback)
         final svSav = savedAnswer?['slotValues'];
         if (svSav is List) {
           for (var i = 0; i < svSav.length && i < 4; i++) {
@@ -1281,6 +1330,17 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
           }
         }
 
+        // Layer 2: server DB over local when opening / device switch / writer promotion
+        if (seedAnswersFromDb) {
+          applyDbRowToSlots();
+        } else if (teamAnswerRow.isNotEmpty && existingAnswer == null) {
+          final localEmpty = slotVals.every((s) => s.trim().isEmpty);
+          if (localEmpty) {
+            applyDbRowToSlots();
+          }
+        }
+
+        // Layer 3: in-memory session edits always win
         if (existingAnswer != null) {
           isSelected = existingAnswer['selected'] as bool? ?? isSelected;
           final svEx = existingAnswer['slotValues'];
@@ -1402,6 +1462,11 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
       _bumpAnswerPoolRevision();
       
       print('QuestionPage: Built ${mergedAnswers.length} answers from game data (enabled: ${mergedAnswers.where((a) => a['enabled'] == true).length})');
+
+      if (seedAnswersFromDb) {
+        await _saveAnswers();
+        print('QuestionPage: Synced local answer cache from server DB');
+      }
 
       // Defer scroll to next frame; use double callback to ensure layout is complete
       // (avoids "RenderBox was not laid out" when ensureVisible runs too early)
@@ -2514,7 +2579,7 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
     );
   }
 
-  Future<void> _handleRefresh({bool quiet = false}) async {
+  Future<void> _handleRefresh({bool quiet = false, bool seedFromDb = false}) async {
     try {
       // Reload game data and saved answers
       if (_currentGameNameForStorage.isNotEmpty) {
@@ -2536,11 +2601,8 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
             teamAnswersFromDb = await DatabaseService.getTeamAnswersForGame(gameNameSafe, teamIdInt);
           }
           
-          // Rebuild answers from cached game data and saved answers
-          // Get round name from current message or from first answer
-          String? roundName;
-          if (_answers.isNotEmpty && _gameData.isNotEmpty) {
-            // Try to get round name from game data
+          String? roundName = _roundName.isNotEmpty ? _roundName : null;
+          if (roundName == null && _answers.isNotEmpty && _gameData.isNotEmpty) {
             final firstQuestion = _gameData.values.first;
             roundName = firstQuestion['round_name'] as String?;
           }
@@ -2561,15 +2623,26 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
                   print('Error parsing last_timer_action_data in _handleRefresh: $e');
                 }
               }
-              await _buildAnswersFromGameData(roundName, questionId, savedAnswers, activeGame, teamAnswersFromDb);
+              await _buildAnswersFromGameData(
+                roundName,
+                questionId,
+                savedAnswers,
+                activeGame,
+                teamAnswersFromDb,
+                seedAnswersFromDb: seedFromDb,
+              );
             }
           }
           
           if (mounted && !quiet) {
             ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text('Answers refreshed from saved data'),
-                duration: Duration(seconds: 2),
+              SnackBar(
+                content: Text(
+                  seedFromDb
+                      ? 'Answers refreshed from team server'
+                      : 'Answers refreshed from saved data',
+                ),
+                duration: const Duration(seconds: 2),
               ),
             );
           }

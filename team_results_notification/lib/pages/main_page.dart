@@ -8,6 +8,7 @@ import '../services/api_config_service.dart';
 import '../services/user_data_service.dart';
 import '../services/strict_visibility_service.dart';
 import '../services/logout_notice.dart';
+import '../services/timer_store.dart';
 import 'login_page.dart'; // For DatabaseService
 import 'question_page.dart' as question_page; // For timer message forwarding and initializeTimerStatus
 
@@ -32,6 +33,7 @@ class _MainPageState extends State<MainPage> {
   bool _logoutInProgress = false;
   int _webSocketSessionId = 0;
   Timer? _echoTimer;
+  DateTime? _lastForcedActiveTimerSync;
   bool _hasShownNotification = false;
   
   // Writer status tracking
@@ -200,38 +202,10 @@ class _MainPageState extends State<MainPage> {
       return;
     }
     
-    // Initialize timer status to Idle (in case of refresh or re-login)
-    await question_page.initializeTimerStatus();
-    
-    // Retrieve last timer setting from server and activate if needed
-    try {
-      final timerSettingResult = await DatabaseService.getLastTimerSetting();
-      if (timerSettingResult['success'] == true && timerSettingResult['data'] != null) {
-        final timerData = timerSettingResult['data'] as Map<String, dynamic>;
-        // Convert to the format expected by TimerStore.applyTrigger
-        final timerMessage = {
-          'type': 'timer_trigger',
-          'timer_action': timerData['timer_action'],
-          'slide_number': timerData['slide_number'],
-          'round_name': timerData['round_name'],
-          'timer_start': timerData['timer_start'],
-          'question_id': timerData['question_id'],
-          'final_timer': timerData['final_timer'],
-          'question_timer': timerData['question_timer'],
-          'event_id': timerData['event_id'],
-          'duration_seconds': timerData['duration_seconds'],
-          'timer_end': timerData['timer_end'],
-        };
-        // Activate the timer with the retrieved data
-        await question_page.forwardTimerMessage(timerMessage);
-        print('MainPage: Retrieved and activated last timer setting from server');
-      } else {
-        print('MainPage: No timer setting available from server');
-      }
-    } catch (e) {
-      print('MainPage: Error retrieving last timer setting: $e');
-    }
-    
+    // Soft sync: restore local timers, then apply server-authoritative snapshot (Option C)
+    await TimerStore.instance.loadFromPrefs();
+    await _syncActiveTimersFromServer(force: true);
+
     // Set loading to false to show the UI
     setState(() {
       _isLoading = false;
@@ -831,6 +805,7 @@ class _MainPageState extends State<MainPage> {
     } else {
       // Player buttons
       final canAccess = _hasTeam && _eligibleForActiveGame;
+      final canAccessQuestion = canAccess && _isWriter;
       return Column(
         children: [
           // Timer moved to Question page
@@ -838,18 +813,21 @@ class _MainPageState extends State<MainPage> {
             children: [
               Expanded(
                 child: Opacity(
-                  opacity: canAccess ? 1.0 : 0.5,
+                  opacity: canAccessQuestion ? 1.0 : 0.5,
                   child: _buildActionCard(
                     'Start Quiz',
                     Icons.play_arrow,
                     Colors.green,
-                    canAccess 
+                    canAccessQuestion
                       ? () { Navigator.pushNamed(context, '/question'); }
                       : () {
+                          final message = !canAccess
+                              ? 'Your team is not in the active game, the team must be in an active game to start the quiz'
+                              : 'Only the team writer can open the quiz page. Turn on writer mode or use View Results to review answers.';
                           ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(
-                              content: Text('Your team is not in the active game, the team must be in an active game to start the quiz'),
-                              duration: Duration(seconds: 5),
+                            SnackBar(
+                              content: Text(message),
+                              duration: const Duration(seconds: 5),
                             ),
                           );
                         },
@@ -944,6 +922,38 @@ class _MainPageState extends State<MainPage> {
     );
   }
 
+  /// Pull `/api/timer/active` and merge into [TimerStore] (drift-aware unless [force]).
+  Future<void> _syncActiveTimersFromServer({bool force = false}) async {
+    if (!force && _lastForcedActiveTimerSync != null) {
+      final elapsed = DateTime.now().difference(_lastForcedActiveTimerSync!);
+      if (elapsed.inSeconds < 2) return;
+    }
+    try {
+      final result = await DatabaseService.getActiveTimers();
+      if (result['success'] == true && result['data'] != null) {
+        await question_page.applyActiveTimersSnapshot(
+          result['data'] as Map<String, dynamic>,
+          force: force,
+        );
+        if (force) {
+          _lastForcedActiveTimerSync = DateTime.now();
+        }
+        print('MainPage: Active timer snapshot synced (force=$force)');
+      } else {
+        print('MainPage: No active timer snapshot: ${result['message']}');
+      }
+    } catch (e) {
+      print('MainPage: Error syncing active timers: $e');
+    }
+  }
+
+  Future<void> _applyActiveTimersPayload(
+    Map<String, dynamic> snapshot, {
+    bool force = false,
+  }) async {
+    await question_page.applyActiveTimersSnapshot(snapshot, force: force);
+  }
+
   // WebSocket and Timer Management
   void _connectWebSocket() {
     if (_suppressWebSocketReconnect || _logoutInProgress) return;
@@ -993,6 +1003,12 @@ class _MainPageState extends State<MainPage> {
             if (message['type'] == 'timer_trigger') {
               print('Forwarding timer message to question_page');
               question_page.forwardTimerMessage(message);
+            } else if (message['type'] == 'timer_state') {
+              final snapshot = message['active_timers'];
+              if (snapshot is Map<String, dynamic>) {
+                print('Applying timer_state snapshot from WebSocket');
+                unawaited(_applyActiveTimersPayload(snapshot));
+              }
             }
           } catch (e) {
             print('Error parsing WebSocket message: $e');
@@ -1260,6 +1276,7 @@ class _MainPageState extends State<MainPage> {
     if (!mounted) return;
     if (StrictVisibilityService.instance.isStrictVisible && _userRole == 'player') {
       _ensureWebSocketConnected();
+      unawaited(_syncActiveTimersFromServer(force: true));
     }
     setState(() {});
   }
@@ -1276,11 +1293,9 @@ class _MainPageState extends State<MainPage> {
         _isWriter = isWriter;
         _currentWriterName = currentWriterName;
       });
+      unawaited(UserDataService.setWriterFlag(isWriter));
       
-      // Show notification if writer status changed
-      if (_previousWriterName != null && _currentWriterName != _previousWriterName) {
-        _showWriterStatusNotification();
-      }
+      _showWriterStatusNotification();
     }
   }
 
@@ -1313,6 +1328,7 @@ class _MainPageState extends State<MainPage> {
         setState(() {
           _isWriter = value;
         });
+        await UserDataService.setWriterFlag(value);
         
         // Show success message
         ScaffoldMessenger.of(context).showSnackBar(
@@ -1502,6 +1518,11 @@ class _MainPageState extends State<MainPage> {
           final writerStatus = echoResult['writer_status'];
           if (writerStatus != null) {
             _handleWriterStatusChange(writerStatus);
+          }
+
+          final activeTimers = echoResult['active_timers'];
+          if (activeTimers is Map<String, dynamic>) {
+            await _applyActiveTimersPayload(activeTimers);
           }
         } else {
           // Any non-success from echo means backend may be unavailable – show Offline

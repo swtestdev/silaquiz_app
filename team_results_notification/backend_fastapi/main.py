@@ -72,7 +72,10 @@ for i in range(1, 21):  # rounds 1-20
 
 # Server-side per-question answer timer window (UTC) — writer answer deadline + player tracking
 _server_answer_window_end: Optional[datetime] = None
+_server_answer_window_start: Optional[datetime] = None
 _server_answer_window_question_id: int = 0
+_server_answer_window_duration_sec: int = 0
+_server_answer_window_final_timer: int = 0
 # Echo visibility: transition tracking and last known visible flag (for WS disconnect rules)
 _echo_app_visible: Dict[int, bool] = {}
 _prev_echo_app_visible: Dict[int, Optional[bool]] = {}
@@ -89,6 +92,9 @@ _round_track_active_game_id: int = 0
 _round_track_round_name: str = ""
 _round_track_window_id: str = ""
 _round_track_ends_at: Optional[datetime] = None
+_round_track_start_utc: Optional[datetime] = None
+_round_track_duration_sec: int = 0
+_round_track_final_timer: int = 0
 
 # Player state for transition-only + 3s cooldown (keys: user_id)
 _last_player_track_ws_connected: Dict[int, bool] = {}
@@ -149,11 +155,15 @@ def _echo_tracking_lock_for(user_id: int) -> asyncio.Lock:
 
 def _clear_round_track_window() -> None:
     global _round_track_active, _round_track_active_game_id, _round_track_round_name, _round_track_window_id, _round_track_ends_at
+    global _round_track_start_utc, _round_track_duration_sec, _round_track_final_timer
     _round_track_active = False
     _round_track_active_game_id = 0
     _round_track_round_name = ""
     _round_track_window_id = ""
     _round_track_ends_at = None
+    _round_track_start_utc = None
+    _round_track_duration_sec = 0
+    _round_track_final_timer = 0
 
 
 def _is_round_tracking_window_active() -> bool:
@@ -413,23 +423,155 @@ def _cancel_pending_server_stop() -> None:
 
 
 def _clear_server_answer_window() -> None:
-    global _server_answer_window_end, _server_answer_window_question_id, _question_track_window_id, _question_track_round_name
+    global _server_answer_window_end, _server_answer_window_start, _server_answer_window_question_id
+    global _server_answer_window_duration_sec, _server_answer_window_final_timer
+    global _question_track_window_id, _question_track_round_name
     _server_answer_window_end = None
+    _server_answer_window_start = None
     _server_answer_window_question_id = 0
+    _server_answer_window_duration_sec = 0
+    _server_answer_window_final_timer = 0
     _question_track_window_id = ""
     _question_track_round_name = ""
 
 
-def _set_server_answer_window(end_utc: datetime, question_id: int) -> None:
-    global _server_answer_window_end, _server_answer_window_question_id
+def _set_server_answer_window(
+    start_utc: datetime,
+    end_utc: datetime,
+    question_id: int,
+    *,
+    duration_sec: int,
+    final_timer: int,
+) -> None:
+    global _server_answer_window_end, _server_answer_window_start, _server_answer_window_question_id
+    global _server_answer_window_duration_sec, _server_answer_window_final_timer
+    _server_answer_window_start = start_utc
     _server_answer_window_end = end_utc
     _server_answer_window_question_id = question_id
+    _server_answer_window_duration_sec = duration_sec
+    _server_answer_window_final_timer = final_timer
 
 
 def _is_server_answer_window_active() -> bool:
     if _server_answer_window_end is None or _server_answer_window_question_id <= 0:
         return False
     return _utc_now() < _server_answer_window_end
+
+
+def _inactive_timer_window() -> Dict[str, Any]:
+    return {"active": False}
+
+
+def _active_timer_window(
+    *,
+    active: bool,
+    start_utc: Optional[datetime],
+    end_utc: Optional[datetime],
+    duration_seconds: int,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if (
+        not active
+        or start_utc is None
+        or end_utc is None
+        or duration_seconds <= 0
+        or _utc_now() >= end_utc
+    ):
+        return _inactive_timer_window()
+    payload: Dict[str, Any] = {
+        "active": True,
+        "timer_start": _format_utc_iso_z(start_utc),
+        "timer_end": _format_utc_iso_z(end_utc),
+        "duration_seconds": duration_seconds,
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _build_active_timer_snapshot() -> Dict[str, Any]:
+    """Server-authoritative dual timer windows for Option C reconnect."""
+    now = _utc_now()
+    round_mode = False
+
+    question_extra: Dict[str, Any] = {}
+    if _server_answer_window_question_id > 0:
+        question_extra["question_id"] = _server_answer_window_question_id
+    if _question_track_round_name:
+        question_extra["round_name"] = _question_track_round_name
+    if _server_answer_window_final_timer != 0:
+        round_mode = True
+        question_extra["final_timer"] = _server_answer_window_final_timer
+    if _server_answer_window_duration_sec > 0:
+        question_extra["question_timer"] = _server_answer_window_duration_sec
+
+    question_window = _active_timer_window(
+        active=_is_server_answer_window_active(),
+        start_utc=_server_answer_window_start,
+        end_utc=_server_answer_window_end,
+        duration_seconds=_server_answer_window_duration_sec,
+        extra=question_extra or None,
+    )
+
+    round_extra: Dict[str, Any] = {}
+    if _round_track_round_name:
+        round_extra["round_name"] = _round_track_round_name
+    if _round_track_final_timer != 0:
+        round_mode = True
+        round_extra["final_timer"] = _round_track_final_timer
+    if last_timer_setting:
+        qid = last_timer_setting.get("question_id")
+        if qid is not None and "question_id" not in round_extra:
+            try:
+                qid_int = int(qid)
+                if qid_int > 0:
+                    round_extra["question_id"] = qid_int
+            except (TypeError, ValueError):
+                pass
+
+    round_active = _is_round_tracking_window_active() and _round_track_ends_at is not None
+    round_start = _round_track_start_utc
+    round_duration = _round_track_duration_sec
+    if round_active and _round_track_ends_at is not None and (
+        round_start is None or round_duration <= 0
+    ):
+        # Recover when in-memory track end is set but start/duration were not persisted.
+        if last_timer_setting and last_timer_setting.get("timer_action") == "LAST_TIMER":
+            try:
+                round_duration = abs(
+                    int(
+                        last_timer_setting.get("duration_seconds")
+                        or last_timer_setting.get("final_timer")
+                        or 0
+                    )
+                )
+            except (TypeError, ValueError):
+                round_duration = 0
+            if round_duration > 0:
+                round_start = _round_track_ends_at - timedelta(seconds=round_duration)
+    round_window = _active_timer_window(
+        active=round_active,
+        start_utc=round_start,
+        end_utc=_round_track_ends_at,
+        duration_seconds=round_duration,
+        extra=round_extra or None,
+    )
+
+    if not round_mode and last_timer_setting:
+        try:
+            if int(last_timer_setting.get("final_timer") or 0) != 0:
+                round_mode = True
+        except (TypeError, ValueError):
+            pass
+
+    last_trigger = dict(last_timer_setting) if last_timer_setting else None
+    return {
+        "server_time_utc": _format_utc_iso_z(now),
+        "round_mode": round_mode,
+        "question_window": question_window,
+        "round_final_window": round_window,
+        "last_trigger": last_trigger,
+    }
 
 
 async def _emit_server_stop_timer(
@@ -4745,6 +4887,20 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
         logger.info(f"User {user_id} marked as visible and connected")
         if not replaced_ws:
             _try_record_player_tracking_event(db, user, "connection")
+
+        try:
+            timer_state_msg = json.dumps(
+                {
+                    "type": "timer_state",
+                    "active_timers": _build_active_timer_snapshot(),
+                },
+                default=str,
+                ensure_ascii=False,
+            )
+            await websocket.send_text(timer_state_msg)
+            logger.info(f"Sent timer_state snapshot to user {user_id}")
+        except Exception as e:
+            logger.warning(f"Could not send timer_state to user {user_id}: {e}")
         
         while True:
             # Keep connection alive and listen for any incoming messages
@@ -4787,7 +4943,8 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
     """
     global last_timer_setting, _pending_server_stop_task
     global _question_track_window_id, _question_track_round_name
-    global _round_track_active, _round_track_active_game_id, _round_track_round_name, _round_track_window_id, _round_track_ends_at
+    global _round_track_active, _round_track_active_game_id, _round_track_round_name, _round_track_window_id
+    global _round_track_ends_at, _round_track_start_utc, _round_track_duration_sec, _round_track_final_timer
     logger.info(f">>>>>>> DATA in BEGGINIG >>>>>>> - rounds_info value: {rounds_info}")
     try:
         ts_utc = _utc_now()
@@ -5024,7 +5181,13 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
         # Server timer: cancel previous auto-STOP, update per-question answer window (START only)
         _cancel_pending_server_stop()
         if timer_action == "START_TIME" and question_timer > 0 and _id > 0:
-            _set_server_answer_window(ts_utc + timedelta(seconds=question_timer), _id)
+            _set_server_answer_window(
+                ts_utc,
+                ts_utc + timedelta(seconds=question_timer),
+                _id,
+                duration_sec=int(question_timer),
+                final_timer=int(_timer),
+            )
             _question_track_window_id = f"{active_game.id}:{round_name}:q{_id}:{int(ts_utc.timestamp())}"
             _question_track_round_name = round_name
         elif timer_action in ("STOP_TIMER", "PAUSE_TIMER"):
@@ -5061,6 +5224,9 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
         if timer_action == "LAST_TIMER":
             if _timer != 0 and timer_end_utc is not None:
                 _round_track_ends_at = timer_end_utc
+                _round_track_start_utc = ts_utc
+                _round_track_duration_sec = abs(int(_timer))
+                _round_track_final_timer = int(_timer)
             else:
                 _clear_round_track_window()
 
@@ -6417,6 +6583,24 @@ async def put_team_answers_batch(
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.utcnow()}
 
+@app.get("/api/timer/active")
+async def get_active_timers(current_user: User = Depends(get_current_user)):
+    """
+    Return both live timer windows (question + round-final) for reconnect sync (Option C).
+    Includes last_trigger metadata for question board restore.
+    """
+    try:
+        snapshot = _build_active_timer_snapshot()
+        return {"success": True, "data": snapshot}
+    except Exception as e:
+        logger.error(f"Error getting active timers: {e}")
+        return {
+            "success": False,
+            "message": f"Error getting active timers: {str(e)}",
+            "data": None,
+        }
+
+
 @app.get("/api/timer/last-setting")
 async def get_last_timer_setting(current_user: User = Depends(get_current_user)):
     """
@@ -6607,6 +6791,7 @@ async def echo_session(
             "user_id": current_user.id,
             "email": current_user.email,
             "visible_connected": current_user.visible_connected,
+            "active_timers": _build_active_timer_snapshot(),
             "writer_status": {
                 "is_writer": is_current_user_writer,
                 "current_writer_id": current_writer_id,

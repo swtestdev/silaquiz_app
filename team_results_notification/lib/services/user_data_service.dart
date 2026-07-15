@@ -82,6 +82,18 @@ class UserDataService {
     }
   }
 
+  /// Update cached writer flag after toggle or ECHO writer_status sync.
+  static Future<void> setWriterFlag(bool isWriter) async {
+    try {
+      final userData = await getUserData();
+      if (userData == null) return;
+      userData['writer'] = isWriter;
+      await saveUserData(userData);
+    } catch (e) {
+      print('Error updating writer flag: $e');
+    }
+  }
+
   // Clear user data (logout)
   static Future<void> clearUserData() async {
     try {
