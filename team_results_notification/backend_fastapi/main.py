@@ -821,6 +821,61 @@ def create_action_game_control_table(active_game_id: int, db: Session) -> None:
     except Exception as e:
         logger.error(f"Error creating control table: {e}")
 
+
+def _action_game_control_table_name(game: GamesList) -> str:
+    game_name_safe = str(game.game_name).strip().lower().replace(" ", "_").replace("-", "_")
+    return f"action_game_control_{game_name_safe}"
+
+
+def _action_game_control_table_exists(db: Session, table_name: str) -> bool:
+    try:
+        result = db.execute(text(f"SHOW TABLES LIKE '{table_name}'"))
+        return result.fetchone() is not None
+    except Exception:
+        return False
+
+
+def _round_started_in_control_table(db: Session, game: GamesList, round_name: str) -> bool:
+    """True when action_game_control table exists and has at least one row for round_name."""
+    if not round_name or not str(round_name).strip():
+        return False
+    table_name = _action_game_control_table_name(game)
+    if not _action_game_control_table_exists(db, table_name):
+        return False
+    try:
+        row = db.execute(
+            text(
+                f"SELECT 1 FROM `{table_name}` WHERE round_name = :rn LIMIT 1"
+            ),
+            {"rn": round_name},
+        ).fetchone()
+        return row is not None
+    except Exception as e:
+        logger.warning("Could not check control table for round %r: %s", round_name, e)
+        return False
+
+
+def _started_round_names_in_control_table(db: Session, game: GamesList) -> List[str]:
+    """Distinct round_name values recorded in action_game_control (empty if table missing)."""
+    table_name = _action_game_control_table_name(game)
+    if not _action_game_control_table_exists(db, table_name):
+        return []
+    try:
+        rows = db.execute(
+            text(
+                f"""
+                SELECT DISTINCT round_name FROM `{table_name}`
+                WHERE round_name IS NOT NULL AND round_name != ''
+                ORDER BY round_name
+                """
+            )
+        ).fetchall()
+        return [str(r[0]) for r in rows if r[0]]
+    except Exception as e:
+        logger.warning("Could not list started rounds from %s: %s", table_name, e)
+        return []
+
+
 def populate_rounds_info(active_game_id: int, db: Session):
     """
     Populate the global rounds_info dictionary with round names from the game table
@@ -1776,6 +1831,8 @@ def _persist_multislot_grade(
     ic2 = statuses_by_col.get(2)
     ic3 = statuses_by_col.get(3)
     ic4 = statuses_by_col.get(4)
+    lb = _read_lucky_bonus(db, answers_table, team_id, question_id)
+    stored_final = float(net_score) + lb
 
     stmt = text(
         f"""
@@ -1790,7 +1847,7 @@ def _persist_multislot_grade(
         "ic2": ic2,
         "ic3": ic3,
         "ic4": ic4,
-        "net_score": float(net_score),
+        "net_score": stored_final,
         "tid": team_id,
         "qid": question_id,
     }
@@ -1814,6 +1871,668 @@ def _multislot_net_score(statuses: List[int], correct_pts: float, wrong_pts: flo
         elif s == -1:
             t += wrong_pts
     return t
+
+
+def _question_num_sort_key(qnum: Any, row_id: int = 0) -> Tuple[int, int]:
+    """Numeric order for question_num (avoids 1, 10, 11, 2 lexicographic sort)."""
+    if qnum is None:
+        return (0, row_id)
+    s = str(qnum).strip()
+    if not s:
+        return (0, row_id)
+    try:
+        return (int(float(s)), row_id)
+    except (TypeError, ValueError):
+        m = re.match(r"(\d+)", s)
+        if m:
+            return (int(m.group(1)), row_id)
+        return (0, row_id)
+
+
+def _sort_rows_by_question_num(rows: List[Any], num_index: int = 1, id_index: int = 0) -> List[Any]:
+    return sorted(
+        rows,
+        key=lambda r: _question_num_sort_key(r[num_index], int(r[id_index])),
+    )
+
+
+def _coerce_score_float(v: Any) -> float:
+    if v is None:
+        return 0.0
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _answer_row_has_per_slot_grades(row: Optional[dict]) -> bool:
+    if not row:
+        return False
+    for k in ("is_correct_1", "is_correct_2", "is_correct_3", "is_correct_4"):
+        if row.get(k) is not None:
+            return True
+    return False
+
+
+def _answer_row_is_graded(row: Optional[dict]) -> bool:
+    """True when a persisted question score exists in final_score."""
+    if not row:
+        return False
+    return row.get("final_score") is not None
+
+
+def _read_lucky_bonus(
+    db: Session, answers_table: str, team_id: int, question_id: int
+) -> float:
+    try:
+        row = db.execute(
+            text(
+                f"""
+                SELECT COALESCE(lucky_bonus, 0)
+                FROM `{answers_table}`
+                WHERE team_id = :tid AND question_id = :qid
+                LIMIT 1
+                """
+            ),
+            {"tid": team_id, "qid": question_id},
+        ).fetchone()
+        return _coerce_score_float(row[0]) if row else 0.0
+    except Exception:
+        return 0.0
+
+
+def _answer_row_points_from_final_score(row: Optional[dict]) -> float:
+    """Earned points for admin tables: final_score already includes lucky_bonus."""
+    if not row:
+        return 0.0
+    fs = row.get("final_score")
+    if fs is None:
+        return 0.0
+    return _coerce_score_float(fs)
+
+
+def _answer_row_display_points(row: Optional[dict]) -> float:
+    """Matrix / scoreboard cell value from active_teams_answers_.final_score."""
+    return _answer_row_points_from_final_score(row)
+
+
+def _fetch_team_answer_grade_row(
+    db: Session, answers_table: str, team_id: int, question_id: int
+) -> Optional[dict]:
+    try:
+        row = db.execute(
+            text(
+                f"""
+                SELECT player_answer1, player_answer2, player_answer3, player_answer4,
+                       is_correct_1, is_correct_2, is_correct_3, is_correct_4,
+                       final_score, lucky_bonus, correct_score, wrong_score,
+                       player_id
+                FROM `{answers_table}`
+                WHERE team_id = :tid AND question_id = :qid
+                LIMIT 1
+                """
+            ),
+            {"tid": team_id, "qid": question_id},
+        ).fetchone()
+    except Exception as e:
+        logger.warning(
+            "fetch_team_answer_grade_row failed for %s team=%s q=%s: %s",
+            answers_table,
+            team_id,
+            question_id,
+            e,
+        )
+        return None
+    if not row:
+        return None
+    ic1, ic2, ic3, ic4 = row[4], row[5], row[6], row[7]
+    return {
+        "player_answer1": row[0] or "",
+        "player_answer2": row[1] or "",
+        "player_answer3": row[2] or "",
+        "player_answer4": row[3] or "",
+        "is_correct_1": ic1,
+        "is_correct_2": ic2,
+        "is_correct_3": ic3,
+        "is_correct_4": ic4,
+        "final_score": row[8],
+        "lucky_bonus": row[9],
+        "correct_score": row[10],
+        "wrong_score": row[11],
+        "is_correct": _rollup_is_correct_four(ic1, ic2, ic3, ic4),
+        "player_id": row[12],
+    }
+
+
+def _compute_suggested_grade(
+    kind: str,
+    expected_cells: List[str],
+    ordered_cols: List[int],
+    player_vals: List[str],
+    correct_pts: float,
+    wrong_pts: float,
+) -> Tuple[Dict[int, Optional[int]], float]:
+    """Non-persisted auto-check suggestion for admin grading UI."""
+    k = len(expected_cells)
+    if k == 0:
+        return {1: None, 2: None, 3: None, 4: None}, 0.0
+    any_input = any((v or "").strip() for v in player_vals)
+    if not any_input:
+        st = [0] * k
+    else:
+        try:
+            st = _greedy_multislot_statuses(kind, expected_cells, player_vals)
+        except ValueError:
+            st = [-1] * k
+    net = _multislot_net_score(st, correct_pts, wrong_pts)
+    icmap = _scatter_is_correct_cols(ordered_cols, st)
+    return icmap, net
+
+
+def _build_round_grading_grid(
+    db: Session,
+    active_game: ActiveGame,
+    game: GamesList,
+    round_name: str,
+) -> dict:
+    game_table = _resolve_game_table_for_list_entry(db, game)
+    game_name_safe = str(game.game_name).strip().lower().replace(" ", "_").replace("-", "_")
+    answers_table = f"active_teams_answers_{game_name_safe}"
+
+    rq = text(
+        f"""
+        SELECT id, question_num, answers_for_selection, answer1, answer2, answer3, answer4,
+               reg_score, bonus_score, type_game
+        FROM `{game_table}`
+        WHERE round_name = :rn
+        ORDER BY question_num ASC, id ASC
+        """
+    )
+    qrows = db.execute(rq, {"rn": round_name}).fetchall()
+    qrows = _sort_rows_by_question_num(list(qrows), num_index=1, id_index=0)
+    list_pool = _canonical_list_options_first_in_round(
+        [(r[0], r[1], r[2]) for r in qrows]
+    )
+
+    questions: List[dict] = []
+    for r in qrows:
+        qid, qnum, afs, a1, a2, a3, a4, reg_score, bonus_score, type_game = (
+            int(r[0]),
+            r[1],
+            r[2],
+            r[3],
+            r[4],
+            r[5],
+            r[6],
+            r[7],
+            r[8],
+            r[9],
+        )
+        kind, opts = _parse_answers_for_selection(afs)
+        pairs = _ordered_nonempty_game_cells(a1, a2, a3, a4)
+        kind = _coerce_kind_for_expected_slots(kind, pairs)
+        questions.append(
+            {
+                "question_id": qid,
+                "question_num": qnum,
+                "answers_for_selection": afs or "",
+                "answer1": a1 or "",
+                "answer2": a2 or "",
+                "answer3": a3 or "",
+                "answer4": a4 or "",
+                "reg_score": _coerce_score_float(reg_score),
+                "bonus_score": _coerce_score_float(bonus_score),
+                "type_game": type_game,
+                "kind": kind,
+                "options": opts,
+                "ordered_cols": [p[0] for p in pairs],
+                "list_pool": list_pool if kind == "list" else [],
+            }
+        )
+
+    team_ids = _active_game_team_ids(active_game)
+    teams_meta: List[dict] = []
+    for tid in team_ids:
+        team = db.query(Teams).filter(Teams.id == tid).first()
+        teams_meta.append(
+            {
+                "team_id": tid,
+                "team_name": team.team_name if team else f"Team {tid}",
+            }
+        )
+
+    teams_out: List[dict] = []
+    for tm in teams_meta:
+        tid = tm["team_id"]
+        cells: Dict[str, dict] = {}
+        round_total = 0.0
+        for q in questions:
+            qid = q["question_id"]
+            row = _fetch_team_answer_grade_row(db, answers_table, tid, qid)
+            p1, p2, p3, p4, corr_pts, wrong_pts = _fetch_team_slots_four(
+                db, answers_table, tid, qid
+            )
+            pairs = _ordered_nonempty_game_cells(
+                q["answer1"], q["answer2"], q["answer3"], q["answer4"]
+            )
+            ordered_cols = [p[0] for p in pairs]
+            expected_cells = [p[1] for p in pairs]
+            kind = q["kind"]
+            p_four = [p1, p2, p3, p4]
+            player_vals = [p_four[col - 1] for col in ordered_cols] if ordered_cols else []
+
+            sug_map, sug_net = _compute_suggested_grade(
+                kind,
+                expected_cells,
+                ordered_cols,
+                player_vals,
+                corr_pts if corr_pts else q["reg_score"],
+                wrong_pts,
+            )
+
+            points = _answer_row_display_points(row)
+            round_total += points
+
+            cell = {
+                "points": points,
+                "player_answer1": p1,
+                "player_answer2": p2,
+                "player_answer3": p3,
+                "player_answer4": p4,
+                "is_correct_1": row.get("is_correct_1") if row else None,
+                "is_correct_2": row.get("is_correct_2") if row else None,
+                "is_correct_3": row.get("is_correct_3") if row else None,
+                "is_correct_4": row.get("is_correct_4") if row else None,
+                "final_score": row.get("final_score") if row else None,
+                "lucky_bonus": row.get("lucky_bonus") if row else None,
+                "correct_score": corr_pts if corr_pts else q["reg_score"],
+                "wrong_score": wrong_pts,
+                "suggested_is_correct_1": sug_map.get(1),
+                "suggested_is_correct_2": sug_map.get(2),
+                "suggested_is_correct_3": sug_map.get(3),
+                "suggested_is_correct_4": sug_map.get(4),
+                "suggested_final_score": sug_net,
+                "graded": _answer_row_is_graded(row),
+            }
+            cells[str(qid)] = cell
+
+        teams_out.append(
+            {
+                "team_id": tid,
+                "team_name": tm["team_name"],
+                "round_total": round_total,
+                "cells": cells,
+            }
+        )
+
+    teams_out.sort(key=lambda t: t["round_total"], reverse=True)
+    for i, t in enumerate(teams_out, start=1):
+        t["rank"] = i
+
+    round_type_game = _resolve_type_game_for_round(db, game_table, round_name)
+    round_uses_shared_list = round_type_game != 0 and bool(list_pool)
+
+    return {
+        "round_name": round_name,
+        "active_game_id": active_game.id,
+        "game_name": game.game_name,
+        "questions": questions,
+        "teams": teams_out,
+        "round_type_game": round_type_game,
+        "round_uses_shared_list": round_uses_shared_list,
+        "list_pool": list_pool if round_uses_shared_list else [],
+    }
+
+
+def _round_review_flags(
+    db: Session, game_table: str, round_name: str, qrows: Optional[List[Any]] = None
+) -> Tuple[int, bool, List[str]]:
+    round_type_game = _resolve_type_game_for_round(db, game_table, round_name)
+    if qrows is None:
+        rq = text(
+            f"""
+            SELECT id, question_num, answers_for_selection
+            FROM `{game_table}` WHERE round_name = :rn ORDER BY question_num ASC, id ASC
+            """
+        )
+        qrows = db.execute(rq, {"rn": round_name}).fetchall()
+        qrows = _sort_rows_by_question_num(list(qrows), num_index=1, id_index=0)
+    list_pool = _canonical_list_options_first_in_round(
+        [(r[0], r[1], r[2]) for r in qrows]
+    )
+    round_uses_shared_list = round_type_game != 0 and bool(list_pool)
+    return round_type_game, round_uses_shared_list, list_pool
+
+
+def _fetch_question_row_for_round(
+    db: Session, game_table: str, round_name: str, question_id: int
+) -> Optional[Any]:
+    row = db.execute(
+        text(
+            f"""
+            SELECT id, question_num, answers_for_selection, answer1, answer2, answer3, answer4,
+                   reg_score, bonus_score, type_game, round_name
+            FROM `{game_table}`
+            WHERE id = :qid LIMIT 1
+            """
+        ),
+        {"qid": question_id},
+    ).fetchone()
+    if not row or str(row[10] or "") != str(round_name):
+        return None
+    return row
+
+
+def _question_meta_from_row(row, list_pool: Optional[List[str]] = None) -> dict:
+    qid, qnum, afs, a1, a2, a3, a4, reg_score, bonus_score, type_game, _rn = row
+    kind, opts = _parse_answers_for_selection(afs)
+    pairs = _ordered_nonempty_game_cells(a1, a2, a3, a4)
+    kind = _coerce_kind_for_expected_slots(kind, pairs)
+    return {
+        "question_id": int(qid),
+        "question_num": qnum,
+        "answers_for_selection": afs or "",
+        "answer1": a1 or "",
+        "answer2": a2 or "",
+        "answer3": a3 or "",
+        "answer4": a4 or "",
+        "reg_score": _coerce_score_float(reg_score),
+        "bonus_score": _coerce_score_float(bonus_score),
+        "type_game": type_game,
+        "kind": kind,
+        "options": opts,
+        "ordered_cols": [p[0] for p in pairs],
+        "list_pool": list_pool or ([] if kind != "list" else opts),
+    }
+
+
+def _build_question_review_payload(
+    db: Session,
+    active_game: ActiveGame,
+    game: GamesList,
+    round_name: str,
+    question_id: int,
+) -> dict:
+    game_table = _resolve_game_table_for_list_entry(db, game)
+    game_name_safe = str(game.game_name).strip().lower().replace(" ", "_").replace("-", "_")
+    answers_table = f"active_teams_answers_{game_name_safe}"
+
+    qrow = _fetch_question_row_for_round(db, game_table, round_name, question_id)
+    if not qrow:
+        raise ValueError("Question not found in this round")
+
+    _, round_uses_shared_list, list_pool = _round_review_flags(db, game_table, round_name)
+    question = _question_meta_from_row(qrow, list_pool if round_uses_shared_list else None)
+    ordered_cols = question["ordered_cols"] or [1]
+    kind = question["kind"]
+    expected_cells = [
+        p[1]
+        for p in _ordered_nonempty_game_cells(
+            qrow[3], qrow[4], qrow[5], qrow[6]
+        )
+    ]
+
+    teams_out: List[dict] = []
+    for tid in _active_game_team_ids(active_game):
+        team = db.query(Teams).filter(Teams.id == tid).first()
+        row = _fetch_team_answer_grade_row(db, answers_table, tid, question_id)
+        p1, p2, p3, p4, corr_pts, wrong_pts = _fetch_team_slots_four(
+            db, answers_table, tid, question_id
+        )
+        p_four = [p1, p2, p3, p4]
+        player_vals = [p_four[c - 1] for c in ordered_cols]
+
+        sug_map, sug_net = _compute_suggested_grade(
+            kind,
+            expected_cells,
+            ordered_cols,
+            player_vals,
+            corr_pts if corr_pts else question["reg_score"],
+            wrong_pts,
+        )
+
+        slots: List[dict] = []
+        for j, col in enumerate(ordered_cols):
+            ic_raw = row.get(f"is_correct_{col}") if row else None
+            ic = ic_raw if ic_raw is not None else sug_map.get(col)
+            slots.append(
+                {
+                    "col": col,
+                    "reference": expected_cells[j] if j < len(expected_cells) else "",
+                    "player_answer": p_four[col - 1],
+                    "is_correct": ic,
+                    "suggested_is_correct": sug_map.get(col),
+                }
+            )
+
+        teams_out.append(
+            {
+                "team_id": tid,
+                "team_name": team.team_name if team else f"Team {tid}",
+                "correct_score": corr_pts if corr_pts else question["reg_score"],
+                "wrong_score": wrong_pts,
+                "lucky_bonus": _coerce_score_float(row.get("lucky_bonus") if row else 0),
+                "final_score": row.get("final_score") if row else None,
+                "player_id": row.get("player_id") if row else None,
+                "slots": slots,
+                "suggested_final_score": sug_net,
+            }
+        )
+
+    round_type_game, _, _ = _round_review_flags(db, game_table, round_name)
+    return {
+        "round_name": round_name,
+        "round_type_game": round_type_game,
+        "round_uses_shared_list": round_uses_shared_list,
+        "question": question,
+        "teams": teams_out,
+    }
+
+
+def _build_canonical_list_rows_for_round(
+    db: Session, game_table: str, round_name: str
+) -> List[dict]:
+    rq = text(
+        f"""
+        SELECT id, question_num, answers_for_selection, answer1, answer2, answer3, answer4,
+               reg_score, bonus_score
+        FROM `{game_table}`
+        WHERE round_name = :rn
+        ORDER BY question_num ASC, id ASC
+        """
+    )
+    qrows = db.execute(rq, {"rn": round_name}).fetchall()
+    qrows = _sort_rows_by_question_num(list(qrows), num_index=1, id_index=0)
+    rows: List[dict] = []
+    idx = 0
+    for r in qrows:
+        qid, qnum, afs, a1, a2, a3, a4, reg_score, bonus_score = r
+        kind, _opts = _parse_answers_for_selection(afs)
+        if kind != "list":
+            continue
+        pairs = _ordered_nonempty_game_cells(a1, a2, a3, a4)
+        reg_pair = str(reg_score or "1;0").split(";")
+        default_c = _coerce_score_float(reg_pair[0] if reg_pair else 1)
+        default_w = _coerce_score_float(reg_pair[1] if len(reg_pair) > 1 else 0)
+        for col, cell in pairs:
+            syns = _split_synonyms(cell)
+            label = syns[0] if syns else str(cell)
+            rows.append(
+                {
+                    "row_index": idx,
+                    "question_id": int(qid),
+                    "question_num": qnum,
+                    "slot_col": col,
+                    "label": label,
+                    "synonyms": syns,
+                    "default_correct_score": default_c,
+                    "default_wrong_score": default_w,
+                }
+            )
+            idx += 1
+    return rows
+
+
+def _suggest_list_cell_grade(kind: str, expected_cell: str, player_answer: str) -> int:
+    if not (player_answer or "").strip():
+        return 0
+    if _cell_player_matches_expected(kind, expected_cell, player_answer):
+        return 1
+    return -1
+
+
+def _build_round_list_review_payload(
+    db: Session,
+    active_game: ActiveGame,
+    game: GamesList,
+    round_name: str,
+) -> dict:
+    game_table = _resolve_game_table_for_list_entry(db, game)
+    game_name_safe = str(game.game_name).strip().lower().replace(" ", "_").replace("-", "_")
+    answers_table = f"active_teams_answers_{game_name_safe}"
+
+    canonical_rows = _build_canonical_list_rows_for_round(db, game_table, round_name)
+    round_type_game, round_uses_shared_list, list_pool = _round_review_flags(
+        db, game_table, round_name
+    )
+
+    teams_out: List[dict] = []
+    for tid in _active_game_team_ids(active_game):
+        team = db.query(Teams).filter(Teams.id == tid).first()
+        cells: List[dict] = []
+        for crow in canonical_rows:
+            qid = crow["question_id"]
+            col = crow["slot_col"]
+            row = _fetch_team_answer_grade_row(db, answers_table, tid, qid)
+            p1, p2, p3, p4, corr_pts, wrong_pts = _fetch_team_slots_four(
+                db, answers_table, tid, qid
+            )
+            p_four = [p1, p2, p3, p4]
+            player_answer = p_four[col - 1]
+            ic_key = f"is_correct_{col}"
+            ic_raw = row.get(ic_key) if row else None
+            ref_cell = crow["synonyms"][0] if crow["synonyms"] else crow["label"]
+            if len(crow["synonyms"]) > 1:
+                ref_cell = ";".join(crow["synonyms"])
+            suggested = _suggest_list_cell_grade("list", ref_cell, player_answer)
+            ic = ic_raw if ic_raw is not None else suggested
+            cells.append(
+                {
+                    "row_index": crow["row_index"],
+                    "question_id": qid,
+                    "slot_col": col,
+                    "player_answer": player_answer,
+                    "is_correct": ic,
+                    "suggested_is_correct": suggested,
+                    "correct_score": corr_pts if corr_pts else crow["default_correct_score"],
+                    "wrong_score": wrong_pts if wrong_pts is not None else crow["default_wrong_score"],
+                }
+            )
+        teams_out.append(
+            {
+                "team_id": tid,
+                "team_name": team.team_name if team else f"Team {tid}",
+                "cells": cells,
+            }
+        )
+
+    return {
+        "round_name": round_name,
+        "round_type_game": round_type_game,
+        "round_uses_shared_list": round_uses_shared_list,
+        "list_pool": list_pool,
+        "canonical_rows": canonical_rows,
+        "teams": teams_out,
+    }
+
+
+def _round_question_ids_sorted(
+    db: Session, game_table: str, round_name: str
+) -> List[int]:
+    rq = text(
+        f"""
+        SELECT id, question_num
+        FROM `{game_table}`
+        WHERE round_name = :rn
+        ORDER BY question_num ASC, id ASC
+        """
+    )
+    rows = db.execute(rq, {"rn": round_name}).fetchall()
+    rows = _sort_rows_by_question_num(list(rows), num_index=1, id_index=0)
+    return [int(r[0]) for r in rows]
+
+
+def _team_round_points(
+    db: Session,
+    answers_table: str,
+    team_id: int,
+    game_table: str,
+    round_name: str,
+) -> float:
+    total = 0.0
+    for qid in _round_question_ids_sorted(db, game_table, round_name):
+        row = _fetch_team_answer_grade_row(db, answers_table, team_id, qid)
+        total += _answer_row_display_points(row)
+    return total
+
+
+def _build_active_game_scoreboard(
+    db: Session,
+    active_game: ActiveGame,
+    game: GamesList,
+) -> dict:
+    game_table = _resolve_game_table_for_list_entry(db, game)
+    game_name_safe = str(game.game_name).strip().lower().replace(" ", "_").replace("-", "_")
+    answers_table = f"active_teams_answers_{game_name_safe}"
+
+    rounds_summary = _fetch_game_rounds_summary(db, game_table)
+    round_names: List[str] = rounds_summary.get("round_names") or []
+
+    team_ids = _active_game_team_ids(active_game)
+    team_ids_str = [str(t) for t in team_ids]
+    start_rows = _load_active_teams_start_rows(db, game, team_ids_str)
+    start_by_team = {int(r["team_id"]): r for r in start_rows}
+
+    teams_out: List[dict] = []
+    for tid in team_ids:
+        team = db.query(Teams).filter(Teams.id == tid).first()
+        start_info = start_by_team.get(tid, {})
+        max_players = int(start_info.get("max_players") or 12)
+        play_players = int(start_info.get("play_players") or 0)
+        start_points = _coerce_score_float(start_info.get("start_points"))
+        start_total = _compute_team_start_total(max_players, play_players, start_points)
+
+        round_scores: Dict[str, float] = {}
+        rounds_sum = 0.0
+        for rn in round_names:
+            rp = _team_round_points(db, answers_table, tid, game_table, rn)
+            round_scores[rn] = rp
+            rounds_sum += rp
+
+        teams_out.append(
+            {
+                "team_id": tid,
+                "team_name": team.team_name if team else f"Team {tid}",
+                "round_scores": round_scores,
+                "rounds_sum": rounds_sum,
+                "max_players": max_players,
+                "play_players": play_players,
+                "start_points": start_points,
+                "start_total": start_total,
+                "total": rounds_sum + start_total,
+            }
+        )
+
+    teams_out.sort(key=lambda t: t["total"], reverse=True)
+    for i, t in enumerate(teams_out, start=1):
+        t["rank"] = i
+
+    return {
+        "active_game_id": active_game.id,
+        "game_name": game.game_name,
+        "round_names": round_names,
+        "teams": teams_out,
+    }
 
 
 def _auto_grade_question_multislot(
@@ -2866,10 +3585,10 @@ async def load_game_from_excel(game_data: GameLoadRequest, db: Session = Depends
 @app.get("/api/admin/active-games", response_model=dict)
 async def get_active_games(db: Session = Depends(get_db)):
     """
-    Get all active games
+    Get all active games (newest first).
     """
     try:
-        active_games = db.query(ActiveGame).all()
+        active_games = db.query(ActiveGame).order_by(ActiveGame.id.desc()).all()
         games_list = []
         
         for active_game in active_games:
@@ -3624,6 +4343,293 @@ class ActiveGameTeamsStartUpdate(BaseModel):
     teams: List[TeamStartSettingUpdate]
 
 
+class AdminGradeRequest(BaseModel):
+    team_id: int
+    question_id: int
+    player_answer1: Optional[str] = None
+    player_answer2: Optional[str] = None
+    player_answer3: Optional[str] = None
+    player_answer4: Optional[str] = None
+    is_correct_1: Optional[int] = None
+    is_correct_2: Optional[int] = None
+    is_correct_3: Optional[int] = None
+    is_correct_4: Optional[int] = None
+    final_score: Optional[float] = None
+
+
+class ReviewSlotUpdate(BaseModel):
+    col: int
+    player_answer: Optional[str] = None
+    is_correct: Optional[int] = None
+
+
+class TeamQuestionReviewUpdate(BaseModel):
+    team_id: int
+    correct_score: Optional[float] = None
+    wrong_score: Optional[float] = None
+    lucky_bonus: Optional[float] = None
+    slots: List[ReviewSlotUpdate] = []
+
+
+class QuestionReviewBatchRequest(BaseModel):
+    teams: List[TeamQuestionReviewUpdate]
+
+
+class ListReviewCellUpdate(BaseModel):
+    question_id: int
+    slot_col: int
+    player_answer: Optional[str] = None
+    is_correct: Optional[int] = None
+    correct_score: Optional[float] = None
+    wrong_score: Optional[float] = None
+
+
+class TeamListReviewUpdate(BaseModel):
+    team_id: int
+    cells: List[ListReviewCellUpdate]
+
+
+class RoundListReviewBatchRequest(BaseModel):
+    teams: List[TeamListReviewUpdate]
+
+
+def _persist_admin_grade(
+    db: Session,
+    answers_table: str,
+    team_id: int,
+    question_id: int,
+    statuses_by_col: Dict[int, Optional[int]],
+    net_score: float,
+    player_answers: Optional[Tuple[str, str, str, str]] = None,
+    player_id: Optional[int] = None,
+    correct_score: Optional[float] = None,
+    wrong_score: Optional[float] = None,
+    lucky_bonus: Optional[float] = None,
+    final_score_override: Optional[float] = None,
+) -> None:
+    if player_answers is not None:
+        p1, p2, p3, p4 = player_answers
+        db.execute(
+            text(
+                f"""
+                UPDATE `{answers_table}`
+                SET player_answer1=:p1, player_answer2=:p2,
+                    player_answer3=:p3, player_answer4=:p4
+                WHERE team_id=:tid AND question_id=:qid
+                """
+            ),
+            {
+                "p1": p1 or "",
+                "p2": p2 or "",
+                "p3": p3 or "",
+                "p4": p4 or "",
+                "tid": team_id,
+                "qid": question_id,
+            },
+        )
+    ic1 = statuses_by_col.get(1)
+    ic2 = statuses_by_col.get(2)
+    ic3 = statuses_by_col.get(3)
+    ic4 = statuses_by_col.get(4)
+    if final_score_override is not None:
+        stored_final = float(final_score_override)
+    else:
+        lb_val = (
+            float(lucky_bonus)
+            if lucky_bonus is not None
+            else _read_lucky_bonus(db, answers_table, team_id, question_id)
+        )
+        stored_final = float(net_score) + lb_val
+    extra_sets: List[str] = []
+    params: Dict[str, Any] = {
+        "ic1": ic1,
+        "ic2": ic2,
+        "ic3": ic3,
+        "ic4": ic4,
+        "net_score": stored_final,
+        "tid": team_id,
+        "qid": question_id,
+    }
+    if player_id is not None:
+        extra_sets.append("player_id=:pid")
+        params["pid"] = int(player_id)
+    if correct_score is not None:
+        extra_sets.append("correct_score=:cs")
+        params["cs"] = float(correct_score)
+    if wrong_score is not None:
+        extra_sets.append("wrong_score=:ws")
+        params["ws"] = float(wrong_score)
+    if lucky_bonus is not None:
+        extra_sets.append("lucky_bonus=:lb")
+        params["lb"] = float(lucky_bonus)
+    extra_sql = (", " + ", ".join(extra_sets)) if extra_sets else ""
+    stmt = text(
+        f"""
+        UPDATE `{answers_table}`
+        SET is_correct_1=:ic1, is_correct_2=:ic2, is_correct_3=:ic3, is_correct_4=:ic4,
+            final_score=:net_score{extra_sql}
+        WHERE team_id=:tid AND question_id=:qid
+        """
+    )
+    db.execute(stmt, params)
+
+
+def _apply_question_review_team_update(
+    db: Session,
+    answers_table: str,
+    game_table: str,
+    question_id: int,
+    kind: str,
+    ordered_cols: List[int],
+    expected_cells: List[str],
+    team_update: TeamQuestionReviewUpdate,
+    admin_user_id: int,
+) -> None:
+    tid = team_update.team_id
+    row = _fetch_team_answer_grade_row(db, answers_table, tid, question_id)
+    p1, p2, p3, p4, corr_pts, wrong_pts = _fetch_team_slots_four(
+        db, answers_table, tid, question_id
+    )
+    baseline = [p1, p2, p3, p4]
+    current = list(baseline)
+    statuses_by_col: Dict[int, Optional[int]] = {
+        1: row.get("is_correct_1") if row else None,
+        2: row.get("is_correct_2") if row else None,
+        3: row.get("is_correct_3") if row else None,
+        4: row.get("is_correct_4") if row else None,
+    }
+
+    for slot in team_update.slots:
+        col = int(slot.col)
+        if col < 1 or col > 4:
+            continue
+        idx = col - 1
+        old_text = (baseline[idx] or "").strip()
+        new_text = slot.player_answer if slot.player_answer is not None else current[idx]
+        new_text = (new_text or "").strip()
+        if slot.player_answer is not None:
+            if old_text and new_text != old_text:
+                raise ValueError(
+                    f"Cannot change existing answer for team {tid} slot {col}"
+                )
+            if not old_text and new_text:
+                current[idx] = new_text
+                if slot.is_correct is None:
+                    statuses_by_col[col] = -1
+        if slot.is_correct is not None:
+            statuses_by_col[col] = int(slot.is_correct)
+
+    cs = float(team_update.correct_score) if team_update.correct_score is not None else corr_pts
+    ws = float(team_update.wrong_score) if team_update.wrong_score is not None else wrong_pts
+    lb = (
+        float(team_update.lucky_bonus)
+        if team_update.lucky_bonus is not None
+        else _coerce_score_float(row.get("lucky_bonus") if row else 0)
+    )
+
+    slot_statuses: List[int] = []
+    for col in ordered_cols:
+        v = statuses_by_col.get(col)
+        slot_statuses.append(int(v) if v is not None else 0)
+    net_score = _multislot_net_score(slot_statuses, cs, ws)
+
+    _persist_admin_grade(
+        db,
+        answers_table,
+        tid,
+        question_id,
+        statuses_by_col,
+        net_score,
+        player_answers=tuple(current),
+        player_id=admin_user_id,
+        correct_score=cs,
+        wrong_score=ws,
+        lucky_bonus=lb,
+    )
+
+
+def _apply_list_review_team_updates(
+    db: Session,
+    answers_table: str,
+    game_table: str,
+    team_update: TeamListReviewUpdate,
+    admin_user_id: int,
+) -> None:
+    by_qid: Dict[int, List[ListReviewCellUpdate]] = {}
+    for cell in team_update.cells:
+        by_qid.setdefault(int(cell.question_id), []).append(cell)
+
+    for qid, cell_updates in by_qid.items():
+        row = _fetch_team_answer_grade_row(db, answers_table, team_update.team_id, qid)
+        p1, p2, p3, p4, corr_pts, wrong_pts = _fetch_team_slots_four(
+            db, answers_table, team_update.team_id, qid
+        )
+        baseline = [p1, p2, p3, p4]
+        current = list(baseline)
+        statuses_by_col: Dict[int, Optional[int]] = {
+            1: row.get("is_correct_1") if row else None,
+            2: row.get("is_correct_2") if row else None,
+            3: row.get("is_correct_3") if row else None,
+            4: row.get("is_correct_4") if row else None,
+        }
+        cs = corr_pts
+        ws = wrong_pts
+
+        for cell in cell_updates:
+            col = int(cell.slot_col)
+            if col < 1 or col > 4:
+                continue
+            idx = col - 1
+            old_text = (baseline[idx] or "").strip()
+            if cell.player_answer is not None:
+                new_text = (cell.player_answer or "").strip()
+                if old_text and new_text != old_text:
+                    raise ValueError(
+                        f"Cannot change existing answer for team {team_update.team_id} "
+                        f"question {qid} slot {col}"
+                    )
+                if not old_text and new_text:
+                    current[idx] = new_text
+                    if cell.is_correct is None:
+                        statuses_by_col[col] = -1
+            if cell.is_correct is not None:
+                statuses_by_col[col] = int(cell.is_correct)
+            if cell.correct_score is not None:
+                cs = float(cell.correct_score)
+            if cell.wrong_score is not None:
+                ws = float(cell.wrong_score)
+
+        qrow = db.execute(
+            text(
+                f"SELECT answer1, answer2, answer3, answer4 FROM `{game_table}` WHERE id = :qid"
+            ),
+            {"qid": qid},
+        ).fetchone()
+        if qrow:
+            ordered_cols = [p[0] for p in _ordered_nonempty_game_cells(qrow[0], qrow[1], qrow[2], qrow[3])]
+        else:
+            ordered_cols = sorted({int(c.slot_col) for c in cell_updates})
+        slot_statuses: List[int] = []
+        for col in ordered_cols:
+            v = statuses_by_col.get(col)
+            slot_statuses.append(int(v) if v is not None else 0)
+        if not slot_statuses:
+            continue
+        net_score = _multislot_net_score(slot_statuses, cs, ws)
+        _persist_admin_grade(
+            db,
+            answers_table,
+            team_update.team_id,
+            qid,
+            statuses_by_col,
+            net_score,
+            player_answers=tuple(current),
+            player_id=admin_user_id,
+            correct_score=cs,
+            wrong_score=ws,
+        )
+
+
 @app.get("/api/admin/active-games/{active_game_id}/teams-start", response_model=dict)
 async def get_active_game_teams_start(active_game_id: int, db: Session = Depends(get_db)):
     """Per-team starting settings (MaxPlayers, PlayPlayers, StartPoints)."""
@@ -3716,6 +4722,387 @@ async def update_active_game_teams_start(
         logger.error(f"Error updating teams start settings: {e}")
         db.rollback()
         return {"success": False, "message": f"Error updating teams start settings: {str(e)}"}
+
+
+@app.get("/api/admin/active-games/{active_game_id}/scoreboard", response_model=dict)
+async def get_active_game_scoreboard(
+    active_game_id: int,
+    db: Session = Depends(get_db),
+):
+    """Live all-teams leaderboard: round totals + start adjustment = TOTAL."""
+    try:
+        active_game = db.query(ActiveGame).filter(ActiveGame.id == active_game_id).first()
+        if not active_game:
+            return {"success": False, "message": "Active game not found"}
+        game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
+        if not game:
+            return {"success": False, "message": "Game not found"}
+        data = _build_active_game_scoreboard(db, active_game, game)
+        return {"success": True, **data}
+    except Exception as e:
+        logger.error(f"Error building scoreboard: {e}")
+        return {"success": False, "message": f"Error building scoreboard: {str(e)}"}
+
+
+@app.get(
+    "/api/admin/active-games/{active_game_id}/rounds/started-status",
+    response_model=dict,
+)
+async def get_active_game_started_rounds(
+    active_game_id: int,
+    db: Session = Depends(get_db),
+):
+    """Which rounds have started (recorded in action_game_control_<game>)."""
+    try:
+        active_game = db.query(ActiveGame).filter(ActiveGame.id == active_game_id).first()
+        if not active_game:
+            return {"success": False, "message": "Active game not found"}
+        game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
+        if not game:
+            return {"success": False, "message": "Game not found"}
+        table_name = _action_game_control_table_name(game)
+        table_exists = _action_game_control_table_exists(db, table_name)
+        started = _started_round_names_in_control_table(db, game) if table_exists else []
+        return {
+            "success": True,
+            "control_table_exists": table_exists,
+            "started_rounds": started,
+        }
+    except Exception as e:
+        logger.error(f"Error fetching started rounds: {e}")
+        return {"success": False, "message": f"Error fetching started rounds: {str(e)}"}
+
+
+@app.get(
+    "/api/admin/active-games/{active_game_id}/rounds/{round_name}/grading-grid",
+    response_model=dict,
+)
+async def get_round_grading_grid(
+    active_game_id: int,
+    round_name: str,
+    db: Session = Depends(get_db),
+):
+    """Round matrix payload: questions, teams, per-cell grades and suggestions."""
+    try:
+        active_game = db.query(ActiveGame).filter(ActiveGame.id == active_game_id).first()
+        if not active_game:
+            return {"success": False, "message": "Active game not found"}
+        game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
+        if not game:
+            return {"success": False, "message": "Game not found"}
+        if not _round_started_in_control_table(db, game, round_name):
+            return {
+                "success": False,
+                "message": "Round has not started yet (no records in action_game_control)",
+            }
+        data = _build_round_grading_grid(db, active_game, game, round_name)
+        return {"success": True, **data}
+    except Exception as e:
+        logger.error(f"Error building grading grid: {e}")
+        return {"success": False, "message": f"Error building grading grid: {str(e)}"}
+
+
+@app.get(
+    "/api/admin/active-games/{active_game_id}/rounds/{round_name}/questions/{question_id}/review",
+    response_model=dict,
+)
+async def get_question_review(
+    active_game_id: int,
+    round_name: str,
+    question_id: int,
+    db: Session = Depends(get_db),
+):
+    try:
+        active_game = db.query(ActiveGame).filter(ActiveGame.id == active_game_id).first()
+        if not active_game:
+            return {"success": False, "message": "Active game not found"}
+        game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
+        if not game:
+            return {"success": False, "message": "Game not found"}
+        if not _round_started_in_control_table(db, game, round_name):
+            return {
+                "success": False,
+                "message": "Round has not started yet (no records in action_game_control)",
+            }
+        data = _build_question_review_payload(db, active_game, game, round_name, question_id)
+        return {"success": True, **data}
+    except ValueError as e:
+        return {"success": False, "message": str(e)}
+    except Exception as e:
+        logger.error(f"Error building question review: {e}")
+        return {"success": False, "message": f"Error building question review: {str(e)}"}
+
+
+@app.get(
+    "/api/admin/active-games/{active_game_id}/rounds/{round_name}/list-review",
+    response_model=dict,
+)
+async def get_round_list_review(
+    active_game_id: int,
+    round_name: str,
+    db: Session = Depends(get_db),
+):
+    try:
+        active_game = db.query(ActiveGame).filter(ActiveGame.id == active_game_id).first()
+        if not active_game:
+            return {"success": False, "message": "Active game not found"}
+        game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
+        if not game:
+            return {"success": False, "message": "Game not found"}
+        if not _round_started_in_control_table(db, game, round_name):
+            return {
+                "success": False,
+                "message": "Round has not started yet (no records in action_game_control)",
+            }
+        data = _build_round_list_review_payload(db, active_game, game, round_name)
+        if not data.get("round_uses_shared_list"):
+            return {
+                "success": False,
+                "message": "This round does not use shared list review mode",
+            }
+        return {"success": True, **data}
+    except Exception as e:
+        logger.error(f"Error building list review: {e}")
+        return {"success": False, "message": f"Error building list review: {str(e)}"}
+
+
+@app.post(
+    "/api/admin/active-games/{active_game_id}/rounds/{round_name}/questions/{question_id}/review-batch",
+    response_model=dict,
+)
+async def post_question_review_batch(
+    active_game_id: int,
+    round_name: str,
+    question_id: int,
+    payload: QuestionReviewBatchRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        if current_user.role != "admin":
+            return {"success": False, "message": "Admin access required"}
+        active_game = db.query(ActiveGame).filter(ActiveGame.id == active_game_id).first()
+        if not active_game:
+            return {"success": False, "message": "Active game not found"}
+        game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
+        if not game:
+            return {"success": False, "message": "Game not found"}
+        if not _round_started_in_control_table(db, game, round_name):
+            return {
+                "success": False,
+                "message": "Round has not started yet (no records in action_game_control)",
+            }
+        game_table = _resolve_game_table_for_list_entry(db, game)
+        game_name_safe = (
+            str(game.game_name).strip().lower().replace(" ", "_").replace("-", "_")
+        )
+        answers_table = f"active_teams_answers_{game_name_safe}"
+        qrow = _fetch_question_row_for_round(db, game_table, round_name, question_id)
+        if not qrow:
+            return {"success": False, "message": "Question not found in this round"}
+        meta = _question_meta_from_row(qrow)
+        ordered_cols = meta["ordered_cols"] or [1]
+        kind = meta["kind"]
+        expected_cells = [p[1] for p in _ordered_nonempty_game_cells(qrow[3], qrow[4], qrow[5], qrow[6])]
+        allowed_teams = set(_active_game_team_ids(active_game))
+
+        for team_update in payload.teams:
+            if team_update.team_id not in allowed_teams:
+                continue
+            _apply_question_review_team_update(
+                db,
+                answers_table,
+                game_table,
+                question_id,
+                kind,
+                ordered_cols,
+                expected_cells,
+                team_update,
+                current_user.id,
+            )
+        db.commit()
+        return {"success": True, "message": "Review saved"}
+    except ValueError as e:
+        db.rollback()
+        return {"success": False, "message": str(e)}
+    except Exception as e:
+        logger.error(f"Error saving question review batch: {e}")
+        db.rollback()
+        return {"success": False, "message": f"Error saving question review batch: {str(e)}"}
+
+
+@app.post(
+    "/api/admin/active-games/{active_game_id}/rounds/{round_name}/list-review-batch",
+    response_model=dict,
+)
+async def post_round_list_review_batch(
+    active_game_id: int,
+    round_name: str,
+    payload: RoundListReviewBatchRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        if current_user.role != "admin":
+            return {"success": False, "message": "Admin access required"}
+        active_game = db.query(ActiveGame).filter(ActiveGame.id == active_game_id).first()
+        if not active_game:
+            return {"success": False, "message": "Active game not found"}
+        game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
+        if not game:
+            return {"success": False, "message": "Game not found"}
+        if not _round_started_in_control_table(db, game, round_name):
+            return {
+                "success": False,
+                "message": "Round has not started yet (no records in action_game_control)",
+            }
+        game_table = _resolve_game_table_for_list_entry(db, game)
+        game_name_safe = (
+            str(game.game_name).strip().lower().replace(" ", "_").replace("-", "_")
+        )
+        answers_table = f"active_teams_answers_{game_name_safe}"
+        _, round_uses_shared_list, _ = _round_review_flags(db, game_table, round_name)
+        if not round_uses_shared_list:
+            return {
+                "success": False,
+                "message": "This round does not use shared list review mode",
+            }
+        allowed_teams = set(_active_game_team_ids(active_game))
+        for team_update in payload.teams:
+            if team_update.team_id not in allowed_teams:
+                continue
+            _apply_list_review_team_updates(
+                db, answers_table, game_table, team_update, current_user.id
+            )
+        db.commit()
+        return {"success": True, "message": "List review saved"}
+    except ValueError as e:
+        db.rollback()
+        return {"success": False, "message": str(e)}
+    except Exception as e:
+        logger.error(f"Error saving list review batch: {e}")
+        db.rollback()
+        return {"success": False, "message": f"Error saving list review batch: {str(e)}"}
+
+
+@app.post("/api/admin/active-games/{active_game_id}/grade", response_model=dict)
+async def post_admin_grade(
+    active_game_id: int,
+    payload: AdminGradeRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Persist admin manual grade (is_correct slots, optional player answers, final_score)."""
+    try:
+        if current_user.role != "admin":
+            return {"success": False, "message": "Admin access required"}
+
+        active_game = db.query(ActiveGame).filter(ActiveGame.id == active_game_id).first()
+        if not active_game:
+            return {"success": False, "message": "Active game not found"}
+        game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
+        if not game:
+            return {"success": False, "message": "Game not found"}
+
+        game_name_safe = (
+            str(game.game_name).strip().lower().replace(" ", "_").replace("-", "_")
+        )
+        answers_table = f"active_teams_answers_{game_name_safe}"
+        game_table = _resolve_game_table_for_list_entry(db, game)
+
+        qmeta = db.execute(
+            text(
+                f"""
+                SELECT round_name, answer1, answer2, answer3, answer4
+                FROM `{game_table}` WHERE id = :qid LIMIT 1
+                """
+            ),
+            {"qid": payload.question_id},
+        ).fetchone()
+        if not qmeta:
+            return {"success": False, "message": "Question not found"}
+        round_name = qmeta[0]
+        if not round_name or not _round_started_in_control_table(db, game, str(round_name)):
+            return {
+                "success": False,
+                "message": "Round has not started yet (no records in action_game_control)",
+            }
+
+        qrow = qmeta
+        ordered_cols: List[int] = []
+        if qrow:
+            ordered_cols = [
+                p[0]
+                for p in _ordered_nonempty_game_cells(qrow[1], qrow[2], qrow[3], qrow[4])
+            ]
+
+        statuses_by_col = {
+            1: payload.is_correct_1,
+            2: payload.is_correct_2,
+            3: payload.is_correct_3,
+            4: payload.is_correct_4,
+        }
+
+        p1, p2, p3, p4, corr_pts, wrong_pts = _fetch_team_slots_four(
+            db, answers_table, payload.team_id, payload.question_id
+        )
+
+        player_answers = (
+            payload.player_answer1 if payload.player_answer1 is not None else p1,
+            payload.player_answer2 if payload.player_answer2 is not None else p2,
+            payload.player_answer3 if payload.player_answer3 is not None else p3,
+            payload.player_answer4 if payload.player_answer4 is not None else p4,
+        )
+        has_player_update = any(
+            x is not None
+            for x in (
+                payload.player_answer1,
+                payload.player_answer2,
+                payload.player_answer3,
+                payload.player_answer4,
+            )
+        )
+
+        if payload.final_score is not None:
+            saved_final = float(payload.final_score)
+            _persist_admin_grade(
+                db,
+                answers_table,
+                payload.team_id,
+                payload.question_id,
+                statuses_by_col,
+                0.0,
+                player_answers if has_player_update else None,
+                final_score_override=saved_final,
+            )
+        else:
+            slot_statuses = []
+            for col in ordered_cols:
+                v = statuses_by_col.get(col)
+                slot_statuses.append(int(v) if v is not None else 0)
+            net_score = _multislot_net_score(slot_statuses, corr_pts, wrong_pts)
+            lb = _read_lucky_bonus(db, answers_table, payload.team_id, payload.question_id)
+            saved_final = float(net_score) + lb
+
+            _persist_admin_grade(
+                db,
+                answers_table,
+                payload.team_id,
+                payload.question_id,
+                statuses_by_col,
+                net_score,
+                player_answers if has_player_update else None,
+            )
+        db.commit()
+        return {
+            "success": True,
+            "message": "Grade saved",
+            "final_score": saved_final,
+        }
+    except Exception as e:
+        logger.error(f"Error saving admin grade: {e}")
+        db.rollback()
+        return {"success": False, "message": f"Error saving admin grade: {str(e)}"}
 
 
 @app.get("/api/admin/active-games/{active_game_id}/round-tracking", response_model=dict)

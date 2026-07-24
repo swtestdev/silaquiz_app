@@ -237,6 +237,9 @@ class _SummaryPageState extends State<SummaryPage> {
 
   /// Question score including any populated lucky bonus (used for round totals and row score).
   num _questionTotalPoints(Map<String, dynamic>? answer) {
+    if (answer != null && answer['final_score'] != null) {
+      return _coerceScore(answer['final_score']);
+    }
     return _playerFacingPoints(answer) + _luckyBonusPoints(answer);
   }
 

@@ -14,6 +14,11 @@ import 'pages/admin/user_management_page.dart';
 import 'pages/admin/game_management_page.dart';
 import 'pages/admin/active_games_page.dart';
 import 'pages/admin/analytics_dashboard_page.dart';
+import 'pages/admin/admin_round_grading_matrix_page.dart';
+import 'pages/admin/admin_grading_detail_page.dart';
+import 'pages/admin/admin_question_review_page.dart';
+import 'pages/admin/admin_round_list_review_page.dart';
+import 'pages/admin/admin_game_results_page.dart';
 import 'services/user_data_service.dart';
 
 final DebugConsoleController _debugConsole = DebugConsoleController();
@@ -71,6 +76,53 @@ class PWAApp extends StatelessWidget {
         '/admin/games': (context) => const GameManagementPage(),
         '/admin/active-games': (context) => const ActiveGamesPage(),
         '/admin/analytics': (context) => const AnalyticsDashboardPage(),
+        '/admin/results': (context) => const AdminGameResultsPage(),
+      },
+      onGenerateRoute: (settings) {
+        final args = settings.arguments;
+        if (settings.name == '/admin/analytics/round' && args is Map<String, dynamic>) {
+          return MaterialPageRoute(
+            builder: (_) => AdminRoundGradingMatrixPage(
+              activeGameId: args['activeGameId'] as int,
+              gameName: args['gameName']?.toString() ?? '',
+              roundName: args['roundName']?.toString() ?? '',
+            ),
+          );
+        }
+        if (settings.name == '/admin/analytics/grade' && args is Map<String, dynamic>) {
+          return MaterialPageRoute(
+            builder: (_) => AdminGradingDetailPage(
+              activeGameId: args['activeGameId'] as int,
+              roundName: args['roundName']?.toString() ?? '',
+              teamId: args['teamId'] as int,
+              teamName: args['teamName']?.toString() ?? '',
+              question: Map<String, dynamic>.from(args['question'] as Map),
+              cell: args['cell'] != null
+                  ? Map<String, dynamic>.from(args['cell'] as Map)
+                  : null,
+            ),
+          );
+        }
+        if (settings.name == '/admin/analytics/question-review' &&
+            args is Map<String, dynamic>) {
+          return MaterialPageRoute(
+            builder: (_) => AdminQuestionReviewPage(
+              activeGameId: args['activeGameId'] as int,
+              roundName: args['roundName']?.toString() ?? '',
+              questionId: args['questionId'] as int,
+            ),
+          );
+        }
+        if (settings.name == '/admin/analytics/list-review' &&
+            args is Map<String, dynamic>) {
+          return MaterialPageRoute(
+            builder: (_) => AdminRoundListReviewPage(
+              activeGameId: args['activeGameId'] as int,
+              roundName: args['roundName']?.toString() ?? '',
+            ),
+          );
+        }
+        return null;
       },
       debugShowCheckedModeBanner: false,
       builder: (context, child) {

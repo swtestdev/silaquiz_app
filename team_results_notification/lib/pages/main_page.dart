@@ -9,7 +9,9 @@ import '../services/user_data_service.dart';
 import '../services/strict_visibility_service.dart';
 import '../services/logout_notice.dart';
 import '../services/timer_store.dart';
+import '../utils/active_game_selection.dart';
 import 'login_page.dart'; // For DatabaseService
+import 'admin/admin_game_results_page.dart';
 import 'question_page.dart' as question_page; // For timer message forwarding and initializeTimerStatus
 
 class MainPage extends StatefulWidget {
@@ -27,6 +29,8 @@ class _MainPageState extends State<MainPage> {
   bool _hasTeam = false;
   String _userRole = 'player';
   bool _eligibleForActiveGame = false;
+  bool _adminHasLiveGame = false;
+  int? _adminActiveGameId;
   bool _sessionValidationInProgress = false;
   bool _disconnectionHandlerRunning = false;
   bool _suppressWebSocketReconnect = false;
@@ -35,6 +39,8 @@ class _MainPageState extends State<MainPage> {
   Timer? _echoTimer;
   DateTime? _lastForcedActiveTimerSync;
   bool _hasShownNotification = false;
+  bool _bonusOptionDialogVisible = false;
+  bool _bonusOptionPromptShown = false;
   
   // Writer status tracking
   bool _isWriter = false;
@@ -231,6 +237,15 @@ class _MainPageState extends State<MainPage> {
     
     // Check if user has a team assigned
     await _checkTeamAssignment(userData);
+
+    if (_userRole == 'admin') {
+      await _checkAdminActiveGame();
+    } else if (_userRole == 'player') {
+      // Players with a team see the notice first; bonus prompt runs after dismiss.
+      if (!_hasTeam) {
+        await _checkForActiveGames();
+      }
+    }
     
     // Connect to WebSocket for timer updates (only for players)
     if (_userRole == 'player') {
@@ -286,6 +301,12 @@ class _MainPageState extends State<MainPage> {
     
     // Check if user has a team assigned
     await _checkTeamAssignment(localUserData);
+
+    if (_userRole == 'admin') {
+      await _checkAdminActiveGame();
+    } else if (_userRole == 'player' && !hasTeam) {
+      await _checkForActiveGames();
+    }
     
     // Connect WebSocket if player
     if (_userRole == 'player') {
@@ -335,12 +356,34 @@ class _MainPageState extends State<MainPage> {
     await _checkTeamAssignment(localUserData);
     
     // Re-evaluate active game eligibility after profile change
-    if (_userRole == 'player' && _userId.isNotEmpty) {
+    if (_userRole == 'admin') {
+      await _checkAdminActiveGame();
+    } else if (_userRole == 'player' && _userId.isNotEmpty) {
       await _checkForActiveGames();
     }
   }
 
   // Check for active games with bonus options
+  Future<void> _checkAdminActiveGame() async {
+    try {
+      final games = await DatabaseService.getActiveGames();
+      final current = pickCurrentActiveGame(games);
+      if (!mounted) return;
+      setState(() {
+        _adminHasLiveGame = current != null;
+        _adminActiveGameId = parseActiveGameId(current?['id']);
+      });
+    } catch (e) {
+      print('Error checking admin active game: $e');
+      if (mounted) {
+        setState(() {
+          _adminHasLiveGame = false;
+          _adminActiveGameId = null;
+        });
+      }
+    }
+  }
+
   Future<void> _checkForActiveGames() async {
     try {
       print('Checking for active games with bonus options...');
@@ -358,21 +401,25 @@ class _MainPageState extends State<MainPage> {
           });
         }
         
-        // Only show dialog if there are games with bonus options
+        // Only prompt when bonus options exist and the player has not chosen yet.
         final gamesWithOptions = activeGames.where((game) {
+          if (game['player_approved'] != null) {
+            return false;
+          }
           final bonusOptions = game['bonus_options'] as List? ?? [];
           print('Game ${game['id']} has ${bonusOptions.length} bonus options');
           return bonusOptions.isNotEmpty;
         }).toList();
-        
-        print('Found ${gamesWithOptions.length} games with bonus options');
-        
-        if (gamesWithOptions.isNotEmpty) {
-          print('Showing bonus option selection dialog...');
-          // Show bonus option selection dialog
-          _showBonusOptionDialog(gamesWithOptions);
+
+        print('Found ${gamesWithOptions.length} games needing bonus selection');
+
+        if (gamesWithOptions.isEmpty) {
+          print('No pending bonus selections');
+        } else if (_bonusOptionPromptShown || _bonusOptionDialogVisible) {
+          print('Bonus option dialog already shown this session, skipping');
         } else {
-          print('No games with bonus options found');
+          print('Showing bonus option selection dialog...');
+          _showBonusOptionDialog(gamesWithOptions);
         }
       } else {
         print('Failed to get active games: ${result['message']}');
@@ -388,8 +435,14 @@ class _MainPageState extends State<MainPage> {
     }
   }
 
-  // Show bonus option selection dialog
+  // Show bonus option selection dialog (at most once per MainPage session).
   void _showBonusOptionDialog(List<dynamic> activeGames) {
+    if (_bonusOptionDialogVisible || _bonusOptionPromptShown) {
+      print('Bonus option dialog already visible or shown, skipping duplicate');
+      return;
+    }
+    _bonusOptionPromptShown = true;
+    _bonusOptionDialogVisible = true;
     showDialog(
       context: context,
       barrierDismissible: false,
@@ -397,7 +450,9 @@ class _MainPageState extends State<MainPage> {
         activeGames: activeGames.cast<Map<String, dynamic>>(),
         userId: int.parse(_userId),
       ),
-    );
+    ).whenComplete(() {
+      _bonusOptionDialogVisible = false;
+    });
   }
 
   // Check if user has a team assigned and show notification if not
@@ -789,13 +844,39 @@ class _MainPageState extends State<MainPage> {
               ),
               const SizedBox(width: 12),
               Expanded(
-                child: _buildActionCard(
-                  'Analytics',
-                  Icons.analytics,
-                  Colors.purple,
-                  () {
-                    Navigator.pushNamed(context, '/admin/analytics');
-                  },
+                child: Opacity(
+                  opacity: _adminHasLiveGame ? 1.0 : 0.5,
+                  child: _buildActionCard(
+                    'Analytics',
+                    Icons.analytics,
+                    Colors.purple,
+                    _adminHasLiveGame
+                        ? () async {
+                            await _checkAdminActiveGame();
+                            if (!mounted) return;
+                            if (!_adminHasLiveGame) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                  content: Text(
+                                    'No active game available. Create or start a game (not idle).',
+                                  ),
+                                ),
+                              );
+                              return;
+                            }
+                            await Navigator.pushNamed(context, '/admin/analytics');
+                            if (mounted) await _checkAdminActiveGame();
+                          }
+                        : () {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text(
+                                  'No active game available. Create or start a game (not idle).',
+                                ),
+                              ),
+                            );
+                          },
+                  ),
                 ),
               ),
             ],
@@ -871,51 +952,95 @@ class _MainPageState extends State<MainPage> {
 
 
   Widget _buildViewSummaryCard() {
-    final enabled = _hasTeam && _eligibleForActiveGame;
-    return Card(
-      elevation: 2,
-      child: InkWell(
-        onTap: enabled ? () { Navigator.pushNamed(context, '/summary'); } : null,
-        borderRadius: BorderRadius.circular(8),
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Row(
-            children: [
-              Icon(
-                Icons.assessment,
-                color: Colors.purple.shade700,
-                size: 32,
-              ),
-              const SizedBox(width: 16),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      'View Results',
-                      style: TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.purple.shade700,
+    final isAdmin = _userRole == 'admin';
+    final enabled = isAdmin
+        ? _adminHasLiveGame
+        : (_hasTeam && _eligibleForActiveGame);
+    final subtitle = isAdmin
+        ? 'View live scoreboard for all teams'
+        : 'View your quiz results';
+
+    return Opacity(
+      opacity: enabled ? 1.0 : 0.5,
+      child: Card(
+        elevation: 2,
+        child: InkWell(
+          onTap: enabled
+              ? () async {
+                  if (isAdmin) {
+                    await _checkAdminActiveGame();
+                    if (!mounted) return;
+                    final gameId = _adminActiveGameId;
+                    if (gameId == null) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text(
+                            'No active game available. Create or start a game (not idle).',
+                          ),
+                        ),
+                      );
+                      return;
+                    }
+                    await Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => AdminGameResultsPage(activeGameId: gameId),
                       ),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      'View your quiz results',
-                      style: TextStyle(
-                        fontSize: 14,
-                        color: Colors.grey.shade600,
-                      ),
-                    ),
-                  ],
+                    );
+                    if (mounted) await _checkAdminActiveGame();
+                  } else {
+                    Navigator.pushNamed(context, '/summary');
+                  }
+                }
+              : () {
+                  final message = isAdmin
+                      ? 'No active game available. Create or start a game (not idle).'
+                      : 'Your team must be in an active game to view results.';
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text(message)),
+                  );
+                },
+          borderRadius: BorderRadius.circular(8),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Row(
+              children: [
+                Icon(
+                  Icons.assessment,
+                  color: Colors.purple.shade700,
+                  size: 32,
                 ),
-              ),
-              Icon(
-                Icons.arrow_forward_ios,
-                color: enabled ? Colors.grey.shade600 : Colors.grey.shade300,
-                size: 16,
-              ),
-            ],
+                const SizedBox(width: 16),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'View Results',
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.purple.shade700,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        subtitle,
+                        style: TextStyle(
+                          fontSize: 14,
+                          color: Colors.grey.shade600,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Icon(
+                  Icons.arrow_forward_ios,
+                  color: enabled ? Colors.grey.shade600 : Colors.grey.shade300,
+                  size: 16,
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -1447,6 +1572,7 @@ class _MainPageState extends State<MainPage> {
   
   // Check for active games after notification popup is dismissed
   void _checkForActiveGamesAfterNotification() {
+    if (_userRole != 'player') return;
     print('Notification popup dismissed, checking for active games...');
     Future.delayed(const Duration(milliseconds: 500), () {
       if (mounted) {

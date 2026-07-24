@@ -1312,6 +1312,244 @@ class DatabaseService {
     }
   }
 
+  /// Admin live scoreboard for an active game (all teams × rounds).
+  static Future<Map<String, dynamic>> getActiveGameScoreboard(int activeGameId) async {
+    try {
+      final response = await http.get(
+        Uri.parse('$_baseUrl/admin/active-games/$activeGameId/scoreboard'),
+        headers: {'Content-Type': 'application/json'},
+      );
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      if (response.statusCode == 200 && data['success'] == true) {
+        return data;
+      }
+      return {
+        'success': false,
+        'message': data['message'] ?? 'Failed to load scoreboard',
+      };
+    } catch (e) {
+      print('Error fetching scoreboard: $e');
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  /// Rounds that have started (rows in action_game_control for this active game).
+  static Future<Map<String, dynamic>> getActiveGameStartedRounds(int activeGameId) async {
+    try {
+      final response = await http.get(
+        Uri.parse('$_baseUrl/admin/active-games/$activeGameId/rounds/started-status'),
+        headers: {'Content-Type': 'application/json'},
+      );
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      if (response.statusCode == 200 && data['success'] == true) {
+        return data;
+      }
+      return {
+        'success': false,
+        'message': data['message'] ?? 'Failed to load started rounds',
+        'started_rounds': <String>[],
+      };
+    } catch (e) {
+      print('Error fetching started rounds: $e');
+      return {
+        'success': false,
+        'message': e.toString(),
+        'started_rounds': <String>[],
+      };
+    }
+  }
+
+  /// Admin grading matrix for a round in an active game.
+  static Future<Map<String, dynamic>> getRoundGradingGrid(
+    int activeGameId,
+    String roundName,
+  ) async {
+    try {
+      final encodedRound = Uri.encodeComponent(roundName);
+      final response = await http.get(
+        Uri.parse(
+          '$_baseUrl/admin/active-games/$activeGameId/rounds/$encodedRound/grading-grid',
+        ),
+        headers: {'Content-Type': 'application/json'},
+      );
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      if (response.statusCode == 200 && data['success'] == true) {
+        return data;
+      }
+      return {
+        'success': false,
+        'message': data['message'] ?? 'Failed to load grading grid',
+      };
+    } catch (e) {
+      print('Error fetching grading grid: $e');
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  /// Per-question review payload (all teams) for admin grading.
+  static Future<Map<String, dynamic>> getQuestionReview(
+    int activeGameId,
+    String roundName,
+    int questionId,
+  ) async {
+    try {
+      final encodedRound = Uri.encodeComponent(roundName);
+      final response = await http.get(
+        Uri.parse(
+          '$_baseUrl/admin/active-games/$activeGameId/rounds/$encodedRound/questions/$questionId/review',
+        ),
+        headers: {'Content-Type': 'application/json'},
+      );
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      if (response.statusCode == 200 && data['success'] == true) {
+        return data;
+      }
+      return {
+        'success': false,
+        'message': data['message'] ?? 'Failed to load question review',
+      };
+    } catch (e) {
+      print('Error fetching question review: $e');
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  /// Batch save per-question review for all teams.
+  static Future<Map<String, dynamic>> saveQuestionReviewBatch(
+    int activeGameId,
+    String roundName,
+    int questionId, {
+    required List<Map<String, dynamic>> teams,
+  }) async {
+    try {
+      final userData = await UserDataService.getUserData();
+      if (userData == null || userData['access_token'] == null) {
+        return {'success': false, 'message': 'Not authenticated'};
+      }
+      final encodedRound = Uri.encodeComponent(roundName);
+      final response = await http.post(
+        Uri.parse(
+          '$_baseUrl/admin/active-games/$activeGameId/rounds/$encodedRound/questions/$questionId/review-batch',
+        ),
+        headers: {
+          'Authorization': 'Bearer ${userData['access_token']}',
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode({'teams': teams}),
+      );
+      return jsonDecode(response.body) as Map<String, dynamic>;
+    } catch (e) {
+      print('Error saving question review batch: $e');
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  /// Round-wide shared list review payload (Example 6).
+  static Future<Map<String, dynamic>> getRoundListReview(
+    int activeGameId,
+    String roundName,
+  ) async {
+    try {
+      final encodedRound = Uri.encodeComponent(roundName);
+      final response = await http.get(
+        Uri.parse(
+          '$_baseUrl/admin/active-games/$activeGameId/rounds/$encodedRound/list-review',
+        ),
+        headers: {'Content-Type': 'application/json'},
+      );
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      if (response.statusCode == 200 && data['success'] == true) {
+        return data;
+      }
+      return {
+        'success': false,
+        'message': data['message'] ?? 'Failed to load list review',
+      };
+    } catch (e) {
+      print('Error fetching list review: $e');
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  /// Batch save round-wide shared list review.
+  static Future<Map<String, dynamic>> saveRoundListReviewBatch(
+    int activeGameId,
+    String roundName, {
+    required List<Map<String, dynamic>> teams,
+  }) async {
+    try {
+      final userData = await UserDataService.getUserData();
+      if (userData == null || userData['access_token'] == null) {
+        return {'success': false, 'message': 'Not authenticated'};
+      }
+      final encodedRound = Uri.encodeComponent(roundName);
+      final response = await http.post(
+        Uri.parse(
+          '$_baseUrl/admin/active-games/$activeGameId/rounds/$encodedRound/list-review-batch',
+        ),
+        headers: {
+          'Authorization': 'Bearer ${userData['access_token']}',
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode({'teams': teams}),
+      );
+      return jsonDecode(response.body) as Map<String, dynamic>;
+    } catch (e) {
+      print('Error saving list review batch: $e');
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  /// Persist admin manual grade for one team + question.
+  static Future<Map<String, dynamic>> saveAdminGrade(
+    int activeGameId, {
+    required int teamId,
+    required int questionId,
+    String? playerAnswer1,
+    String? playerAnswer2,
+    String? playerAnswer3,
+    String? playerAnswer4,
+    int? isCorrect1,
+    int? isCorrect2,
+    int? isCorrect3,
+    int? isCorrect4,
+    double? finalScore,
+  }) async {
+    try {
+      final userData = await UserDataService.getUserData();
+      if (userData == null || userData['access_token'] == null) {
+        return {'success': false, 'message': 'Not authenticated'};
+      }
+      final body = <String, dynamic>{
+        'team_id': teamId,
+        'question_id': questionId,
+      };
+      if (playerAnswer1 != null) body['player_answer1'] = playerAnswer1;
+      if (playerAnswer2 != null) body['player_answer2'] = playerAnswer2;
+      if (playerAnswer3 != null) body['player_answer3'] = playerAnswer3;
+      if (playerAnswer4 != null) body['player_answer4'] = playerAnswer4;
+      if (isCorrect1 != null) body['is_correct_1'] = isCorrect1;
+      if (isCorrect2 != null) body['is_correct_2'] = isCorrect2;
+      if (isCorrect3 != null) body['is_correct_3'] = isCorrect3;
+      if (isCorrect4 != null) body['is_correct_4'] = isCorrect4;
+      if (finalScore != null) body['final_score'] = finalScore;
+
+      final response = await http.post(
+        Uri.parse('$_baseUrl/admin/active-games/$activeGameId/grade'),
+        headers: {
+          'Authorization': 'Bearer ${userData['access_token']}',
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode(body),
+      );
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      return data;
+    } catch (e) {
+      print('Error saving admin grade: $e');
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
   /// Get game questions by round name
   /// Returns list of questions with all their data
   static Future<List<Map<String, dynamic>>> getGameQuestionsByRound(String gameName, String roundName) async {
