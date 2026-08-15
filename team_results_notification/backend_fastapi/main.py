@@ -141,6 +141,10 @@ TRACKING_ATTENTION_INVISIBLE: FrozenSet[str] = frozenset(
     }
 )
 
+PLAYER_MATRIX_VISIBLE: FrozenSet[str] = frozenset({"visible"})
+PLAYER_MATRIX_NOT_VISIBLE: FrozenSet[str] = frozenset({"invisible", "blur"})
+PLAYER_MATRIX_REASONS: FrozenSet[str] = PLAYER_MATRIX_VISIBLE | PLAYER_MATRIX_NOT_VISIBLE
+
 # Serialize echo-based visibility tracking per user (avoids parallel requests double-counting)
 _echo_tracking_locks: Dict[int, asyncio.Lock] = {}
 
@@ -248,7 +252,7 @@ def _try_record_player_tracking_event(
     Insert one row into active_round_tracking_<game> during a valid timer window.
     - connection/disconnection: transition-gated + 3s same-reason cooldown.
     - attention / audit reasons: 3s same-reason cooldown only (distinct reasons preserved).
-    Timestamp is DB-authoritative (DEFAULT CURRENT_TIMESTAMP).
+    Timestamp is DB-authoritative (UTC_TIMESTAMP() on insert).
     """
     if not user or user.role != "player" or not user.playing_in_team_id:
         return
@@ -299,9 +303,9 @@ def _try_record_player_tracking_event(
             text(
                 f"""
                 INSERT INTO `{table}`
-                    (team_id, user_id, round_name, question_id, reason, window_scope, window_id)
+                    (team_id, user_id, round_name, question_id, reason, window_scope, window_id, `timestamp`)
                 VALUES
-                    (:team_id, :user_id, :round_name, :question_id, :reason, :window_scope, :window_id)
+                    (:team_id, :user_id, :round_name, :question_id, :reason, :window_scope, :window_id, UTC_TIMESTAMP())
                 """
             ),
             {
@@ -876,6 +880,57 @@ def _started_round_names_in_control_table(db: Session, game: GamesList) -> List[
         return []
 
 
+def _resolve_game_question_for_slide(
+    db: Session,
+    control_table_name: str,
+    game_table_name: str,
+    slide_number: int,
+    round_name: str,
+) -> Optional[Tuple[int, int, int]]:
+    """
+    Map a control-table slide to the matching game question row.
+    Index = count of slides in this round with slide_number <= current (by slide order).
+    Returns (game_question_id, type_game, time_to_get_answer) or None.
+    """
+    try:
+        idx_row = db.execute(
+            text(
+                f"""
+                SELECT COUNT(*) FROM `{control_table_name}`
+                WHERE round_name = :rn AND slide_number <= :slide
+                """
+            ),
+            {"rn": round_name, "slide": slide_number},
+        ).fetchone()
+        if not idx_row or int(idx_row[0]) <= 0:
+            return None
+        offset = int(idx_row[0]) - 1
+        q_row = db.execute(
+            text(
+                f"""
+                SELECT id, type_game, time_to_get_answer FROM `{game_table_name}`
+                WHERE round_name = :rn
+                ORDER BY id ASC
+                LIMIT 1 OFFSET :off
+                """
+            ),
+            {"rn": round_name, "off": offset},
+        ).fetchone()
+        if not q_row:
+            return None
+        type_game = int(q_row[1]) if q_row[1] is not None else 0
+        time_to_answer = int(q_row[2]) if q_row[2] is not None else 0
+        return int(q_row[0]), type_game, time_to_answer
+    except Exception as e:
+        logger.warning(
+            "Could not resolve game question for slide %s round %r: %s",
+            slide_number,
+            round_name,
+            e,
+        )
+        return None
+
+
 def populate_rounds_info(active_game_id: int, db: Session):
     """
     Populate the global rounds_info dictionary with round names from the game table
@@ -1345,11 +1400,13 @@ def _parse_answers_for_selection(raw) -> tuple:
         return "none", []
     if t == "=":
         return "equals", []
-    if t.startswith("Radio:"):
-        opts = [x.strip() for x in t[6:].split(";") if x.strip()]
+    if t.startswith("Radio:") or t.lower().startswith("radio:"):
+        sep_idx = t.index(":") + 1
+        opts = [x.strip() for x in t[sep_idx:].split(";") if x.strip()]
         return "radio", opts
-    if t.startswith("List:"):
-        opts = [x.strip() for x in t[5:].split(";") if x.strip()]
+    if t.startswith("List:") or t.lower().startswith("list:"):
+        sep_idx = t.index(":") + 1
+        opts = [x.strip() for x in t[sep_idx:].split(";") if x.strip()]
         return "list", opts
     return "none", []
 
@@ -2184,6 +2241,319 @@ def _build_round_grading_grid(
     }
 
 
+def _round_start_utc(
+    db: Session,
+    game: GamesList,
+    round_name: str,
+    fallback_events: Optional[List[dict]] = None,
+) -> Optional[datetime]:
+    """Earliest timer_start for round from action_game_control (UTC)."""
+    table = _action_game_control_table_name(game)
+    if _action_game_control_table_exists(db, table):
+        row = db.execute(
+            text(f"SELECT MIN(timer_start) FROM `{table}` WHERE round_name = :rn"),
+            {"rn": round_name},
+        ).fetchone()
+        if row and row[0] is not None:
+            ts = row[0]
+            if isinstance(ts, datetime) and ts.tzinfo is None:
+                return ts.replace(tzinfo=timezone.utc)
+            return ts
+    if fallback_events:
+        first_ts = min(ev["timestamp"] for ev in fallback_events if ev.get("timestamp"))
+        if isinstance(first_ts, datetime):
+            if first_ts.tzinfo is None:
+                return first_ts.replace(tzinfo=timezone.utc)
+            return first_ts
+    return None
+
+
+def _fetch_round_visibility_events(
+    db: Session,
+    game: GamesList,
+    round_name: str,
+) -> List[dict]:
+    """All visible/invisible/blur rows for a round, ordered by user then time."""
+    game_name_safe = str(game.game_name).strip().lower().replace(" ", "_").replace("-", "_")
+    tname = f"active_round_tracking_{game_name_safe}"
+    exists = db.execute(
+        text(
+            "SELECT COUNT(*) FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :tn"
+        ),
+        {"tn": tname},
+    ).scalar()
+    if not exists:
+        return []
+    reasons = ", ".join(f"'{r}'" for r in sorted(PLAYER_MATRIX_REASONS))
+    rows = db.execute(
+        text(
+            f"""
+            SELECT team_id, user_id, reason, `timestamp`
+            FROM `{tname}`
+            WHERE round_name = :round_name AND reason IN ({reasons})
+            ORDER BY user_id ASC, `timestamp` ASC, id ASC
+            """
+        ),
+        {"round_name": round_name},
+    ).fetchall()
+    out: List[dict] = []
+    for row in rows:
+        ts = row[3]
+        if ts is not None and isinstance(ts, datetime) and ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        out.append(
+            {
+                "team_id": int(row[0]),
+                "user_id": int(row[1]),
+                "reason": str(row[2]),
+                "timestamp": ts,
+            }
+        )
+    return out
+
+
+def _compute_player_tracking_cell(
+    events: List[dict],
+    server_now: datetime,
+) -> dict:
+    """
+    Last state green/red from final visible/invisible/blur event.
+    Episode seconds: first blur/invisible in episode -> 0; second+ counts from first not-visible.
+    visible freezes duration until next episode.
+    """
+    if not events:
+        return {
+            "last_reason": None,
+            "is_visible": True,
+            "invisible_seconds": 0,
+        }
+
+    last_reason = str(events[-1]["reason"])
+    is_visible = last_reason == "visible"
+
+    frozen_seconds = 0
+    in_episode = False
+    episode_first_ts: Optional[datetime] = None
+    episode_not_visible_count = 0
+
+    for ev in events:
+        reason = str(ev["reason"])
+        ts = ev["timestamp"]
+        if reason == "visible":
+            if (
+                in_episode
+                and episode_not_visible_count >= 2
+                and episode_first_ts is not None
+                and ts is not None
+            ):
+                frozen_seconds = max(
+                    0, int((ts - episode_first_ts).total_seconds())
+                )
+            in_episode = False
+            episode_first_ts = None
+            episode_not_visible_count = 0
+        elif reason in PLAYER_MATRIX_NOT_VISIBLE:
+            if not in_episode:
+                in_episode = True
+                episode_first_ts = ts
+                episode_not_visible_count = 1
+            else:
+                episode_not_visible_count += 1
+
+    invisible_seconds = frozen_seconds
+    if not is_visible and in_episode:
+        if (
+            episode_not_visible_count >= 2
+            and episode_first_ts is not None
+        ):
+            invisible_seconds = max(
+                0, int((server_now - episode_first_ts).total_seconds())
+            )
+        else:
+            invisible_seconds = 0
+
+    return {
+        "last_reason": last_reason,
+        "is_visible": is_visible,
+        "invisible_seconds": invisible_seconds,
+    }
+
+
+def _build_player_tracking_graph_points(
+    events: List[dict],
+    round_start: Optional[datetime],
+) -> List[dict]:
+    """Step graph: t_sec from round_start; y=+1 visible, -1 invisible/blur, 0 idle before first event."""
+    if not events or round_start is None:
+        return []
+    points: List[dict] = [{"t_sec": 0, "y": 0}]
+    for ev in events:
+        ts = ev.get("timestamp")
+        if ts is None:
+            continue
+        if isinstance(ts, datetime) and ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        t_sec = max(0, int((ts - round_start).total_seconds()))
+        y = 1 if ev["reason"] == "visible" else -1
+        if points[-1]["t_sec"] == t_sec and points[-1]["y"] == y:
+            continue
+        points.append({"t_sec": t_sec, "y": y})
+    return points
+
+
+def _build_round_player_tracking_matrix(
+    db: Session,
+    active_game: ActiveGame,
+    game: GamesList,
+    round_name: str,
+) -> dict:
+    """Per-team rows × dynamic player columns for admin APP tracking matrix."""
+    server_time = _utc_now()
+    team_ids = _active_game_team_ids(active_game)
+    teams_meta: List[dict] = []
+    for tid in team_ids:
+        team = db.query(Teams).filter(Teams.id == tid).first()
+        teams_meta.append(
+            {
+                "team_id": tid,
+                "team_name": team.team_name if team else f"Team {tid}",
+            }
+        )
+
+    all_events = _fetch_round_visibility_events(db, game, round_name)
+    round_start = _round_start_utc(db, game, round_name, fallback_events=all_events or None)
+
+    by_player: Dict[int, List[dict]] = {}
+    player_team: Dict[int, int] = {}
+    for ev in all_events:
+        uid = int(ev["user_id"])
+        by_player.setdefault(uid, []).append(ev)
+        player_team[uid] = int(ev["team_id"])
+
+    player_ids = sorted(by_player.keys())
+    user_names: Dict[int, str] = {}
+    if player_ids:
+        users = db.query(User).filter(User.id.in_(player_ids)).all()
+        for u in users:
+            user_names[int(u.id)] = u.name or f"Player {u.id}"
+
+    players_out: List[dict] = []
+    for uid in player_ids:
+        players_out.append(
+            {
+                "user_id": uid,
+                "display_name": user_names.get(uid, f"Player {uid}"),
+                "team_id": player_team.get(uid),
+            }
+        )
+
+    teams_out: List[dict] = []
+    for tm in teams_meta:
+        tid = int(tm["team_id"])
+        cells: List[dict] = []
+        for uid in player_ids:
+            if player_team.get(uid) != tid:
+                continue
+            evs = by_player.get(uid, [])
+            cell = _compute_player_tracking_cell(evs, server_time)
+            cells.append(
+                {
+                    "user_id": uid,
+                    "display_name": user_names.get(uid, f"Player {uid}"),
+                    **cell,
+                }
+            )
+        teams_out.append(
+            {
+                "team_id": tid,
+                "team_name": tm["team_name"],
+                "cells": cells,
+            }
+        )
+
+    round_timer: Optional[dict] = None
+    snap = _build_active_timer_snapshot()
+    if (
+        snap
+        and snap.get("kind") == "round_final_window"
+        and str(snap.get("round_name") or "") == round_name
+        and int(snap.get("active_game_id") or 0) == int(active_game.id)
+    ):
+        round_timer = {
+            "duration_sec": int(snap.get("duration_sec") or 0),
+            "remaining_sec": int(snap.get("remaining_sec") or 0),
+            "ends_at": snap.get("ends_at"),
+            "is_active": bool(snap.get("is_active")),
+        }
+
+    return {
+        "server_time": server_time.isoformat(),
+        "round_name": round_name,
+        "active_game_id": active_game.id,
+        "game_name": game.game_name,
+        "round_start_utc": round_start.isoformat() if round_start else None,
+        "round_timer": round_timer,
+        "players": players_out,
+        "teams": teams_out,
+    }
+
+
+def _build_round_player_tracking_detail(
+    db: Session,
+    active_game: ActiveGame,
+    game: GamesList,
+    round_name: str,
+    user_id: int,
+) -> Optional[dict]:
+    """Single-player event table + step graph for admin dialog."""
+    all_events = _fetch_round_visibility_events(db, game, round_name)
+    player_events = [ev for ev in all_events if int(ev["user_id"]) == int(user_id)]
+    if not player_events:
+        return None
+
+    user = db.query(User).filter(User.id == user_id).first()
+    round_start = _round_start_utc(db, game, round_name, fallback_events=all_events)
+    server_time = _utc_now()
+    cell = _compute_player_tracking_cell(player_events, server_time)
+
+    events_out: List[dict] = []
+    for ev in player_events:
+        ts = ev["timestamp"]
+        offset_sec: Optional[int] = None
+        if round_start is not None and ts is not None:
+            if isinstance(ts, datetime) and ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            offset_sec = max(0, int((ts - round_start).total_seconds()))
+        events_out.append(
+            {
+                "reason": ev["reason"],
+                "timestamp": ts.isoformat() if ts is not None else None,
+                "offset_sec": offset_sec,
+            }
+        )
+
+    return {
+        "user_id": int(user_id),
+        "display_name": user.name if user else f"Player {user_id}",
+        "team_id": int(player_events[0]["team_id"]),
+        "round_start_utc": round_start.isoformat() if round_start else None,
+        **cell,
+        "events": events_out,
+        "graph_points": _build_player_tracking_graph_points(player_events, round_start),
+    }
+
+
+def _build_round_app_tracking_summary(
+    db: Session,
+    active_game: ActiveGame,
+    game: GamesList,
+    round_name: str,
+) -> dict:
+    """Alias for per-player matrix payload (admin Tracking APP monitor)."""
+    return _build_round_player_tracking_matrix(db, active_game, game, round_name)
+
+
 def _round_review_flags(
     db: Session, game_table: str, round_name: str, qrows: Optional[List[Any]] = None
 ) -> Tuple[int, bool, List[str]]:
@@ -2329,9 +2699,50 @@ def _build_question_review_payload(
     }
 
 
+def _canonical_list_rows_sort_key(label: str) -> str:
+    """Case-insensitive A→B ordering for review grid labels (incl. Cyrillic)."""
+    return _normalize_answer_text(label) or str(label or "").casefold()
+
+
+def _register_canonical_list_owner(
+    owners: Dict[str, dict],
+    opt: str,
+    qid: int,
+    qnum: Any,
+    col: int,
+    cell: str,
+    reg_score: Any,
+    bonus_score: Any,
+) -> None:
+    label = (opt or "").strip()
+    key = _normalize_answer_text(label)
+    if not key or key in owners:
+        return
+    syns = _split_synonyms(cell) if cell else [label]
+    if label not in syns:
+        syns = [label] + [s for s in syns if s != label]
+    reg_pair = str(reg_score or "1;0").split(";")
+    default_c = _coerce_score_float(reg_pair[0] if reg_pair else 1)
+    default_w = _coerce_score_float(reg_pair[1] if len(reg_pair) > 1 else 0)
+    owners[key] = {
+        "question_id": int(qid),
+        "question_num": qnum,
+        "slot_col": col,
+        "label": label,
+        "synonyms": syns,
+        "default_correct_score": default_c,
+        "default_wrong_score": default_w,
+    }
+
+
 def _build_canonical_list_rows_for_round(
     db: Session, game_table: str, round_name: str
 ) -> List[dict]:
+    """
+    Unique right list answers for the round, sorted A→B.
+    Labels prefer shared pool option text (e.g. 25/17, BLIZKEY) when an answer
+    cell matches the pool — not the first synonym fragment (e.g. artist name).
+    """
     rq = text(
         f"""
         SELECT id, question_num, answers_for_selection, answer1, answer2, answer3, answer4,
@@ -2343,34 +2754,225 @@ def _build_canonical_list_rows_for_round(
     )
     qrows = db.execute(rq, {"rn": round_name}).fetchall()
     qrows = _sort_rows_by_question_num(list(qrows), num_index=1, id_index=0)
-    rows: List[dict] = []
-    idx = 0
+    list_pool = _canonical_list_options_first_in_round(
+        [(r[0], r[1], r[2]) for r in qrows]
+    )
+
+    owners: Dict[str, dict] = {}
+    list_questions: List[Any] = []
+
     for r in qrows:
         qid, qnum, afs, a1, a2, a3, a4, reg_score, bonus_score = r
+        kind, pool_opts = _parse_answers_for_selection(afs)
+        if kind != "list":
+            continue
+        list_questions.append(r)
+        pairs = _ordered_nonempty_game_cells(a1, a2, a3, a4)
+        search_pool = pool_opts or list_pool
+        for col, cell in pairs:
+            matched_pool = False
+            for opt in search_pool:
+                if _cell_player_matches_expected("list", cell, opt):
+                    _register_canonical_list_owner(
+                        owners, opt, int(qid), qnum, col, cell, reg_score, bonus_score
+                    )
+                    matched_pool = True
+            if not matched_pool:
+                syns = _split_synonyms(cell)
+                fallback_label = syns[0] if syns else str(cell)
+                _register_canonical_list_owner(
+                    owners,
+                    fallback_label,
+                    int(qid),
+                    qnum,
+                    col,
+                    cell,
+                    reg_score,
+                    bonus_score,
+                )
+
+    if not owners and list_pool and list_questions:
+        fq = list_questions[0]
+        fqid, fqnum, _, _, _, _, freg, fbonus = (
+            int(fq[0]),
+            fq[1],
+            fq[2],
+            fq[3],
+            fq[4],
+            fq[5],
+            fq[6],
+            fq[7],
+        )
+        for opt in list_pool:
+            _register_canonical_list_owner(
+                owners, opt, fqid, fqnum, 1, opt, freg, fbonus
+            )
+
+    ordered = sorted(
+        owners.values(), key=lambda e: _canonical_list_rows_sort_key(e["label"])
+    )
+    rows: List[dict] = []
+    for idx, entry in enumerate(ordered):
+        rows.append(
+            {
+                "row_index": idx,
+                "question_id": entry["question_id"],
+                "question_num": entry["question_num"],
+                "slot_col": entry["slot_col"],
+                "label": entry["label"],
+                "synonyms": entry["synonyms"],
+                "default_correct_score": entry["default_correct_score"],
+                "default_wrong_score": entry["default_wrong_score"],
+            }
+        )
+    return rows
+
+
+def _pick_matches_canonical_row(pick_text: str, crow: dict) -> bool:
+    pt = _normalize_answer_text(pick_text)
+    if not pt:
+        return False
+    if pt == _normalize_answer_text(crow.get("label") or ""):
+        return True
+    ref = _list_ref_cell_for_canonical_row(crow)
+    return _cell_player_matches_expected("list", ref, pick_text)
+
+
+def _list_ref_cell_for_canonical_row(crow: dict) -> str:
+    syns = crow.get("synonyms") or []
+    if len(syns) > 1:
+        return ";".join(syns)
+    if syns:
+        return syns[0]
+    return str(crow.get("label") or "")
+
+
+def _collect_team_round_list_picks(
+    db: Session,
+    answers_table: str,
+    game_table: str,
+    round_name: str,
+    team_id: int,
+) -> List[dict]:
+    """All nonempty list picks submitted by one team in this round (any question slot)."""
+    rq = text(
+        f"""
+        SELECT id, answers_for_selection
+        FROM `{game_table}`
+        WHERE round_name = :rn
+        ORDER BY question_num ASC, id ASC
+        """
+    )
+    qrows = db.execute(rq, {"rn": round_name}).fetchall()
+    qrows = _sort_rows_by_question_num(list(qrows), num_index=1, id_index=0)
+    picks: List[dict] = []
+    for qid, afs in [(int(r[0]), r[1]) for r in qrows]:
         kind, _opts = _parse_answers_for_selection(afs)
         if kind != "list":
             continue
-        pairs = _ordered_nonempty_game_cells(a1, a2, a3, a4)
-        reg_pair = str(reg_score or "1;0").split(";")
-        default_c = _coerce_score_float(reg_pair[0] if reg_pair else 1)
-        default_w = _coerce_score_float(reg_pair[1] if len(reg_pair) > 1 else 0)
-        for col, cell in pairs:
-            syns = _split_synonyms(cell)
-            label = syns[0] if syns else str(cell)
-            rows.append(
+        grade_row = _fetch_team_answer_grade_row(db, answers_table, team_id, qid)
+        p1, p2, p3, p4, _, _ = _fetch_team_slots_four(db, answers_table, team_id, qid)
+        for col, raw in enumerate([p1, p2, p3, p4], start=1):
+            text_val = (raw or "").strip()
+            if not text_val:
+                continue
+            tokens = [x.strip() for x in text_val.split(",") if x.strip()]
+            pick_text = tokens[0] if tokens else text_val
+            ic_key = f"is_correct_{col}"
+            ic_raw = grade_row.get(ic_key) if grade_row else None
+            picks.append(
                 {
-                    "row_index": idx,
-                    "question_id": int(qid),
-                    "question_num": qnum,
+                    "text": pick_text,
+                    "question_id": qid,
                     "slot_col": col,
-                    "label": label,
-                    "synonyms": syns,
-                    "default_correct_score": default_c,
-                    "default_wrong_score": default_w,
+                    "is_correct": ic_raw,
                 }
             )
-            idx += 1
-    return rows
+    return picks
+
+
+def _map_team_picks_to_canonical_grid(
+    team_picks: List[dict],
+    canonical_rows: List[dict],
+) -> Dict[int, dict]:
+    """
+    Map a team's list picks onto canonical rows (Example #6 auto-layout):
+    1) match pick → row by synonym when possible
+    2) unmatched picks → first still-empty rows as wrong
+    3) remaining rows → no answer
+    """
+    grid: Dict[int, dict] = {}
+    used_rows: set = set()
+    unmatched: List[dict] = []
+
+    for pick in team_picks:
+        pick_text = (pick.get("text") or "").strip()
+        if not pick_text:
+            continue
+        matched_row: Optional[dict] = None
+        for crow in canonical_rows:
+            ri = crow["row_index"]
+            if ri in used_rows:
+                continue
+            if _pick_matches_canonical_row(pick_text, crow):
+                matched_row = crow
+                break
+        if matched_row is None:
+            unmatched.append(pick)
+            continue
+        ri = matched_row["row_index"]
+        used_rows.add(ri)
+        ref_cell = _list_ref_cell_for_canonical_row(matched_row)
+        suggested = _suggest_list_cell_grade("list", ref_cell, pick_text)
+        ic_raw = pick.get("is_correct")
+        same_slot = (
+            pick.get("question_id") == matched_row["question_id"]
+            and pick.get("slot_col") == matched_row["slot_col"]
+        )
+        if same_slot and ic_raw is not None:
+            ic = ic_raw
+        else:
+            ic = suggested
+        grid[ri] = {
+            "row_index": ri,
+            "question_id": matched_row["question_id"],
+            "slot_col": matched_row["slot_col"],
+            "player_answer": pick_text,
+            "is_correct": ic,
+            "suggested_is_correct": suggested,
+            "correct_score": matched_row["default_correct_score"],
+            "wrong_score": matched_row["default_wrong_score"],
+        }
+
+    for pick in unmatched:
+        pick_text = (pick.get("text") or "").strip()
+        if not pick_text:
+            continue
+        target: Optional[dict] = None
+        for crow in canonical_rows:
+            ri = crow["row_index"]
+            if ri not in used_rows:
+                target = crow
+                break
+        if target is None:
+            continue
+        ri = target["row_index"]
+        used_rows.add(ri)
+        ref_cell = _list_ref_cell_for_canonical_row(target)
+        suggested = _suggest_list_cell_grade("list", ref_cell, pick_text)
+        ic_raw = pick.get("is_correct")
+        grid[ri] = {
+            "row_index": ri,
+            "question_id": target["question_id"],
+            "slot_col": target["slot_col"],
+            "player_answer": pick_text,
+            "is_correct": ic_raw if ic_raw is not None else (suggested if suggested != 0 else -1),
+            "suggested_is_correct": suggested if suggested != 0 else -1,
+            "correct_score": target["default_correct_score"],
+            "wrong_score": target["default_wrong_score"],
+        }
+
+    return grid
 
 
 def _suggest_list_cell_grade(kind: str, expected_cell: str, player_answer: str) -> int:
@@ -2399,35 +3001,47 @@ def _build_round_list_review_payload(
     teams_out: List[dict] = []
     for tid in _active_game_team_ids(active_game):
         team = db.query(Teams).filter(Teams.id == tid).first()
+        team_picks = _collect_team_round_list_picks(
+            db, answers_table, game_table, round_name, tid
+        )
+        pick_grid = _map_team_picks_to_canonical_grid(team_picks, canonical_rows)
         cells: List[dict] = []
         for crow in canonical_rows:
-            qid = crow["question_id"]
-            col = crow["slot_col"]
-            row = _fetch_team_answer_grade_row(db, answers_table, tid, qid)
-            p1, p2, p3, p4, corr_pts, wrong_pts = _fetch_team_slots_four(
-                db, answers_table, tid, qid
-            )
-            p_four = [p1, p2, p3, p4]
-            player_answer = p_four[col - 1]
-            ic_key = f"is_correct_{col}"
-            ic_raw = row.get(ic_key) if row else None
-            ref_cell = crow["synonyms"][0] if crow["synonyms"] else crow["label"]
-            if len(crow["synonyms"]) > 1:
-                ref_cell = ";".join(crow["synonyms"])
-            suggested = _suggest_list_cell_grade("list", ref_cell, player_answer)
-            ic = ic_raw if ic_raw is not None else suggested
-            cells.append(
-                {
-                    "row_index": crow["row_index"],
-                    "question_id": qid,
-                    "slot_col": col,
-                    "player_answer": player_answer,
-                    "is_correct": ic,
-                    "suggested_is_correct": suggested,
-                    "correct_score": corr_pts if corr_pts else crow["default_correct_score"],
-                    "wrong_score": wrong_pts if wrong_pts is not None else crow["default_wrong_score"],
-                }
-            )
+            ri = crow["row_index"]
+            mapped = pick_grid.get(ri)
+            if mapped is not None:
+                _, _, _, _, corr_pts, wrong_pts = _fetch_team_slots_four(
+                    db, answers_table, tid, mapped["question_id"]
+                )
+                cells.append(
+                    {
+                        "row_index": ri,
+                        "question_id": mapped["question_id"],
+                        "slot_col": mapped["slot_col"],
+                        "player_answer": mapped["player_answer"],
+                        "is_correct": mapped["is_correct"],
+                        "suggested_is_correct": mapped["suggested_is_correct"],
+                        "correct_score": corr_pts
+                        if corr_pts
+                        else mapped["correct_score"],
+                        "wrong_score": wrong_pts
+                        if wrong_pts is not None
+                        else mapped["wrong_score"],
+                    }
+                )
+            else:
+                cells.append(
+                    {
+                        "row_index": ri,
+                        "question_id": crow["question_id"],
+                        "slot_col": crow["slot_col"],
+                        "player_answer": "",
+                        "is_correct": 0,
+                        "suggested_is_correct": 0,
+                        "correct_score": crow["default_correct_score"],
+                        "wrong_score": crow["default_wrong_score"],
+                    }
+                )
         teams_out.append(
             {
                 "team_id": tid,
@@ -2533,6 +3147,145 @@ def _build_active_game_scoreboard(
         "round_names": round_names,
         "teams": teams_out,
     }
+
+
+QUZE_EXPORT_SERVER_DIR = os.getenv("QUZE_EXPORT_SERVER_DIR", "").strip()
+
+
+def _slug_for_export_filename(name: str) -> str:
+    s = str(name or "game").strip().lower()
+    s = re.sub(r"[^\w]+", "_", s, flags=re.UNICODE)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return (s[:80] or "game")
+
+
+def _export_timestamp_str() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _format_export_cell_value(value: Any) -> Union[int, float, str]:
+    """Excel-friendly score: int when whole, else float."""
+    if value is None or value == "":
+        return 0
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if abs(n - round(n)) < 1e-9:
+        return int(round(n))
+    return round(n, 2)
+
+
+def _grading_cell_points(cell: Optional[dict]) -> float:
+    if not cell:
+        return 0.0
+    if "points" in cell and cell["points"] is not None:
+        return _coerce_score_float(cell["points"])
+    return _answer_row_display_points(cell)
+
+
+def _build_results_excel_workbook(
+    db: Session,
+    active_game: ActiveGame,
+    game: GamesList,
+    scoreboard: Optional[dict] = None,
+) -> bytes:
+    """SUMMARY sheet + R1..Rn round matrices matching venue export layout."""
+    from openpyxl import Workbook
+    import io
+
+    if scoreboard is None:
+        scoreboard = _build_active_game_scoreboard(db, active_game, game)
+    round_names: List[str] = scoreboard.get("round_names") or []
+    teams_sb: List[dict] = scoreboard.get("teams") or []
+
+    wb = Workbook()
+    ws_summary = wb.active
+    ws_summary.title = "SUMMARY"
+
+    summary_headers = ["#", "КОМАНДЫ", "ИГРАЮТ", "СТАРТ"] + list(round_names) + ["ФИНАЛ"]
+    ws_summary.append(summary_headers)
+    for team in teams_sb:
+        round_scores = team.get("round_scores") or {}
+        row: List[Any] = [
+            team.get("rank"),
+            team.get("team_name"),
+            team.get("play_players"),
+            _format_export_cell_value(team.get("start_total")),
+        ]
+        for rn in round_names:
+            row.append(_format_export_cell_value(round_scores.get(rn, 0)))
+        row.append(_format_export_cell_value(team.get("total")))
+        ws_summary.append(row)
+
+    for round_index, round_name in enumerate(round_names, start=1):
+        grid = _build_round_grading_grid(db, active_game, game, round_name)
+        sheet_title = f"R{round_index}"
+        ws_round = wb.create_sheet(title=sheet_title)
+
+        ws_round.append(["", round_name])
+        questions: List[dict] = grid.get("questions") or []
+        q_headers: List[Any] = ["#", "КОМАНДЫ"]
+        for q in questions:
+            qnum = q.get("question_num")
+            q_headers.append(str(qnum) if qnum is not None else "")
+        q_headers.append("ИТОГ")
+        ws_round.append(q_headers)
+
+        grid_teams: List[dict] = grid.get("teams") or []
+        for team in grid_teams:
+            cells = team.get("cells") or {}
+            data_row: List[Any] = [
+                team.get("rank"),
+                team.get("team_name"),
+            ]
+            for q in questions:
+                qid = str(q.get("question_id"))
+                cell = cells.get(qid)
+                data_row.append(_format_export_cell_value(_grading_cell_points(cell)))
+            data_row.append(_format_export_cell_value(team.get("round_total")))
+            ws_round.append(data_row)
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+def _save_results_excel_to_server_dir(
+    content: bytes,
+    game_slug: str,
+    timestamp: str,
+) -> dict:
+    if not QUZE_EXPORT_SERVER_DIR:
+        return {
+            "ok": False,
+            "aborted": True,
+            "message": "QUZE_EXPORT_SERVER_DIR is not set",
+        }
+    if not os.path.isdir(QUZE_EXPORT_SERVER_DIR):
+        return {
+            "ok": False,
+            "aborted": True,
+            "message": f"QUZE_EXPORT_SERVER_DIR does not exist: {QUZE_EXPORT_SERVER_DIR}",
+        }
+    filename = f"server_{game_slug}_{timestamp}.xlsx"
+    target_path = os.path.join(QUZE_EXPORT_SERVER_DIR, filename)
+    try:
+        with open(target_path, "wb") as outfile:
+            outfile.write(content)
+        return {
+            "ok": True,
+            "aborted": False,
+            "path": target_path,
+            "filename": filename,
+        }
+    except OSError as exc:
+        logger.error("Failed to write export to server dir: %s", exc)
+        return {
+            "ok": False,
+            "aborted": True,
+            "message": f"Could not write to QUZE_EXPORT_SERVER_DIR: {exc}",
+        }
 
 
 def _auto_grade_question_multislot(
@@ -4744,6 +5497,69 @@ async def get_active_game_scoreboard(
         return {"success": False, "message": f"Error building scoreboard: {str(e)}"}
 
 
+class ExportResultsRequest(BaseModel):
+    destinations: List[str]
+
+
+@app.post("/api/admin/active-games/{active_game_id}/export-results", response_model=dict)
+async def export_active_game_results(
+    active_game_id: int,
+    body: ExportResultsRequest,
+    db: Session = Depends(get_db),
+):
+    """Build SUMMARY + R1..Rn Excel export; optional server save and base64 for local download."""
+    import base64
+
+    destinations = {str(d).strip().lower() for d in (body.destinations or [])}
+    want_server = "server" in destinations
+    want_local = "local" in destinations
+
+    if not want_server and not want_local:
+        return {"success": False, "message": "Select at least one export destination (local or server)."}
+
+    try:
+        active_game = db.query(ActiveGame).filter(ActiveGame.id == active_game_id).first()
+        if not active_game:
+            return {"success": False, "message": "Active game not found"}
+        game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
+        if not game:
+            return {"success": False, "message": "Game not found"}
+
+        game_slug = _slug_for_export_filename(game.game_name)
+        timestamp = _export_timestamp_str()
+
+        scoreboard = _build_active_game_scoreboard(db, active_game, game)
+        excel_bytes = _build_results_excel_workbook(db, active_game, game, scoreboard)
+
+        response: Dict[str, Any] = {
+            "success": True,
+            "game_name": game.game_name,
+            "game_slug": game_slug,
+            "timestamp": timestamp,
+            "round_count": len(scoreboard.get("round_names") or []),
+            "server": None,
+            "local": None,
+        }
+
+        if want_server:
+            response["server"] = _save_results_excel_to_server_dir(
+                excel_bytes, game_slug, timestamp
+            )
+
+        if want_local:
+            local_filename = f"local_{game_slug}_{timestamp}.xlsx"
+            response["local"] = {
+                "ready": True,
+                "filename": local_filename,
+                "file_base64": base64.b64encode(excel_bytes).decode("ascii"),
+            }
+
+        return response
+    except Exception as e:
+        logger.error(f"Error exporting active game results: {e}")
+        return {"success": False, "message": f"Error exporting results: {str(e)}"}
+
+
 @app.get(
     "/api/admin/active-games/{active_game_id}/rounds/started-status",
     response_model=dict,
@@ -5186,6 +6002,69 @@ async def get_active_game_round_tracking(
     except Exception as e:
         logger.error("round-tracking: %s", e)
         return {"success": False, "message": str(e), "data": []}
+
+
+@app.get(
+    "/api/admin/active-games/{active_game_id}/rounds/{round_name}/app-tracking",
+    response_model=dict,
+)
+async def get_round_app_tracking(
+    active_game_id: int,
+    round_name: str,
+    db: Session = Depends(get_db),
+):
+    """Per-player visibility matrix for admin Tracking APP monitor."""
+    try:
+        active_game = db.query(ActiveGame).filter(ActiveGame.id == active_game_id).first()
+        if not active_game:
+            return {"success": False, "message": "Active game not found"}
+        game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
+        if not game:
+            return {"success": False, "message": "Game not found"}
+        if not _round_started_in_control_table(db, game, round_name):
+            return {
+                "success": False,
+                "message": "Round has not started yet (no records in action_game_control)",
+            }
+        data = _build_round_player_tracking_matrix(db, active_game, game, round_name)
+        return {"success": True, **data}
+    except Exception as e:
+        logger.error("app-tracking: %s", e)
+        return {"success": False, "message": str(e)}
+
+
+@app.get(
+    "/api/admin/active-games/{active_game_id}/rounds/{round_name}/app-tracking/players/{user_id}",
+    response_model=dict,
+)
+async def get_round_app_tracking_player(
+    active_game_id: int,
+    round_name: str,
+    user_id: int,
+    db: Session = Depends(get_db),
+):
+    """Single-player tracking events + step graph for admin dialog."""
+    try:
+        active_game = db.query(ActiveGame).filter(ActiveGame.id == active_game_id).first()
+        if not active_game:
+            return {"success": False, "message": "Active game not found"}
+        game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
+        if not game:
+            return {"success": False, "message": "Game not found"}
+        if not _round_started_in_control_table(db, game, round_name):
+            return {
+                "success": False,
+                "message": "Round has not started yet (no records in action_game_control)",
+            }
+        detail = _build_round_player_tracking_detail(
+            db, active_game, game, round_name, user_id
+        )
+        if detail is None:
+            return {"success": False, "message": "No tracking events for this player"}
+        return {"success": True, **detail}
+    except Exception as e:
+        logger.error("app-tracking player: %s", e)
+        return {"success": False, "message": str(e)}
 
 
 @app.post("/api/admin/active-games/{active_game_id}/start", response_model=dict)
@@ -6421,8 +7300,7 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
 
             if existing_row:
                 # Update existing row in DB
-                question_id = existing_row[0]
-                _id = question_id
+                stored_round = existing_row[1] or round_name
                 update_sql = text(f"""
                     UPDATE `{control_table_name}`
                     SET timer_start = :timer_start
@@ -6431,16 +7309,20 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
                 db.execute(update_sql, {"timer_start": timer_start, "slide_num": slide_number})
                 db.commit()
 
-                # Get final_timer and time_to_get_answer from game table
-                try:
-                    question_data_result = db.execute(text(f"SELECT type_game, time_to_get_answer FROM `{game_table_name}` WHERE id = :qid"), {"qid": question_id})
-                    question_data_row = question_data_result.fetchone()
-                    _timer = int(question_data_row[0]) if question_data_row and question_data_row[0] is not None else 0
-                    question_timer = int(question_data_row[1]) if question_data_row and question_data_row[1] is not None else 0
-                except Exception as e:
-                    logger.warning(f"Could not get type_game/time_to_get_answer for question_id {question_id}: {e}")
+                resolved = _resolve_game_question_for_slide(
+                    db, control_table_name, game_table_name, slide_number, stored_round
+                )
+                if resolved:
+                    _id, _timer, question_timer = resolved
+                else:
+                    _id = 0
                     _timer = 0
                     question_timer = 0
+                    logger.warning(
+                        "No game question for existing control slide %s round %r",
+                        slide_number,
+                        stored_round,
+                    )
 
                 # Update rounds_info with Slide and time_now (just in case the PPT is changed)
                 round_key = None
@@ -6461,56 +7343,30 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
                 db.execute(insert_sql, {"slide_num": slide_number, "round_name": round_name, "timer_start": timer_start})
                 db.commit()
 
-                # Get the inserted question_id
-                get_id_sql = text(f"SELECT question_id FROM `{control_table_name}` WHERE slide_number = :slide_num")
-                id_result = db.execute(get_id_sql, {"slide_num": slide_number})
-                inserted_row = id_result.fetchone()
-                if inserted_row:
-                    _id = inserted_row[0]
+                resolved = _resolve_game_question_for_slide(
+                    db, control_table_name, game_table_name, slide_number, round_name
+                )
+                if resolved:
+                    _id, _timer, question_timer = resolved
+                else:
+                    _id = 0
+                    _timer = 0
+                    question_timer = 0
+                    logger.warning(
+                        "No game question for new control slide %s round %r",
+                        slide_number,
+                        round_name,
+                    )
 
-                    # Check if question_id exists in the game table,
-                    # and the round_name from slide matches to the round_name for the question_id
-                    try:
-                        check_round_sql = text(f"SELECT round_name FROM `{game_table_name}` WHERE id = :qid")
-                        round_result = db.execute(check_round_sql, {"qid": _id})
-                        game_round_row = round_result.fetchone()
+                round_key = None
+                for key, value in rounds_info.items():
+                    if value.get("Name") == round_name:
+                        round_key = key
+                        break
 
-                        if game_round_row and game_round_row[0] == round_name:
-                            # Valid - get final_timer (type_game) and time_to_get_answer
-                            try:
-                                question_data_result = db.execute(text(f"SELECT type_game, time_to_get_answer FROM `{game_table_name}` WHERE id = :qid"), {"qid": _id})
-                                question_data_row = question_data_result.fetchone()
-                                _timer = int(question_data_row[0]) if question_data_row and question_data_row[0] is not None else 0
-                                question_timer = int(question_data_row[1]) if question_data_row and question_data_row[1] is not None else 0
-                            except Exception as e:
-                                logger.warning(f"Could not get type_game/time_to_get_answer for question_id {_id}: {e}")
-                                _timer = 0
-                                question_timer = 0
-
-                            # Update rounds_info with Slide and time_now
-                            round_key = None
-                            for key, value in rounds_info.items():
-                                if value.get("Name") == round_name:
-                                    round_key = key
-                                    break
-
-                            if round_key:
-                                rounds_info[round_key]["Slide"] = slide_number
-                                rounds_info[round_key]["time_now"] = timer_start
-                        else:
-                            # round_name doesn't match - remove the inserted row
-                            delete_sql = text(f"DELETE FROM `{control_table_name}` WHERE slide_number = :slide_num")
-                            db.execute(delete_sql, {"slide_num": slide_number})
-                            db.commit()
-                            logger.warning(f"Round name mismatch for question_id {_id}. Removed inserted row.")
-                            # Don't send broadcast message
-
-                    except Exception as e:
-                        logger.error(f"Error checking round_name for question_id {_id}: {e}")
-                        # Remove the inserted row on error
-                        delete_sql = text(f"DELETE FROM `{control_table_name}` WHERE slide_number = :slide_num")
-                        db.execute(delete_sql, {"slide_num": slide_number})
-                        db.commit()
+                if round_key:
+                    rounds_info[round_key]["Slide"] = slide_number
+                    rounds_info[round_key]["time_now"] = timer_start
 
             # If DB left question_timer at 0, use optional VBA "#time#" segment from trigger string
             if question_timer == 0:

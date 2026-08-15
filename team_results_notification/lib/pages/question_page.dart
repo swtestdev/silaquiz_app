@@ -85,8 +85,11 @@ Future<void> reapplyGlobalStartTimerFromGameData(
   int questionTimerSeconds,
 ) async {
   if (questionTimerSeconds <= 0) return;
+  final action = message['timer_action']?.toString() ?? '';
+  if (action != 'START_TIME' && action != 'START_TIMER') return;
   final enriched = Map<String, dynamic>.from(message);
   enriched['question_timer'] = questionTimerSeconds;
+  enriched['timer_action'] = action;
   await TimerStore.instance.applyTrigger(enriched);
 }
 
@@ -720,7 +723,10 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
         return;
       }
       
-      // If question_id is 0, get the last question_id from action_game_control for this round_name
+      // If question_id is 0, resolve scores from action_game_control but keep timer qid=0
+      // for publish/editability rules (classic rounds must not publish on STOP at slide boundary).
+      final timerQuestionId = questionId;
+      dynamic scoreQuestionId = questionId;
       if (questionId == null || questionId == 0) {
         print('QuestionPage: question_id is 0, retrieving from action_game_control for round_name: $roundName');
         final gameNameSafe = gameName.replaceAll(' ', '_').replaceAll('-', '_').toLowerCase();
@@ -733,16 +739,14 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
         
         final controlQuestionId = controlData['question_id'];
         print('QuestionPage: Retrieved question_id=$controlQuestionId from action_game_control for round_name: $roundName');
-        
-        // Use the question_id from control table, but we'll still show all questions in the round
-        questionId = controlQuestionId;
+        scoreQuestionId = controlQuestionId;
       }
       
       print('QuestionPage: Game name: $gameName');
 
-      final int? resolvedQuestionId = questionId is int
-          ? questionId
-          : int.tryParse(questionId?.toString() ?? '');
+      final int? resolvedQuestionId = scoreQuestionId is int
+          ? scoreQuestionId
+          : int.tryParse(scoreQuestionId?.toString() ?? '');
       
       // Update current game name for storage
       _currentGameNameForStorage = gameName;
@@ -799,6 +803,9 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
           resolvedQuestionId != null &&
           resolvedQuestionId > 0 &&
           _gameData.containsKey(resolvedQuestionId)) {
+        final timerAction = message['timer_action']?.toString() ?? '';
+        final canReapplyStart =
+            timerAction == 'START_TIME' || timerAction == 'START_TIMER';
         final ttaRaw = _gameData[resolvedQuestionId]!['time_to_get_answer'];
         var tta = 0;
         if (ttaRaw is int) {
@@ -806,7 +813,7 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
         } else if (ttaRaw != null) {
           tta = int.tryParse(ttaRaw.toString()) ?? 0;
         }
-        if (tta > 0) {
+        if (canReapplyStart && tta > 0) {
           print('QuestionPage: Re-applying global START timer with time_to_get_answer=$tta from game data');
           await reapplyGlobalStartTimerFromGameData(message, tta);
           if (mounted) await _loadTimerStatus();
@@ -901,7 +908,7 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
       }
       await _buildAnswersFromGameData(
         roundName,
-        questionId,
+        timerQuestionId,
         savedAnswers,
         effectiveActiveGame,
         teamAnswersFromDb,
@@ -910,8 +917,8 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
       print('QuestionPage: Built ${_answers.length} answers');
       
       // Update game info with specific question data
-      print('QuestionPage: Updating game info for question_id: $questionId');
-      await _updateGameInfo(activeGame, questionId);
+      print('QuestionPage: Updating game info for question_id: $scoreQuestionId');
+      await _updateGameInfo(activeGame, scoreQuestionId);
       print('QuestionPage: Game info updated - _gameName=$_gameName, _roundName=$_roundName, _regScore=$_regScore/$_regScoreTotal, _bonusScore=$_bonusScore/$_bonusScoreTotal');
       
     } catch (e, stackTrace) {

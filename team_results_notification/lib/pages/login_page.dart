@@ -1359,6 +1359,31 @@ class DatabaseService {
     }
   }
 
+  /// Export active game results as multi-sheet Excel (SUMMARY + R1..Rn).
+  static Future<Map<String, dynamic>> exportActiveGameResults(
+    int activeGameId,
+    List<String> destinations,
+  ) async {
+    try {
+      final response = await http.post(
+        Uri.parse('$_baseUrl/admin/active-games/$activeGameId/export-results'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'destinations': destinations}),
+      );
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      if (response.statusCode == 200 && data['success'] == true) {
+        return data;
+      }
+      return {
+        'success': false,
+        'message': data['message'] ?? 'Failed to export results',
+      };
+    } catch (e) {
+      print('Error exporting active game results: $e');
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
   /// Admin grading matrix for a round in an active game.
   static Future<Map<String, dynamic>> getRoundGradingGrid(
     int activeGameId,
@@ -1382,6 +1407,61 @@ class DatabaseService {
       };
     } catch (e) {
       print('Error fetching grading grid: $e');
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  /// Aggregated APP tracking (DIS/INV/BLUR + live status) for a round.
+  static Future<Map<String, dynamic>> getRoundAppTracking(
+    int activeGameId,
+    String roundName,
+  ) async {
+    try {
+      final encodedRound = Uri.encodeComponent(roundName);
+      final response = await http.get(
+        Uri.parse(
+          '$_baseUrl/admin/active-games/$activeGameId/rounds/$encodedRound/app-tracking',
+        ),
+        headers: {'Content-Type': 'application/json'},
+      );
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      if (response.statusCode == 200 && data['success'] == true) {
+        return data;
+      }
+      return {
+        'success': false,
+        'message': data['message'] ?? 'Failed to load app tracking',
+      };
+    } catch (e) {
+      print('Error fetching app tracking: $e');
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  /// Per-player tracking detail (events + graph) for admin dialog.
+  static Future<Map<String, dynamic>> getRoundAppTrackingPlayer(
+    int activeGameId,
+    String roundName,
+    int userId,
+  ) async {
+    try {
+      final encodedRound = Uri.encodeComponent(roundName);
+      final response = await http.get(
+        Uri.parse(
+          '$_baseUrl/admin/active-games/$activeGameId/rounds/$encodedRound/app-tracking/players/$userId',
+        ),
+        headers: {'Content-Type': 'application/json'},
+      );
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      if (response.statusCode == 200 && data['success'] == true) {
+        return data;
+      }
+      return {
+        'success': false,
+        'message': data['message'] ?? 'Failed to load player tracking',
+      };
+    } catch (e) {
+      print('Error fetching player app tracking: $e');
       return {'success': false, 'message': e.toString()};
     }
   }

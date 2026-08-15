@@ -435,6 +435,8 @@ class TimerStore {
       }
     }
 
+    await _syncExpiredRoundsFromSnapshot(snapshot, force: force);
+
     await _persistSessions();
     await _syncLegacyPrefs();
     if ((_questionSession?.isActiveAt(DateTime.now().toUtc()) ?? false) ||
@@ -444,6 +446,58 @@ class TimerStore {
       _stopTickerIfIdle();
     }
     _notify();
+  }
+
+  /// Re-apply round completion from server [last_trigger] after login/reconnect.
+  Future<void> _syncExpiredRoundsFromSnapshot(
+    Map<String, dynamic> snapshot, {
+    bool force = false,
+  }) async {
+    final rWin = snapshot['round_final_window'] as Map<String, dynamic>?;
+    if (rWin?['active'] == true) return;
+
+    final lastTrigger = snapshot['last_trigger'];
+    if (lastTrigger is! Map<String, dynamic>) return;
+
+    final action = lastTrigger['timer_action']?.toString() ?? '';
+    final rn = lastTrigger['round_name']?.toString() ?? '';
+    if (rn.isEmpty) return;
+
+    final prefs = await SharedPreferences.getInstance();
+    final now = DateTime.now().toUtc();
+
+    if (action == 'LAST_TIMER') {
+      final ends = parseUtc(lastTrigger['timer_end'] as String?);
+      if (ends != null && !ends.isAfter(now)) {
+        await _addRoundFinalTimerExpired(prefs, rn);
+      }
+      return;
+    }
+
+    if (action == 'STOP_TIMER' || action == 'PAUSE_TIMER') {
+      final qWin = snapshot['question_window'] as Map<String, dynamic>?;
+      final qInactive = qWin?['active'] != true;
+      final qid = parseInt(lastTrigger['question_id']);
+      final snapshotRoundMode = snapshot['round_mode'] == true;
+
+      // Login/resume only: show left the round (STOP at slide boundary, not in round mode).
+      // Must not run on live STOP between per-question timers in round mode.
+      if (force && qInactive && qid == 0 && !snapshotRoundMode) {
+        await _addRoundFinalTimerExpired(prefs, rn);
+        return;
+      }
+
+      final ft = parseInt(lastTrigger['final_timer']);
+      if (ft == 0) return;
+      final prevStr = prefs.getString('last_timer_action_data');
+      if (prevStr == null) return;
+      try {
+        final prev = jsonDecode(prevStr) as Map<String, dynamic>;
+        if (prev['timer_action']?.toString() == 'LAST_TIMER') {
+          await _addRoundFinalTimerExpired(prefs, rn);
+        }
+      } catch (_) {}
+    }
   }
 
   Map<String, dynamic>? _decodeJson(String? raw) {
@@ -515,6 +569,8 @@ class TimerStore {
     _questionSession = null;
     _roundFinalSession = null;
     final prefs = await SharedPreferences.getInstance();
+    // Preserve completed-round markers so answer fields stay locked after logout/login.
+    final expiredRounds = prefs.getStringList('rounds_final_timer_expired');
     await prefs.remove(_prefsQuestionKey);
     await prefs.remove(_prefsRoundFinalKey);
     await prefs.setString('start_timer_status', 'Idle');
@@ -526,10 +582,12 @@ class TimerStore {
     await prefs.remove('start_timer_start_time');
     await prefs.remove('last_timer_start_time');
     await prefs.remove('last_timer_action_data');
-    await prefs.remove('rounds_final_timer_expired');
     await prefs.remove('cached_round_timer');
     await prefs.remove('start_timer_end_utc');
     await prefs.remove('last_timer_end_utc');
+    if (expiredRounds != null && expiredRounds.isNotEmpty) {
+      await prefs.setStringList('rounds_final_timer_expired', expiredRounds);
+    }
     _notify();
   }
 
@@ -617,6 +675,13 @@ class TimerStore {
     final typeGame = parseInt(message['final_timer']);
     final roundModeSlideStart = typeGame != 0;
 
+    if (roundModeSlideStart) {
+      final rn = message['round_name']?.toString() ?? '';
+      if (rn.isNotEmpty) {
+        await _removeRoundFinalTimerExpired(prefs, rn);
+      }
+    }
+
     if (!roundModeSlideStart) {
       _roundFinalSession = null;
       await prefs.setString('last_timer_status', 'Idle');
@@ -670,8 +735,8 @@ class TimerStore {
         storedTimerPayloadIndicatesRoundMode(prefs) || ftVal > 0;
 
     if (isRoundModeStop) {
-      final rActive =
-          _roundFinalSession?.isActiveAt(DateTime.now().toUtc()) ?? false;
+      final now = DateTime.now().toUtc();
+      final rActive = _roundFinalSession?.isActiveAt(now) ?? false;
       if (rActive && _roundFinalSession != null) {
         final stopRoundName = (message['round_name'] as String?)?.trim() ?? '';
         final lastRoundName = _roundFinalSession!.roundName.trim();

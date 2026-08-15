@@ -14,12 +14,14 @@ import 'pages/admin/user_management_page.dart';
 import 'pages/admin/game_management_page.dart';
 import 'pages/admin/active_games_page.dart';
 import 'pages/admin/analytics_dashboard_page.dart';
+import 'pages/admin/admin_round_app_tracking_page.dart';
 import 'pages/admin/admin_round_grading_matrix_page.dart';
 import 'pages/admin/admin_grading_detail_page.dart';
 import 'pages/admin/admin_question_review_page.dart';
 import 'pages/admin/admin_round_list_review_page.dart';
 import 'pages/admin/admin_game_results_page.dart';
 import 'services/user_data_service.dart';
+import 'navigation/app_route_observer.dart';
 
 final DebugConsoleController _debugConsole = DebugConsoleController();
 
@@ -64,6 +66,7 @@ class PWAApp extends StatelessWidget {
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
       ),
       initialRoute: '/splash',
+      navigatorObservers: [appRouteObserver],
       routes: {
         '/splash': (context) => const SplashPage(),
         '/login': (context) => const LoginPage(),
@@ -83,6 +86,16 @@ class PWAApp extends StatelessWidget {
         if (settings.name == '/admin/analytics/round' && args is Map<String, dynamic>) {
           return MaterialPageRoute(
             builder: (_) => AdminRoundGradingMatrixPage(
+              activeGameId: args['activeGameId'] as int,
+              gameName: args['gameName']?.toString() ?? '',
+              roundName: args['roundName']?.toString() ?? '',
+            ),
+          );
+        }
+        if (settings.name == '/admin/analytics/app-tracking' &&
+            args is Map<String, dynamic>) {
+          return MaterialPageRoute(
+            builder: (_) => AdminRoundAppTrackingPage(
               activeGameId: args['activeGameId'] as int,
               gameName: args['gameName']?.toString() ?? '',
               roundName: args['roundName']?.toString() ?? '',

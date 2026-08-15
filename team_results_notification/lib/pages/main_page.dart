@@ -10,6 +10,7 @@ import '../services/strict_visibility_service.dart';
 import '../services/logout_notice.dart';
 import '../services/timer_store.dart';
 import '../utils/active_game_selection.dart';
+import '../navigation/app_route_observer.dart';
 import 'login_page.dart'; // For DatabaseService
 import 'admin/admin_game_results_page.dart';
 import 'question_page.dart' as question_page; // For timer message forwarding and initializeTimerStatus
@@ -21,7 +22,7 @@ class MainPage extends StatefulWidget {
   State<MainPage> createState() => _MainPageState();
 }
 
-class _MainPageState extends State<MainPage> {
+class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteAware {
   bool _isLoading = true;
   String _userName = 'User';
   String _userId = '';
@@ -58,6 +59,7 @@ class _MainPageState extends State<MainPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     // Re-read API config before any API/WebSocket calls (fixes web localStorage timing on refresh)
     _loadConfigAndCheckLogin();
 
@@ -319,6 +321,43 @@ class _MainPageState extends State<MainPage> {
     }
     
     print('=== _loadUserDataFallback COMPLETE ===');
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final route = ModalRoute.of(context);
+    if (route is PageRoute<void>) {
+      appRouteObserver.subscribe(this, route);
+    }
+  }
+
+  @override
+  void didPopNext() {
+    // Returned to Welcome from another screen (e.g. Game Management after starting a game).
+    _refreshGameEligibility();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _refreshGameEligibility();
+    }
+  }
+
+  /// Re-fetch active/running game state so Analytics / View Results buttons update.
+  Future<void> _refreshGameEligibility() async {
+    if (!mounted || _logoutInProgress) return;
+    if (_userRole == 'admin') {
+      await _checkAdminActiveGame();
+    } else if (_userRole == 'player' && _userId.isNotEmpty) {
+      await _checkForActiveGames();
+    }
+  }
+
+  /// Pull-to-refresh and manual refresh for the Welcome page.
+  Future<void> _refreshWelcomePage() async {
+    await _refreshUserData();
   }
 
   // Refresh user data without session validation (for profile updates)
@@ -701,12 +740,16 @@ class _MainPageState extends State<MainPage> {
         child: Column(
           children: [
             Expanded(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: SingleChildScrollView(
-                  keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
-                  physics: const BouncingScrollPhysics(),
-                  child: Column(
+              child: RefreshIndicator(
+                onRefresh: _refreshWelcomePage,
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: SingleChildScrollView(
+                    keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+                    physics: const AlwaysScrollableScrollPhysics(
+                      parent: BouncingScrollPhysics(),
+                    ),
+                    child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     // User Info Widget
@@ -790,9 +833,10 @@ class _MainPageState extends State<MainPage> {
                   ],
                 ),
               ),
+                ),
+              ),
             ),
-          ),
-        ],
+          ],
         ),
       ),
     );
@@ -1706,6 +1750,8 @@ class _MainPageState extends State<MainPage> {
 
   @override
   void dispose() {
+    appRouteObserver.unsubscribe(this);
+    WidgetsBinding.instance.removeObserver(this);
     StrictVisibilityService.instance.strictVisible.removeListener(_onStrictVisibleChanged);
     _echoTimer?.cancel();
     _channel?.sink.close();
