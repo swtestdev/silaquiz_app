@@ -80,6 +80,7 @@ _server_answer_window_final_timer: int = 0
 _echo_app_visible: Dict[int, bool] = {}
 _prev_echo_app_visible: Dict[int, Optional[bool]] = {}
 _pending_server_stop_task: Optional[asyncio.Task] = None
+_pending_auto_grade_task: Optional[asyncio.Task] = None
 _server_fired_stop_ids: Set[str] = set()
 
 # Per-question player-event tracking window (type_game == 0); set with server answer window
@@ -95,6 +96,10 @@ _round_track_ends_at: Optional[datetime] = None
 _round_track_start_utc: Optional[datetime] = None
 _round_track_duration_sec: int = 0
 _round_track_final_timer: int = 0
+
+# When a timer ends/stops, unavailability counters freeze at this UTC (per round_name).
+_question_track_count_frozen_at: Dict[str, datetime] = {}
+_round_final_count_frozen_at: Dict[str, datetime] = {}
 
 # Player state for transition-only + 3s cooldown (keys: user_id)
 _last_player_track_ws_connected: Dict[int, bool] = {}
@@ -141,8 +146,8 @@ TRACKING_ATTENTION_INVISIBLE: FrozenSet[str] = frozenset(
     }
 )
 
-PLAYER_MATRIX_VISIBLE: FrozenSet[str] = frozenset({"visible"})
-PLAYER_MATRIX_NOT_VISIBLE: FrozenSet[str] = frozenset({"invisible", "blur"})
+PLAYER_MATRIX_VISIBLE: FrozenSet[str] = TRACKING_ATTENTION_VISIBLE
+PLAYER_MATRIX_NOT_VISIBLE: FrozenSet[str] = TRACKING_ATTENTION_INVISIBLE
 PLAYER_MATRIX_REASONS: FrozenSet[str] = PLAYER_MATRIX_VISIBLE | PLAYER_MATRIX_NOT_VISIBLE
 
 # Serialize echo-based visibility tracking per user (avoids parallel requests double-counting)
@@ -176,6 +181,55 @@ def _is_round_tracking_window_active() -> bool:
     if _round_track_ends_at is not None and _utc_now() >= _round_track_ends_at:
         return False
     return True
+
+
+def _freeze_question_tracking_count(round_name: str, at_utc: datetime) -> None:
+    rn = (round_name or "").strip()
+    if rn:
+        _question_track_count_frozen_at[rn] = at_utc
+
+
+def _freeze_round_final_tracking_count(round_name: str, at_utc: datetime) -> None:
+    rn = (round_name or "").strip()
+    if rn:
+        _round_final_count_frozen_at[rn] = at_utc
+
+
+def _player_tracking_count_until(
+    db: Session,
+    game_table: str,
+    round_name: str,
+    server_now: datetime,
+) -> datetime:
+    """
+    UTC instant used as the upper bound for live unavailability counting.
+    While the relevant timer is active, returns server_now (counter ticks).
+    After question/round timer finishes or STOP/PAUSE, returns the freeze instant.
+    """
+    rn = (round_name or "").strip()
+    type_game = _resolve_type_game_for_round(db, game_table, rn) if rn and game_table else 0
+
+    if type_game == 0:
+        if (
+            _is_server_answer_window_active()
+            and (_question_track_round_name or "").strip() == rn
+        ):
+            return server_now
+        frozen = _question_track_count_frozen_at.get(rn)
+        if frozen is not None:
+            return frozen if frozen <= server_now else server_now
+        return server_now
+
+    if (
+        _round_track_ends_at is not None
+        and (_round_track_round_name or "").strip() == rn
+        and server_now < _round_track_ends_at
+    ):
+        return server_now
+    frozen = _round_final_count_frozen_at.get(rn)
+    if frozen is not None:
+        return frozen if frozen <= server_now else server_now
+    return server_now
 
 
 def _user_team_id_int(user: User) -> Optional[int]:
@@ -426,6 +480,14 @@ def _cancel_pending_server_stop() -> None:
         t.cancel()
 
 
+def _cancel_pending_auto_grade() -> None:
+    global _pending_auto_grade_task
+    t = _pending_auto_grade_task
+    _pending_auto_grade_task = None
+    if t is not None and not t.done():
+        t.cancel()
+
+
 def _clear_server_answer_window() -> None:
     global _server_answer_window_end, _server_answer_window_start, _server_answer_window_question_id
     global _server_answer_window_duration_sec, _server_answer_window_final_timer
@@ -583,7 +645,13 @@ async def _emit_server_stop_timer(
     source_event_id: str,
     round_name: str,
     slide_number: int,
+    *,
+    expired_kind: str,
+    question_id: int = 0,
+    final_timer: int = 0,
+    active_game_id: Optional[int] = None,
 ) -> None:
+    global last_timer_setting
     try:
         await asyncio.sleep(delay_sec)
         if source_event_id in _server_fired_stop_ids:
@@ -592,14 +660,20 @@ async def _emit_server_stop_timer(
         if len(_server_fired_stop_ids) > 400:
             _server_fired_stop_ids.clear()
 
-        _clear_server_answer_window()
-        if (
-            _round_track_active
-            and _round_track_ends_at is not None
-            and _utc_now() >= _round_track_ends_at
-        ):
-            _clear_round_track_window()
         now = _utc_now()
+        if expired_kind == "round_final":
+            _freeze_round_final_tracking_count(round_name, now)
+            _clear_server_answer_window()
+            if (
+                _round_track_active
+                and _round_track_ends_at is not None
+                and now >= _round_track_ends_at
+            ):
+                _clear_round_track_window()
+        else:
+            _freeze_question_tracking_count(round_name, now)
+            _clear_server_answer_window()
+
         stop_event_id = str(uuid.uuid4())
         payload = {
             "type": "timer_trigger",
@@ -607,17 +681,43 @@ async def _emit_server_stop_timer(
             "slide_number": slide_number,
             "round_name": round_name,
             "timer_start": _format_utc_iso_z(now),
-            "question_id": 0,
-            "final_timer": 0,
+            "question_id": question_id if expired_kind == "question" else 0,
+            "final_timer": final_timer,
             "question_timer": 0,
             "event_id": stop_event_id,
             "server_stop": True,
             "stops_event_id": source_event_id,
+            "expired_kind": expired_kind,
             "timer_end": _format_utc_iso_z(now),
             "duration_seconds": 0,
         }
         await manager.broadcast_to_all_players(json.dumps(payload))
-        logger.info("Server STOP_TIMER broadcast (stops_event_id=%s)", source_event_id)
+        last_timer_setting = {
+            "timer_action": "STOP_TIMER",
+            "slide_number": slide_number,
+            "round_name": round_name,
+            "timer_start": payload["timer_start"],
+            "timer_end": payload["timer_end"],
+            "question_id": payload["question_id"],
+            "final_timer": final_timer,
+            "question_timer": 0,
+            "event_id": stop_event_id,
+            "duration_seconds": 0,
+            "server_stop": True,
+            "stops_event_id": source_event_id,
+            "expired_kind": expired_kind,
+        }
+        if active_game_id is not None:
+            db: Session = SessionLocal()
+            try:
+                _save_last_timer_setting_to_db(active_game_id, db)
+            finally:
+                db.close()
+        logger.info(
+            "Server STOP_TIMER broadcast (kind=%s, stops_event_id=%s)",
+            expired_kind,
+            source_event_id,
+        )
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -1822,7 +1922,12 @@ def _cell_player_matches_expected(kind: str, expected_cell: str, pv: str) -> boo
     if not norm_pv:
         return False
     if kind == "radio":
-        return norm_pv == _normalize_answer_text(expected_cell)
+        if norm_pv == _normalize_answer_text(expected_cell):
+            return True
+        for syn in _split_synonyms(expected_cell):
+            if norm_pv == _normalize_answer_text(syn):
+                return True
+        return False
     if kind == "list":
         # One list pick per answer slot; answer# holds synonym variants separated by ;
         tokens = [x.strip() for x in str(pv or "").split(",") if x.strip()]
@@ -2316,12 +2421,16 @@ def _fetch_round_visibility_events(
 def _compute_player_tracking_cell(
     events: List[dict],
     server_now: datetime,
+    *,
+    count_until: Optional[datetime] = None,
 ) -> dict:
     """
     Last state green/red from final visible/invisible/blur event.
     Episode seconds: first blur/invisible in episode -> 0; second+ counts from first not-visible.
     visible freezes duration until next episode.
+    count_until caps live counting when the relevant timer has ended or been stopped.
     """
+    effective_now = count_until if count_until is not None else server_now
     if not events:
         return {
             "last_reason": None,
@@ -2330,7 +2439,7 @@ def _compute_player_tracking_cell(
         }
 
     last_reason = str(events[-1]["reason"])
-    is_visible = last_reason == "visible"
+    is_visible = last_reason in PLAYER_MATRIX_VISIBLE
 
     frozen_seconds = 0
     in_episode = False
@@ -2340,15 +2449,16 @@ def _compute_player_tracking_cell(
     for ev in events:
         reason = str(ev["reason"])
         ts = ev["timestamp"]
-        if reason == "visible":
+        if reason in PLAYER_MATRIX_VISIBLE:
             if (
                 in_episode
                 and episode_not_visible_count >= 2
                 and episode_first_ts is not None
                 and ts is not None
             ):
+                cap_ts = ts if ts <= effective_now else effective_now
                 frozen_seconds = max(
-                    0, int((ts - episode_first_ts).total_seconds())
+                    0, int((cap_ts - episode_first_ts).total_seconds())
                 )
             in_episode = False
             episode_first_ts = None
@@ -2368,7 +2478,7 @@ def _compute_player_tracking_cell(
             and episode_first_ts is not None
         ):
             invisible_seconds = max(
-                0, int((server_now - episode_first_ts).total_seconds())
+                0, int((effective_now - episode_first_ts).total_seconds())
             )
         else:
             invisible_seconds = 0
@@ -2395,7 +2505,13 @@ def _build_player_tracking_graph_points(
         if isinstance(ts, datetime) and ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
         t_sec = max(0, int((ts - round_start).total_seconds()))
-        y = 1 if ev["reason"] == "visible" else -1
+        reason = str(ev["reason"])
+        if reason in PLAYER_MATRIX_VISIBLE:
+            y = 1
+        elif reason in PLAYER_MATRIX_NOT_VISIBLE:
+            y = -1
+        else:
+            continue
         if points[-1]["t_sec"] == t_sec and points[-1]["y"] == y:
             continue
         points.append({"t_sec": t_sec, "y": y})
@@ -2449,28 +2565,43 @@ def _build_round_player_tracking_matrix(
         )
 
     teams_out: List[dict] = []
+    count_until = _player_tracking_count_until(
+        db, game.game_name, round_name, server_time
+    )
     for tm in teams_meta:
         tid = int(tm["team_id"])
         cells: List[dict] = []
+        players_map: Dict[str, dict] = {}
         for uid in player_ids:
             if player_team.get(uid) != tid:
                 continue
             evs = by_player.get(uid, [])
-            cell = _compute_player_tracking_cell(evs, server_time)
-            cells.append(
-                {
-                    "user_id": uid,
-                    "display_name": user_names.get(uid, f"Player {uid}"),
-                    **cell,
-                }
+            cell = _compute_player_tracking_cell(
+                evs, server_time, count_until=count_until
             )
+            cell_payload = {
+                "user_id": uid,
+                "display_name": user_names.get(uid, f"Player {uid}"),
+                **cell,
+            }
+            cells.append(cell_payload)
+            players_map[str(uid)] = cell_payload
         teams_out.append(
             {
                 "team_id": tid,
                 "team_name": tm["team_name"],
                 "cells": cells,
+                "players": players_map,
             }
         )
+
+    player_columns = [
+        {
+            "user_id": uid,
+            "user_name": user_names.get(uid, f"Player {uid}"),
+        }
+        for uid in player_ids
+    ]
 
     round_timer: Optional[dict] = None
     snap = _build_active_timer_snapshot()
@@ -2494,6 +2625,7 @@ def _build_round_player_tracking_matrix(
         "game_name": game.game_name,
         "round_start_utc": round_start.isoformat() if round_start else None,
         "round_timer": round_timer,
+        "player_columns": player_columns,
         "players": players_out,
         "teams": teams_out,
     }
@@ -2515,7 +2647,12 @@ def _build_round_player_tracking_detail(
     user = db.query(User).filter(User.id == user_id).first()
     round_start = _round_start_utc(db, game, round_name, fallback_events=all_events)
     server_time = _utc_now()
-    cell = _compute_player_tracking_cell(player_events, server_time)
+    count_until = _player_tracking_count_until(
+        db, game.game_name, round_name, server_time
+    )
+    cell = _compute_player_tracking_cell(
+        player_events, server_time, count_until=count_until
+    )
 
     events_out: List[dict] = []
     for ev in player_events:
@@ -2542,16 +2679,6 @@ def _build_round_player_tracking_detail(
         "events": events_out,
         "graph_points": _build_player_tracking_graph_points(player_events, round_start),
     }
-
-
-def _build_round_app_tracking_summary(
-    db: Session,
-    active_game: ActiveGame,
-    game: GamesList,
-    round_name: str,
-) -> dict:
-    """Alias for per-player matrix payload (admin Tracking APP monitor)."""
-    return _build_round_player_tracking_matrix(db, active_game, game, round_name)
 
 
 def _round_review_flags(
@@ -2645,7 +2772,14 @@ def _build_question_review_payload(
     teams_out: List[dict] = []
     for tid in _active_game_team_ids(active_game):
         team = db.query(Teams).filter(Teams.id == tid).first()
-        row = _fetch_team_answer_grade_row(db, answers_table, tid, question_id)
+        # Capture persisted grades before any admin-load refresh so stored_is_correct
+        # reflects the DB row the admin expects (not a post-refresh auto-check).
+        row_before = _fetch_team_answer_grade_row(db, answers_table, tid, question_id)
+        stored_by_col = {
+            col: (row_before.get(f"is_correct_{col}") if row_before else None)
+            for col in ordered_cols
+        }
+        row = row_before
         p1, p2, p3, p4, corr_pts, wrong_pts = _fetch_team_slots_four(
             db, answers_table, tid, question_id
         )
@@ -2663,15 +2797,15 @@ def _build_question_review_payload(
 
         slots: List[dict] = []
         for j, col in enumerate(ordered_cols):
-            ic_raw = row.get(f"is_correct_{col}") if row else None
-            ic = ic_raw if ic_raw is not None else sug_map.get(col)
+            suggested = sug_map.get(col)
             slots.append(
                 {
                     "col": col,
                     "reference": expected_cells[j] if j < len(expected_cells) else "",
                     "player_answer": p_four[col - 1],
-                    "is_correct": ic,
-                    "suggested_is_correct": sug_map.get(col),
+                    "is_correct": suggested,
+                    "stored_is_correct": stored_by_col.get(col),
+                    "suggested_is_correct": suggested,
                 }
             )
 
@@ -2929,16 +3063,14 @@ def _map_team_picks_to_canonical_grid(
             pick.get("question_id") == matched_row["question_id"]
             and pick.get("slot_col") == matched_row["slot_col"]
         )
-        if same_slot and ic_raw is not None:
-            ic = ic_raw
-        else:
-            ic = suggested
+        stored = ic_raw if same_slot else None
         grid[ri] = {
             "row_index": ri,
             "question_id": matched_row["question_id"],
             "slot_col": matched_row["slot_col"],
             "player_answer": pick_text,
-            "is_correct": ic,
+            "is_correct": suggested,
+            "stored_is_correct": stored,
             "suggested_is_correct": suggested,
             "correct_score": matched_row["default_correct_score"],
             "wrong_score": matched_row["default_wrong_score"],
@@ -2960,13 +3092,13 @@ def _map_team_picks_to_canonical_grid(
         used_rows.add(ri)
         ref_cell = _list_ref_cell_for_canonical_row(target)
         suggested = _suggest_list_cell_grade("list", ref_cell, pick_text)
-        ic_raw = pick.get("is_correct")
         grid[ri] = {
             "row_index": ri,
             "question_id": target["question_id"],
             "slot_col": target["slot_col"],
             "player_answer": pick_text,
-            "is_correct": ic_raw if ic_raw is not None else (suggested if suggested != 0 else -1),
+            "is_correct": suggested if suggested != 0 else -1,
+            "stored_is_correct": None,
             "suggested_is_correct": suggested if suggested != 0 else -1,
             "correct_score": target["default_correct_score"],
             "wrong_score": target["default_wrong_score"],
@@ -3020,6 +3152,7 @@ def _build_round_list_review_payload(
                         "slot_col": mapped["slot_col"],
                         "player_answer": mapped["player_answer"],
                         "is_correct": mapped["is_correct"],
+                        "stored_is_correct": mapped.get("stored_is_correct"),
                         "suggested_is_correct": mapped["suggested_is_correct"],
                         "correct_score": corr_pts
                         if corr_pts
@@ -3037,6 +3170,7 @@ def _build_round_list_review_payload(
                         "slot_col": crow["slot_col"],
                         "player_answer": "",
                         "is_correct": 0,
+                        "stored_is_correct": None,
                         "suggested_is_correct": 0,
                         "correct_score": crow["default_correct_score"],
                         "wrong_score": crow["default_wrong_score"],
@@ -3288,14 +3422,35 @@ def _save_results_excel_to_server_dir(
         }
 
 
-def _auto_grade_question_multislot(
+def _team_answer_slots_ungraded(
+    ic1: Any, ic2: Any, ic3: Any, ic4: Any,
+) -> bool:
+    return ic1 is None and ic2 is None and ic3 is None and ic4 is None
+
+
+def _team_answer_grade_is_stale(
     db: Session,
     answers_table: str,
     game_table: str,
+    team_id: int,
     question_id: int,
-    team_ids: List[int],
-) -> None:
-    row = db.execute(
+) -> bool:
+    """True when player text exists but stored is_correct_* no longer matches auto-check."""
+    p1, p2, p3, p4, corr_pts, wrong_pts = _fetch_team_slots_four(
+        db, answers_table, team_id, question_id
+    )
+    if not any(str(x or "").strip() for x in (p1, p2, p3, p4)):
+        return False
+
+    grade_row = _fetch_team_answer_grade_row(db, answers_table, team_id, question_id)
+    ic1 = grade_row.get("is_correct_1") if grade_row else None
+    ic2 = grade_row.get("is_correct_2") if grade_row else None
+    ic3 = grade_row.get("is_correct_3") if grade_row else None
+    ic4 = grade_row.get("is_correct_4") if grade_row else None
+    if _team_answer_slots_ungraded(ic1, ic2, ic3, ic4):
+        return True
+
+    qrow = db.execute(
         text(
             f"""
             SELECT answers_for_selection, answer1, answer2, answer3, answer4
@@ -3304,38 +3459,239 @@ def _auto_grade_question_multislot(
         ),
         {"qid": question_id},
     ).fetchone()
-    if not row:
-        return
-    afs, a1, a2, a3, a4 = row[0], row[1], row[2], row[3], row[4]
+    if not qrow:
+        return False
+    afs, a1, a2, a3, a4 = qrow[0], qrow[1], qrow[2], qrow[3], qrow[4]
     pairs = _ordered_nonempty_game_cells(a1, a2, a3, a4)
-    k = len(pairs)
-    if k == 0:
-        return
+    if not pairs:
+        return False
     kind, _opts = _parse_answers_for_selection(afs)
     kind = _coerce_kind_for_expected_slots(kind, pairs)
     if kind == "none":
+        return False
+    expected_cells = [p[1] for p in pairs]
+    ordered_cols = [p[0] for p in pairs]
+    p_four = [p1, p2, p3, p4]
+    player_vals = [p_four[col - 1] for col in ordered_cols]
+    sug_map, _sug_net = _compute_suggested_grade(
+        kind,
+        expected_cells,
+        ordered_cols,
+        player_vals,
+        corr_pts if corr_pts else 1.0,
+        wrong_pts,
+    )
+    for col in ordered_cols:
+        stored = grade_row.get(f"is_correct_{col}") if grade_row else None
+        suggested = sug_map.get(col)
+        if suggested is None:
+            continue
+        if stored is None:
+            return True
+        try:
+            if int(stored) != int(suggested):
+                return True
+        except (TypeError, ValueError):
+            return True
+    return False
+
+
+def _maybe_refresh_team_answer_grade(
+    db: Session,
+    answers_table: str,
+    game_table: str,
+    team_id: int,
+    question_id: int,
+) -> bool:
+    if not _team_answer_grade_is_stale(
+        db, answers_table, game_table, team_id, question_id
+    ):
+        return False
+    return _auto_grade_single_team_question(
+        db,
+        answers_table,
+        game_table,
+        team_id,
+        question_id,
+        only_if_ungraded=False,
+    )
+
+
+def _apply_grading_on_timer_end(
+    db: Session,
+    active_game: ActiveGame,
+    game_table_name: str,
+    game_name_safe: str,
+    *,
+    question_id: int = 0,
+    round_name: str = "",
+) -> None:
+    """
+    Persist grades when a question or round timer ends (natural expiry or STOP/PAUSE).
+    Classic mode (type_game == 0): grade one question.
+    Round mode (type_game != 0): grade all questions in the round.
+    """
+    team_ids = _active_game_team_ids(active_game)
+    if not team_ids:
         return
+    answers_table = f"active_teams_answers_{game_name_safe}"
+    if question_id > 0:
+        _auto_grade_question_multislot(
+            db, answers_table, game_table_name, question_id, team_ids
+        )
+        logger.info(
+            "Timer-end grade (question) game=%s qid=%s teams=%s",
+            game_name_safe,
+            question_id,
+            len(team_ids),
+        )
+    elif (round_name or "").strip():
+        _auto_grade_round_multislot(
+            db, answers_table, game_table_name, round_name.strip(), team_ids
+        )
+        logger.info(
+            "Timer-end grade (round) game=%s round=%s teams=%s",
+            game_name_safe,
+            round_name.strip(),
+            len(team_ids),
+        )
+    else:
+        return
+    db.commit()
+
+
+def _fetch_question_round_name(
+    db: Session, game_table: str, question_id: int
+) -> str:
+    row = db.execute(
+        text(f"SELECT round_name FROM `{game_table}` WHERE id = :qid LIMIT 1"),
+        {"qid": question_id},
+    ).fetchone()
+    if not row or row[0] is None:
+        return ""
+    return str(row[0]).strip()
+
+
+def _player_grades_revealed_for_question(
+    db: Session,
+    game_table: str,
+    round_name: str,
+    question_id: int,
+) -> bool:
+    """
+    Players may see right/wrong only after the relevant timer finishes:
+    - type_game == 0 (round_timer == 0): after that question's countdown ends
+    - type_game != 0: after the round-final (LAST) countdown ends
+    """
+    if not round_name:
+        return True
+    type_game = _resolve_type_game_for_round(db, game_table, round_name)
+    if type_game != 0:
+        if (
+            _round_track_active
+            and _round_track_round_name == round_name
+            and _is_round_tracking_window_active()
+        ):
+            return False
+        return True
+    if (
+        _is_server_answer_window_active()
+        and _server_answer_window_question_id == question_id
+    ):
+        return False
+    return True
+
+
+def _strip_player_grade_fields(answer: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(answer)
+    out["is_correct"] = None
+    out["is_correct_1"] = None
+    out["is_correct_2"] = None
+    out["is_correct_3"] = None
+    out["is_correct_4"] = None
+    out["final_score"] = None
+    return out
+
+
+def _auto_grade_single_team_question(
+    db: Session,
+    answers_table: str,
+    game_table: str,
+    team_id: int,
+    question_id: int,
+    *,
+    only_if_ungraded: bool = True,
+) -> bool:
+    """Grade one team/question row. Returns True when a grade was persisted."""
+    grade_row = _fetch_team_answer_grade_row(db, answers_table, team_id, question_id)
+    if only_if_ungraded and grade_row:
+        if not _team_answer_slots_ungraded(
+            grade_row.get("is_correct_1"),
+            grade_row.get("is_correct_2"),
+            grade_row.get("is_correct_3"),
+            grade_row.get("is_correct_4"),
+        ):
+            return False
+
+    qrow = db.execute(
+        text(
+            f"""
+            SELECT answers_for_selection, answer1, answer2, answer3, answer4
+            FROM `{game_table}` WHERE id = :qid
+            """
+        ),
+        {"qid": question_id},
+    ).fetchone()
+    if not qrow:
+        return False
+    afs, a1, a2, a3, a4 = qrow[0], qrow[1], qrow[2], qrow[3], qrow[4]
+    pairs = _ordered_nonempty_game_cells(a1, a2, a3, a4)
+    k = len(pairs)
+    if k == 0:
+        return False
+    kind, _opts = _parse_answers_for_selection(afs)
+    kind = _coerce_kind_for_expected_slots(kind, pairs)
+    if kind == "none":
+        return False
     expected_cells = [p[1] for p in pairs]
     ordered_cols = [p[0] for p in pairs]
 
-    for tid in team_ids:
-        p1, p2, p3, p4, corr_pts, wrong_pts = _fetch_team_slots_four(
-            db, answers_table, tid, question_id
-        )
-        p_four = [p1, p2, p3, p4]
-        player_vals = [p_four[col - 1] for col in ordered_cols]
+    p1, p2, p3, p4, corr_pts, wrong_pts = _fetch_team_slots_four(
+        db, answers_table, team_id, question_id
+    )
+    p_four = [p1, p2, p3, p4]
+    player_vals = [p_four[col - 1] for col in ordered_cols]
 
-        any_input = any((v or "").strip() for v in player_vals)
-        if not any_input:
-            st = [0] * k
-            icmap = _scatter_is_correct_cols(ordered_cols, st)
-            _persist_multislot_grade(db, answers_table, tid, question_id, icmap, 0.0)
-            continue
-
-        st = _greedy_multislot_statuses(kind, expected_cells, player_vals)
-        net = _multislot_net_score(st, corr_pts, wrong_pts)
+    any_input = any((v or "").strip() for v in player_vals)
+    if not any_input:
+        st = [0] * k
         icmap = _scatter_is_correct_cols(ordered_cols, st)
-        _persist_multislot_grade(db, answers_table, tid, question_id, icmap, net)
+        _persist_multislot_grade(db, answers_table, team_id, question_id, icmap, 0.0)
+        return True
+
+    st = _greedy_multislot_statuses(kind, expected_cells, player_vals)
+    net = _multislot_net_score(st, corr_pts, wrong_pts)
+    icmap = _scatter_is_correct_cols(ordered_cols, st)
+    _persist_multislot_grade(db, answers_table, team_id, question_id, icmap, net)
+    return True
+
+
+def _auto_grade_question_multislot(
+    db: Session,
+    answers_table: str,
+    game_table: str,
+    question_id: int,
+    team_ids: List[int],
+) -> None:
+    for tid in team_ids:
+        _auto_grade_single_team_question(
+            db,
+            answers_table,
+            game_table,
+            tid,
+            question_id,
+            only_if_ungraded=False,
+        )
 
 
 def _auto_grade_round_multislot(
@@ -7207,7 +7563,7 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
          "Slide#164#START_TIMER#round_7#at#2025-10-29 10:16:49 PM#time#1 min_black"
          "Slide#159#STOP_TIMER##at#2025-10-29 10:14:19 PM"
     """
-    global last_timer_setting, _pending_server_stop_task
+    global last_timer_setting, _pending_server_stop_task, _pending_auto_grade_task
     global _question_track_window_id, _question_track_round_name
     global _round_track_active, _round_track_active_game_id, _round_track_round_name, _round_track_window_id
     global _round_track_ends_at, _round_track_start_utc, _round_track_duration_sec, _round_track_final_timer
@@ -7421,8 +7777,11 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
             question_timer = 0
             pass
 
-        # Server timer: cancel previous auto-STOP, update per-question answer window (START only)
+        # Server timer: cancel previous auto-STOP / auto-grade, update windows
+        pending_grade_qid = 0
+        pending_grade_round = ""
         _cancel_pending_server_stop()
+        _cancel_pending_auto_grade()
         if timer_action == "START_TIME" and question_timer > 0 and _id > 0:
             _set_server_answer_window(
                 ts_utc,
@@ -7434,6 +7793,22 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
             _question_track_window_id = f"{active_game.id}:{round_name}:q{_id}:{int(ts_utc.timestamp())}"
             _question_track_round_name = round_name
         elif timer_action in ("STOP_TIMER", "PAUSE_TIMER"):
+            type_game = _resolve_type_game_for_round(db, game_table_name, round_name)
+            if type_game == 0:
+                if _server_answer_window_question_id > 0:
+                    pending_grade_qid = _server_answer_window_question_id
+                if _server_answer_window_question_id > 0:
+                    _freeze_question_tracking_count(
+                        _question_track_round_name or round_name,
+                        ts_utc,
+                    )
+            else:
+                pending_grade_round = (round_name or _round_track_round_name or "").strip()
+            if _round_track_active and _round_track_ends_at is not None:
+                _freeze_round_final_tracking_count(
+                    _round_track_round_name or round_name,
+                    ts_utc,
+                )
             _clear_server_answer_window()
             # Per-slide STOP: keep round tracking open between questions (type_game != 0).
             # Clear round window only when LAST countdown was active (STOP ends the round early).
@@ -7501,15 +7876,22 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
 
         if duration_seconds > 0 and timer_end_utc is not None:
             delay = max(0.0, (timer_end_utc - _utc_now()).total_seconds())
-            if delay > 0:
-                _pending_server_stop_task = asyncio.create_task(
-                    _emit_server_stop_timer(
-                        float(delay), event_id, round_name, slide_number
-                    )
+            expired_kind = "round_final" if timer_action == "LAST_TIMER" else "question"
+            _pending_server_stop_task = asyncio.create_task(
+                _emit_server_stop_timer(
+                    float(delay),
+                    event_id,
+                    round_name,
+                    slide_number,
+                    expired_kind=expired_kind,
+                    question_id=int(_id) if expired_kind == "question" else 0,
+                    final_timer=int(_timer),
+                    active_game_id=active_game.id,
                 )
+            )
             grade_delay = delay + AUTO_GRADE_DELAY_SEC
             if timer_action == "START_TIME" and _id > 0 and _timer == 0:
-                asyncio.create_task(
+                _pending_auto_grade_task = asyncio.create_task(
                     _run_scheduled_auto_grade_question(
                         float(grade_delay),
                         active_game.id,
@@ -7519,7 +7901,7 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
                     )
                 )
             elif timer_action == "LAST_TIMER" and _timer != 0:
-                asyncio.create_task(
+                _pending_auto_grade_task = asyncio.create_task(
                     _run_scheduled_auto_grade_round(
                         float(grade_delay),
                         active_game.id,
@@ -7547,6 +7929,23 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
         # Save both to database
         _save_last_timer_setting_to_db(active_game.id, db)
         _save_rounds_info_to_db(active_game.id, db)
+
+        if pending_grade_qid > 0 or pending_grade_round:
+            try:
+                _apply_grading_on_timer_end(
+                    db,
+                    active_game,
+                    game_table_name,
+                    game_name_safe,
+                    question_id=pending_grade_qid,
+                    round_name=pending_grade_round,
+                )
+            except Exception as e:
+                logger.exception("Timer-end grading on STOP/PAUSE failed: %s", e)
+                try:
+                    db.rollback()
+                except Exception:  # noqa: S110
+                    pass
         
         return TimerTriggerResponse(
             success=True,
@@ -8385,6 +8784,8 @@ async def get_team_answers_for_game(
     try:
         # Construct answers table name
         answers_table_name = f"active_teams_answers_{game_name_safe}"
+        game = _find_games_list_by_safe(db, game_name_safe)
+        game_table = game.game_name if game else None
         
         # Verify user has access (admin or belongs to the team)
         if current_user.role != 'admin':
@@ -8409,6 +8810,9 @@ async def get_team_answers_for_game(
         result = db.execute(query_sql, {"team_id": team_id})
         rows = result.fetchall()
 
+        is_admin = current_user.role == "admin"
+        round_name_cache: Dict[int, str] = {}
+
         answers: List[Dict[str, Any]] = []
         for row in rows:
             pa1 = row[5]
@@ -8418,12 +8822,13 @@ async def get_team_answers_for_game(
             ic1, ic2, ic3, ic4 = row[9], row[10], row[11], row[12]
             lucky = row[13]
             final_s = row[14]
+            qid = int(row[2])
             p1 = str(pa1 or "")
             p2 = str(pa2 or "")
             p3 = str(pa3 or "")
             p4 = str(pa4 or "")
             rollup = _rollup_is_correct_four(ic1, ic2, ic3, ic4)
-            answers.append({
+            payload: Dict[str, Any] = {
                 "id": row[0],
                 "team_id": row[1],
                 "question_id": row[2],
@@ -8443,7 +8848,17 @@ async def get_team_answers_for_game(
                 "final_score": final_s,
                 "answered_at": row[15].isoformat() if row[15] else None,
                 "player_id": row[16],
-            })
+            }
+            if not is_admin and game_table:
+                rn = round_name_cache.get(qid)
+                if rn is None:
+                    rn = _fetch_question_round_name(db, game_table, qid)
+                    round_name_cache[qid] = rn
+                if not _player_grades_revealed_for_question(
+                    db, game_table, rn, qid
+                ):
+                    payload = _strip_player_grade_fields(payload)
+            answers.append(payload)
 
         return answers
         
@@ -8989,7 +9404,6 @@ async def echo_session(
                 source == "immediate"
                 and visibility_reason
                 and visibility_reason in TRACKING_REASONS_ALL
-                and visibility_reason not in ("connection", "disconnection")
             ):
                 _try_record_player_tracking_event(db, current_user, visibility_reason)
             elif source == "periodic":

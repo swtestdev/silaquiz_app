@@ -7,7 +7,7 @@ import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../services/user_data_service.dart';
 import '../services/api_config_service.dart';
-import 'dart:html' as html;
+import '../utils/browser/browser.dart';
 import 'question_page.dart' show initializeTimerStatus;
 
 // API service class for authentication operations
@@ -1411,7 +1411,7 @@ class DatabaseService {
     }
   }
 
-  /// Aggregated APP tracking (DIS/INV/BLUR + live status) for a round.
+  /// Per-player visibility matrix (visible/invisible/blur/disconnection) for a round.
   static Future<Map<String, dynamic>> getRoundAppTracking(
     int activeGameId,
     String roundName,
@@ -2003,6 +2003,8 @@ class _LoginPageState extends State<LoginPage> {
   final _confirmPasswordController = TextEditingController();
   bool _isLoading = false;
   bool _isSignUp = false;
+  bool _obscurePassword = true;
+  bool _obscureConfirmPassword = true;
   bool _databaseInitialized = false; // Add flag to prevent multiple calls
   
   // Version info
@@ -2481,99 +2483,9 @@ class _LoginPageState extends State<LoginPage> {
   Future<void> _deleteAllCachesAndReload() async {
     try {
       print('Starting aggressive cache deletion and reload...');
-      
-      // Step 1: Clear all storage (localStorage, sessionStorage)
-      try {
-        html.window.localStorage.clear();
-        html.window.sessionStorage.clear();
-        print('Local and session storage cleared');
-      } catch (e) {
-        print('Error clearing storage: $e');
-      }
-      
-      // Step 2: Delete all caches FIRST (before unregistering service worker)
-      final caches = html.window.caches;
-      if (caches != null) {
-        try {
-          final cacheNames = await caches.keys();
-          print('Found ${cacheNames.length} caches to delete');
-          for (var cacheName in cacheNames) {
-            await caches.delete(cacheName);
-            print('Cache deleted: $cacheName');
-          }
-          // Wait a bit to ensure cache deletion completes
-          await Future.delayed(const Duration(milliseconds: 200));
-        } catch (e) {
-          print('Error deleting caches: $e');
-        }
-      }
-      
-      // Step 3: Unregister all service workers
-      final serviceWorker = html.window.navigator.serviceWorker;
-      if (serviceWorker != null) {
-        try {
-          final registrations = await serviceWorker.getRegistrations();
-          print('Found ${registrations.length} service workers to unregister');
-          for (var registration in registrations) {
-            // Send message to skip waiting first
-            if (registration.installing != null) {
-              registration.installing!.postMessage({'type': 'SKIP_WAITING'});
-            }
-            if (registration.waiting != null) {
-              registration.waiting!.postMessage({'type': 'SKIP_WAITING'});
-            }
-            if (registration.active != null) {
-              registration.active!.postMessage({'type': 'SKIP_WAITING'});
-            }
-            // Now unregister
-            final unregistered = await registration.unregister();
-            print('Service worker unregistered: $unregistered');
-          }
-          // Wait for unregistration to complete
-          await Future.delayed(const Duration(milliseconds: 300));
-        } catch (e) {
-          print('Error unregistering service workers: $e');
-        }
-      }
-      
-      // Step 4: Force navigation to base URL with cache-busting parameters
-      print('Forcing page reload with cache bypass...');
-      final origin = html.window.location.origin;
-      final pathname = html.window.location.pathname;
-      final timestamp = DateTime.now().millisecondsSinceEpoch;
-      final random = (timestamp % 100000).toString();
-      
-      // Navigate to base URL with multiple cache-busting parameters
-      final reloadUrl = '$origin$pathname?_update=$timestamp&_cb=$random&_nocache=true';
-      
-      print('Navigating to: $reloadUrl');
-      
-      // Use location.replace to avoid history entry
-      html.window.location.replace(reloadUrl);
-      
-      // If that doesn't work, try location.href after a delay
-      Future.delayed(const Duration(milliseconds: 1000), () {
-        try {
-          print('Fallback: forcing reload via location.href');
-          html.window.location.href = reloadUrl;
-        } catch (e) {
-          print('Error with location.href fallback: $e');
-          // Last resort: regular reload
-          try {
-            html.window.location.reload();
-          } catch (e2) {
-            print('Error with final reload: $e2');
-          }
-        }
-      });
+      await deleteAllCachesAndReload();
     } catch (e) {
       print('Error in deleteAllCachesAndReload: $e');
-      // Last resort: try regular reload
-      try {
-        html.window.location.reload();
-      } catch (e2) {
-        print('Error with final reload attempt: $e2');
-      }
     }
   }
 
@@ -2882,6 +2794,8 @@ class _LoginPageState extends State<LoginPage> {
   void _toggleMode() {
     setState(() {
       _isSignUp = !_isSignUp;
+      _obscurePassword = true;
+      _obscureConfirmPassword = true;
       _emailController.clear();
       _passwordController.clear();
       _nameController.clear();
@@ -3033,13 +2947,27 @@ class _LoginPageState extends State<LoginPage> {
                         decoration: InputDecoration(
                           labelText: 'Password',
                           prefixIcon: Icon(Icons.lock, size: isVerySmallScreen ? 20 : 24),
+                          suffixIcon: IconButton(
+                            icon: Icon(
+                              _obscurePassword
+                                  ? Icons.visibility_outlined
+                                  : Icons.visibility_off_outlined,
+                              size: isVerySmallScreen ? 20 : 24,
+                            ),
+                            tooltip: _obscurePassword ? 'Show password' : 'Hide password',
+                            onPressed: () {
+                              setState(() {
+                                _obscurePassword = !_obscurePassword;
+                              });
+                            },
+                          ),
                           border: const OutlineInputBorder(),
                           contentPadding: EdgeInsets.symmetric(
                             horizontal: isVerySmallScreen ? 12 : 16,
                             vertical: isVerySmallScreen ? 12 : 16,
                           ),
                         ),
-                        obscureText: true,
+                        obscureText: _obscurePassword,
                         validator: (value) {
                           if (value == null || value.isEmpty) {
                             return 'Please enter your password';
@@ -3058,13 +2986,29 @@ class _LoginPageState extends State<LoginPage> {
                           decoration: InputDecoration(
                             labelText: 'Confirm Password',
                             prefixIcon: Icon(Icons.lock_outline, size: isVerySmallScreen ? 20 : 24),
+                            suffixIcon: IconButton(
+                              icon: Icon(
+                                _obscureConfirmPassword
+                                    ? Icons.visibility_outlined
+                                    : Icons.visibility_off_outlined,
+                                size: isVerySmallScreen ? 20 : 24,
+                              ),
+                              tooltip: _obscureConfirmPassword
+                                  ? 'Show password'
+                                  : 'Hide password',
+                              onPressed: () {
+                                setState(() {
+                                  _obscureConfirmPassword = !_obscureConfirmPassword;
+                                });
+                              },
+                            ),
                             border: const OutlineInputBorder(),
                             contentPadding: EdgeInsets.symmetric(
                               horizontal: isVerySmallScreen ? 12 : 16,
                               vertical: isVerySmallScreen ? 12 : 16,
                             ),
                           ),
-                          obscureText: true,
+                          obscureText: _obscureConfirmPassword,
                           validator: (value) {
                             if (value == null || value.isEmpty) {
                               return 'Please confirm your password';

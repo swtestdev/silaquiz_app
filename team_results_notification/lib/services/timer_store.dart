@@ -19,6 +19,7 @@ class TimerSession {
     required this.startedAtUtc,
     required this.endsAtUtc,
     required this.totalSeconds,
+    this.questionId = 0,
   });
 
   final String eventId;
@@ -27,6 +28,7 @@ class TimerSession {
   final DateTime startedAtUtc;
   final DateTime endsAtUtc;
   final int totalSeconds;
+  final int questionId;
 
   bool isActiveAt(DateTime nowUtc) => endsAtUtc.isAfter(nowUtc);
 
@@ -42,6 +44,7 @@ class TimerSession {
         'started_at_utc': startedAtUtc.toIso8601String(),
         'ends_at_utc': endsAtUtc.toIso8601String(),
         'total_seconds': totalSeconds,
+        'question_id': questionId,
       };
 
   static TimerSession? fromJson(Map<String, dynamic>? json) {
@@ -62,6 +65,7 @@ class TimerSession {
         startedAtUtc: started,
         endsAtUtc: ends,
         totalSeconds: TimerStore.parseInt(json['total_seconds']),
+        questionId: TimerStore.parseInt(json['question_id']),
       );
     } catch (_) {
       return null;
@@ -113,6 +117,16 @@ class TimerStore {
 
   TimerSession? get questionSession => _questionSession;
   TimerSession? get roundFinalSession => _roundFinalSession;
+
+  /// Question id for the active per-question countdown, when known.
+  int get activeQuestionId {
+    final now = DateTime.now().toUtc();
+    final q = _questionSession;
+    if (q != null && q.isActiveAt(now) && q.questionId > 0) {
+      return q.questionId;
+    }
+    return 0;
+  }
 
   static int parseInt(dynamic v) {
     if (v == null) return 0;
@@ -321,6 +335,7 @@ class TimerStore {
       startedAtUtc: started,
       endsAtUtc: ends,
       totalSeconds: total,
+      questionId: parseInt(window['question_id']),
     );
   }
 
@@ -347,6 +362,7 @@ class TimerStore {
       startedAtUtc: start,
       endsAtUtc: ends,
       totalSeconds: total,
+      questionId: parseInt(lastTrigger['question_id']),
     );
   }
 
@@ -406,17 +422,43 @@ class TimerStore {
     Map<String, dynamic> snapshot, {
     bool force = false,
   }) async {
-    if (!force && !await needsSyncFromActiveSnapshot(snapshot)) return;
+    final qWin = snapshot['question_window'] as Map<String, dynamic>?;
+    final serverQuestionActive = qWin?['active'] == true;
+    final prefs = await SharedPreferences.getInstance();
+
+    // Always refresh legacy START prefs when server window is live, even if
+    // session drift check would skip the rest of the sync (ECHO uses force=false).
+    if (serverQuestionActive && qWin != null) {
+      await _persistActiveQuestionWindowPrefs(prefs, qWin);
+    }
+
+    if (!force && !await needsSyncFromActiveSnapshot(snapshot)) {
+      if (serverQuestionActive) {
+        _notify();
+      } else if (_questionSession != null) {
+        // Server window inactive while local session lingered — reconcile UI.
+        _questionSession = null;
+        await _persistSessions();
+        await _syncLegacyPrefs();
+        _stopTickerIfIdle();
+        _notify();
+      }
+      return;
+    }
 
     final now = DateTime.now().toUtc();
-    final qWin = snapshot['question_window'] as Map<String, dynamic>?;
 
     var newQuestion =
         _sessionFromWindow(qWin, TimerSessionKind.question);
     if (newQuestion == null &&
         !force &&
         (_questionSession?.isActiveAt(now) ?? false)) {
-      newQuestion = _questionSession;
+      // Server explicitly inactive (STOP / slide change) — clear local countdown.
+      final serverExplicitInactive =
+          qWin != null && qWin['active'] != true;
+      if (!serverExplicitInactive) {
+        newQuestion = _questionSession;
+      }
     }
     _questionSession = newQuestion;
     _roundFinalSession = _mergeRoundSessionFromSnapshot(
@@ -425,14 +467,16 @@ class TimerStore {
       force: force,
     );
 
-    final prefs = await SharedPreferences.getInstance();
+    final localQuestionActive =
+        _questionSession?.isActiveAt(now) ?? false;
     final lastTrigger = snapshot['last_trigger'];
-    if (lastTrigger is Map<String, dynamic>) {
-      await prefs.setString('last_timer_action_data', jsonEncode(lastTrigger));
-      final ft = parseInt(lastTrigger['final_timer']);
-      if (ft != 0) {
-        await prefs.setInt('cached_round_timer', ft);
-      }
+    if (!serverQuestionActive && lastTrigger is Map<String, dynamic>) {
+      await _persistLastTriggerFromSnapshot(
+        prefs,
+        lastTrigger,
+        localQuestionActive: localQuestionActive,
+        serverQuestionActive: serverQuestionActive,
+      );
     }
 
     await _syncExpiredRoundsFromSnapshot(snapshot, force: force);
@@ -497,6 +541,81 @@ class TimerStore {
           await _addRoundFinalTimerExpired(prefs, rn);
         }
       } catch (_) {}
+    }
+  }
+
+  /// Writes [lastTrigger] to legacy prefs without clobbering an active question id.
+  Future<void> _persistActiveQuestionWindowPrefs(
+    SharedPreferences prefs,
+    Map<String, dynamic> qWin,
+  ) async {
+    final roundName = qWin['round_name']?.toString() ?? '';
+    if (roundName.isEmpty) return;
+
+    final payload = <String, dynamic>{
+      'timer_action': 'START_TIME',
+      'round_name': roundName,
+      'question_id': parseInt(qWin['question_id']),
+      'timer_start': qWin['timer_start'],
+      'timer_end': qWin['timer_end'],
+      'duration_seconds': parseInt(qWin['duration_seconds']),
+      'question_timer': parseInt(qWin['question_timer']) > 0
+          ? parseInt(qWin['question_timer'])
+          : parseInt(qWin['duration_seconds']),
+      'final_timer': parseInt(qWin['final_timer']),
+      'event_id': qWin['event_id']?.toString() ?? '',
+    };
+    await prefs.setString('last_timer_action_data', jsonEncode(payload));
+    final ft = parseInt(payload['final_timer']);
+    if (ft != 0) {
+      await prefs.setInt('cached_round_timer', ft);
+    }
+  }
+
+  Future<void> _persistLastTriggerFromSnapshot(
+    SharedPreferences prefs,
+    Map<String, dynamic> lastTrigger, {
+    required bool localQuestionActive,
+    required bool serverQuestionActive,
+  }) async {
+    final action = lastTrigger['timer_action']?.toString() ?? '';
+    final qid = parseInt(lastTrigger['question_id']);
+    final stopLike = action == 'STOP_TIMER' || action == 'PAUSE_TIMER';
+
+    if (localQuestionActive &&
+        !serverQuestionActive &&
+        stopLike &&
+        qid == 0) {
+      final prevStr = prefs.getString('last_timer_action_data');
+      if (prevStr != null) {
+        try {
+          final prev = jsonDecode(prevStr) as Map<String, dynamic>;
+          final prevQid = parseInt(prev['question_id']);
+          if (prevQid != 0) {
+            final merged = Map<String, dynamic>.from(lastTrigger);
+            merged['question_id'] = prevQid;
+            if ((merged['round_name']?.toString() ?? '').isEmpty) {
+              merged['round_name'] = prev['round_name'];
+            }
+            await prefs.setString(
+              'last_timer_action_data',
+              jsonEncode(merged),
+            );
+            final ft = parseInt(merged['final_timer']);
+            if (ft != 0) {
+              await prefs.setInt('cached_round_timer', ft);
+            }
+            return;
+          }
+        } catch (_) {}
+      }
+      return;
+    }
+
+    await prefs.setString('last_timer_action_data', jsonEncode(lastTrigger));
+    final ft = parseInt(lastTrigger['final_timer']);
+    if (ft != 0) {
+      await prefs.setInt('cached_round_timer', ft);
     }
   }
 
@@ -621,6 +740,7 @@ class TimerStore {
       startedAtUtc: startedAt,
       endsAtUtc: ends,
       totalSeconds: total,
+      questionId: parseInt(message['question_id']),
     );
   }
 
@@ -728,6 +848,26 @@ class TimerStore {
     SharedPreferences prefs,
     int ftVal,
   ) async {
+    if (message['server_stop'] == true) {
+      final expiredKind = message['expired_kind']?.toString() ?? 'question';
+      if (expiredKind == 'round_final') {
+        _questionSession = null;
+        await prefs.remove('start_timer_end_utc');
+        final rn = _roundFinalSession?.roundName.trim() ??
+            (message['round_name'] as String?)?.trim() ??
+            '';
+        _roundFinalSession = null;
+        await prefs.remove('last_timer_end_utc');
+        if (rn.isNotEmpty) {
+          await _addRoundFinalTimerExpired(prefs, rn);
+        }
+      } else {
+        _questionSession = null;
+        await prefs.remove('start_timer_end_utc');
+      }
+      return;
+    }
+
     _questionSession = null;
     await prefs.remove('start_timer_end_utc');
 

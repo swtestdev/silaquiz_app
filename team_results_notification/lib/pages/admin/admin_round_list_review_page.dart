@@ -41,6 +41,7 @@ class _TeamCellState {
   final String teamName;
   String playerAnswer;
   int? isCorrect;
+  final int? storedIsCorrect;
   final int questionId;
   final int slotCol;
   final String? baselineAnswer;
@@ -50,6 +51,7 @@ class _TeamCellState {
     required this.teamName,
     required this.playerAnswer,
     required this.isCorrect,
+    required this.storedIsCorrect,
     required this.questionId,
     required this.slotCol,
     required this.baselineAnswer,
@@ -122,7 +124,8 @@ class _AdminRoundListReviewPageState extends State<AdminRoundListReviewPage> {
           teamId: teamId,
           teamName: teamName,
           playerAnswer: answer,
-          isCorrect: _parseGrade(c['is_correct']),
+          isCorrect: parseStoredGrade(c['suggested_is_correct']),
+          storedIsCorrect: parseStoredGrade(c['stored_is_correct']),
           questionId: c['question_id'] as int,
           slotCol: c['slot_col'] as int,
           baselineAnswer: baseline,
@@ -138,12 +141,6 @@ class _AdminRoundListReviewPageState extends State<AdminRoundListReviewPage> {
       _teamsMeta = teamsRaw;
       _loading = false;
     });
-  }
-
-  int? _parseGrade(dynamic v) {
-    if (v == null) return null;
-    if (v is int) return v;
-    return int.tryParse(v.toString());
   }
 
   _TeamCellState? _cell(int teamId, int rowIndex) =>
@@ -272,7 +269,7 @@ class _AdminRoundListReviewPageState extends State<AdminRoundListReviewPage> {
     final text = cell.playerAnswer.trim();
     final label = text.isEmpty ? 'No answer' : text;
     final grade = text.isEmpty ? 0 : (cell.isCorrect ?? 0);
-    return Material(
+    final chip = Material(
       color: verdictChipColor(grade),
       borderRadius: BorderRadius.circular(6),
       child: InkWell(
@@ -296,6 +293,7 @@ class _AdminRoundListReviewPageState extends State<AdminRoundListReviewPage> {
         ),
       ),
     );
+    return verdictChipWithStoredLine(storedGrade: cell.storedIsCorrect, chip: chip);
   }
 
   Widget _buildTable() {

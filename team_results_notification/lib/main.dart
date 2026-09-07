@@ -1,8 +1,8 @@
 import 'dart:async';
-import 'dart:html' as html;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'utils/browser/browser.dart';
 import 'pages/splash_page.dart';
 import 'pages/login_page.dart';
 import 'pages/main_page.dart';
@@ -184,29 +184,7 @@ class _DebugConsoleOverlayState extends State<DebugConsoleOverlay> {
   bool _expanded = true;
 
   Future<bool> _copyToClipboardWeb(String text) async {
-    try {
-      final clipboard = html.window.navigator.clipboard;
-      if (clipboard != null) {
-        await clipboard.writeText(text);
-        return true;
-      }
-    } catch (_) {}
-    try {
-      final textarea = html.TextAreaElement()
-        ..value = text
-        ..style.position = 'fixed'
-        ..style.left = '-9999px'
-        ..style.top = '0';
-      html.document.body?.append(textarea);
-      textarea.focus();
-      textarea.select();
-      textarea.setSelectionRange(0, text.length);
-      final ok = html.document.execCommand('copy');
-      textarea.remove();
-      return ok;
-    } catch (_) {
-      return false;
-    }
+    return copyTextToClipboard(text);
   }
 
   @override

@@ -33,10 +33,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
   bool _adminHasLiveGame = false;
   int? _adminActiveGameId;
   bool _sessionValidationInProgress = false;
-  bool _disconnectionHandlerRunning = false;
   bool _suppressWebSocketReconnect = false;
   bool _logoutInProgress = false;
-  int _webSocketSessionId = 0;
   Timer? _echoTimer;
   DateTime? _lastForcedActiveTimerSync;
   bool _hasShownNotification = false;
@@ -48,13 +46,24 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
   String? _currentWriterName;
   String? _previousWriterName;
   
-  // Visible connected status tracking
+  // Admin matrix: tab visible + WS (from backend echo). Not used for user-facing Online.
   int _visibleConnected = 0;
+
+  /// User-facing Online when HTTP/API (ECHO) reaches the server.
+  bool _serverReachable = false;
   
   // WebSocket state
   WebSocketChannel? _channel;
+  StreamSubscription<dynamic>? _webSocketSubscription;
+  Timer? _webSocketReconnectTimer;
+  bool _webSocketConnecting = false;
+  bool _webSocketLive = false;
+  int _webSocketConnectionGen = 0;
   bool _hasShownLocalhostHint = false;
   int _webSocketReconnectAttempts = 0;
+
+  bool get _isWebSocketHealthy =>
+      _webSocketLive && _channel != null && !_webSocketConnecting;
 
   @override
   void initState() {
@@ -73,6 +82,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
       },
     );
     StrictVisibilityService.instance.strictVisible.addListener(_onStrictVisibleChanged);
+    StrictVisibilityService.instance.effectiveVisible.addListener(_onStrictVisibleChanged);
 
     // Show version upgrade message if config was from older app
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -185,6 +195,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
             _userName = freshUserData?['name'] ?? 'User';
             _isWriter = freshUserData?['writer'] ?? false;
             _visibleConnected = freshUserData?['visible_connected'] ?? 0;
+            _serverReachable = true;
             _userId = freshUserData?['id']?.toString() ?? '';
             _userRole = freshUserData?['role'] ?? 'player';
           });
@@ -251,7 +262,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
     
     // Connect to WebSocket for timer updates (only for players)
     if (_userRole == 'player') {
-      _connectWebSocket();
+      StrictVisibilityService.instance.setWebSocketConnected(false);
+      _requestWebSocketConnect();
     }
     
     // Start periodic session validation to catch session invalidation
@@ -312,7 +324,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
     
     // Connect WebSocket if player
     if (_userRole == 'player') {
-      _connectWebSocket();
+      StrictVisibilityService.instance.setWebSocketConnected(false);
+      _requestWebSocketConnect();
     }
     
     // Show notification popup only if user has a team
@@ -665,16 +678,16 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
             mainAxisSize: MainAxisSize.min,
             children: [
               Icon(
-                _visibleConnected == 1 ? Icons.wifi : Icons.wifi_off,
-                color: _visibleConnected == 1 ? Colors.lightGreen : Colors.red,
+                _serverReachable ? Icons.wifi : Icons.wifi_off,
+                color: _serverReachable ? Colors.lightGreen : Colors.red,
                 size: 16,
               ),
               const SizedBox(width: 4),
               Text(
-                _visibleConnected == 1 ? 'Online' : 'Offline',
+                _serverReachable ? 'Online' : 'Offline',
                 style: TextStyle(
                   fontSize: 16,
-                  color: _visibleConnected == 1 ? Colors.lightGreen : Colors.red,
+                  color: _serverReachable ? Colors.lightGreen : Colors.red,
                 ),
               ),
             ],
@@ -709,7 +722,11 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
             icon: const Icon(Icons.logout),
             onPressed: () async {
               _suppressWebSocketReconnect = true;
-              _webSocketSessionId++;
+              _webSocketConnectionGen++;
+              _cancelWebSocketReconnect();
+              _webSocketLive = false;
+              _webSocketConnecting = false;
+              StrictVisibilityService.instance.setWebSocketConnected(false);
               // Call backend logout API to set visible_connected = 0
               try {
                 await DatabaseService.logoutUser();
@@ -717,12 +734,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
                 print('Error calling logout API: $e');
                 // Continue with logout even if API call fails
               }
-              
-              // Close WebSocket connection
-              try {
-                _channel?.sink.close();
-              } catch (_) {}
-              _channel = null;
+
+              _tearDownWebSocketChannel();
               _echoTimer?.cancel();
               
               // Clear timer status on logout
@@ -940,7 +953,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
                 child: Opacity(
                   opacity: canAccessQuestion ? 1.0 : 0.5,
                   child: _buildActionCard(
-                    'Start Quiz',
+                    'Board Quize',
                     Icons.play_arrow,
                     Colors.green,
                     canAccessQuestion
@@ -1107,6 +1120,11 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
         if (force) {
           _lastForcedActiveTimerSync = DateTime.now();
         }
+        if (mounted) {
+          setState(() {
+            _serverReachable = true;
+          });
+        }
         print('MainPage: Active timer snapshot synced (force=$force)');
       } else {
         print('MainPage: No active timer snapshot: ${result['message']}');
@@ -1124,101 +1142,174 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
   }
 
   // WebSocket and Timer Management
-  void _connectWebSocket() {
+  void _requestWebSocketConnect() {
     if (_suppressWebSocketReconnect || _logoutInProgress) return;
     if (_userId.isEmpty || _userRole != 'player') return;
-    
+    if (_isWebSocketHealthy) return;
+    if (_webSocketConnecting) return;
+
+    _webSocketReconnectTimer?.cancel();
+    _webSocketReconnectTimer = null;
+    unawaited(_beginWebSocketConnect());
+  }
+
+  void _ensureWebSocketConnected() {
+    if (_isWebSocketHealthy) return;
+    _requestWebSocketConnect();
+  }
+
+  Future<void> _beginWebSocketConnect() async {
+    if (_suppressWebSocketReconnect || _logoutInProgress) return;
+    if (_userId.isEmpty || _userRole != 'player') return;
+    if (_isWebSocketHealthy || _webSocketConnecting) return;
+
+    _webSocketConnecting = true;
+    final gen = ++_webSocketConnectionGen;
+    _tearDownWebSocketChannel();
+
+    final wsUrl = DatabaseService.getWebSocketUrl(_userId);
+    if (kDebugMode) {
+      print('WebSocket connect start (gen=$gen): $wsUrl');
+    }
+
     try {
-      // Close existing connection if any
-      if (_channel != null) {
-        try {
-          _channel!.sink.close();
-          print('Closed existing WebSocket connection before reconnecting');
-        } catch (e) {
-          print('Error closing existing WebSocket: $e');
+      _channel = WebSocketChannel.connect(Uri.parse(wsUrl));
+
+      _webSocketSubscription = _channel!.stream.listen(
+        (data) => _onWebSocketData(gen, data),
+        onError: (error) => _onWebSocketError(gen, error),
+        onDone: () => _onWebSocketClosed(gen),
+        cancelOnError: true,
+      );
+
+      await _channel!.ready;
+      if (!mounted ||
+          _suppressWebSocketReconnect ||
+          _logoutInProgress ||
+          gen != _webSocketConnectionGen) {
+        if (gen == _webSocketConnectionGen) {
+          _webSocketConnecting = false;
         }
-        _channel = null;
+        return;
       }
-      
-      // Get WebSocket URL from configurable server URL
-      final wsUrl = DatabaseService.getWebSocketUrl(_userId);
-      print('Connecting to WebSocket: $wsUrl');
-      
-      _channel = WebSocketChannel.connect(
-        Uri.parse(wsUrl),
-      );
-      
-      // Set visible connected status when WebSocket connects
-      _webSocketReconnectAttempts = 0; // Reset backoff on success
-      setState(() {
-        _visibleConnected = 1;
-      });
-      print('WebSocket connected, setting visible_connected = 1');
-      
-      _channel!.stream.listen(
-        (data) {
-          final now = DateTime.now();
-          final utcNow = DateTime.now().toUtc();
-          print('=== WebSocket Message Received ===');
-          print('Timestamp (Local): ${now.toIso8601String()}');
-          print('Timestamp (UTC): ${utcNow.toIso8601String()}');
-          print('Time since epoch (ms): ${now.millisecondsSinceEpoch}');
-          print('Data: $data');
-          try {
-            final message = json.decode(data) as Map<String, dynamic>;
-            print('Parsed message: $message');
-            
-            // Forward timer messages to question_page if it's listening
-            if (message['type'] == 'timer_trigger') {
-              print('Forwarding timer message to question_page');
-              question_page.forwardTimerMessage(message);
-            } else if (message['type'] == 'timer_state') {
-              final snapshot = message['active_timers'];
-              if (snapshot is Map<String, dynamic>) {
-                print('Applying timer_state snapshot from WebSocket');
-                unawaited(_applyActiveTimersPayload(snapshot));
-              }
-            }
-          } catch (e) {
-            print('Error parsing WebSocket message: $e');
-          }
-        },
-        onError: (error) {
-          print('WebSocket error: $error');
-          // Set visible connected status to 0 on error
-          if (mounted) {
-            setState(() {
-              _visibleConnected = 0;
-            });
-            print('WebSocket error, setting visible_connected = 0');
-            _maybeShowLocalhostMobileHint();
-          }
-          // WebSocket error might indicate connection issues, check if we should logout
-          _handleWebSocketDisconnection();
-        },
-        onDone: () {
-          print('WebSocket connection closed - this might be due to new device login');
-          // Set visible connected status to 0 when WebSocket disconnects
-          if (mounted) {
-            setState(() {
-              _visibleConnected = 0;
-            });
-            print('WebSocket disconnected, setting visible_connected = 0');
-          }
-          // Reconnect without SnackBar noise; Online/Offline indicator reflects _visibleConnected
-          _handleWebSocketDisconnection();
-        },
-      );
+
+      _webSocketConnecting = false;
+      _webSocketLive = true;
+      _webSocketReconnectAttempts = 0;
+      _webSocketReconnectTimer?.cancel();
+      _webSocketReconnectTimer = null;
+      StrictVisibilityService.instance.setWebSocketConnected(true);
+      if (kDebugMode) {
+        print('WebSocket ready (gen=$gen)');
+      }
     } catch (e) {
-      print('Error connecting to WebSocket: $e');
-      // Set visible connected status to 0 on connection error
-      if (mounted) {
-        setState(() {
-          _visibleConnected = 0;
-        });
-        _maybeShowLocalhostMobileHint();
+      if (gen != _webSocketConnectionGen) return;
+      if (kDebugMode) {
+        print('WebSocket connect failed (gen=$gen): $e');
+      }
+      _markWebSocketOffline(scheduleReconnect: true);
+      _maybeShowLocalhostMobileHint();
+    }
+  }
+
+  void _onWebSocketData(int gen, dynamic data) {
+    if (gen != _webSocketConnectionGen) return;
+    try {
+      final message = json.decode(data) as Map<String, dynamic>;
+      if (message['type'] == 'timer_trigger') {
+        unawaited(question_page.forwardTimerMessage(message));
+      } else if (message['type'] == 'timer_state') {
+        final snapshot = message['active_timers'];
+        if (snapshot is Map<String, dynamic>) {
+          unawaited(_applyActiveTimersPayload(snapshot));
+        }
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('WebSocket parse error: $e');
       }
     }
+  }
+
+  void _onWebSocketError(int gen, Object error) {
+    if (gen != _webSocketConnectionGen) return;
+    if (kDebugMode) {
+      print('WebSocket error (gen=$gen): $error');
+    }
+    _markWebSocketOffline(scheduleReconnect: true);
+    _maybeShowLocalhostMobileHint();
+  }
+
+  void _onWebSocketClosed(int gen) {
+    if (gen != _webSocketConnectionGen) return;
+    if (kDebugMode) {
+      print('WebSocket closed (gen=$gen)');
+    }
+    _markWebSocketOffline(scheduleReconnect: true);
+  }
+
+  void _markWebSocketOffline({required bool scheduleReconnect}) {
+    if (!_webSocketLive && !_webSocketConnecting && _channel == null) {
+      if (scheduleReconnect) {
+        _scheduleWebSocketReconnect();
+      }
+      return;
+    }
+
+    _webSocketConnectionGen++;
+    _webSocketLive = false;
+    _webSocketConnecting = false;
+    _tearDownWebSocketChannel();
+    StrictVisibilityService.instance.setWebSocketConnected(false);
+    if (scheduleReconnect) {
+      _scheduleWebSocketReconnect();
+    }
+  }
+
+  void _scheduleWebSocketReconnect() {
+    if (_suppressWebSocketReconnect || _logoutInProgress) return;
+    if (_isWebSocketHealthy || _webSocketConnecting) return;
+    if (_webSocketReconnectTimer?.isActive ?? false) return;
+
+    final baseUrl = DatabaseService.baseUrl;
+    final useBackoff = kIsWeb && baseUrl.contains('localhost');
+    final delaySeconds = useBackoff
+        ? (1 << _webSocketReconnectAttempts.clamp(0, 5)).clamp(1, 30)
+        : 1;
+    _webSocketReconnectAttempts =
+        (_webSocketReconnectAttempts + 1).clamp(0, 10);
+
+    if (kDebugMode) {
+      print(
+        'WebSocket reconnect in ${delaySeconds}s '
+        '(attempt $_webSocketReconnectAttempts)',
+      );
+    }
+
+    _webSocketReconnectTimer = Timer(Duration(seconds: delaySeconds), () {
+      _webSocketReconnectTimer = null;
+      if (!mounted || _suppressWebSocketReconnect || _logoutInProgress) {
+        return;
+      }
+      _requestWebSocketConnect();
+    });
+  }
+
+  void _tearDownWebSocketChannel() {
+    _webSocketSubscription?.cancel();
+    _webSocketSubscription = null;
+    final channel = _channel;
+    _channel = null;
+    if (channel != null) {
+      try {
+        channel.sink.close();
+      } catch (_) {}
+    }
+  }
+
+  void _cancelWebSocketReconnect() {
+    _webSocketReconnectTimer?.cancel();
+    _webSocketReconnectTimer = null;
   }
 
   void _maybeShowLocalhostMobileHint() {
@@ -1232,133 +1323,6 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
     );
   }
 
-  // Ensure WebSocket is connected, reconnect if needed
-  void _ensureWebSocketConnected() {
-    if (_suppressWebSocketReconnect || _logoutInProgress) return;
-    if (_userId.isEmpty || _userRole != 'player') return;
-    
-    // Check if WebSocket is null or closed
-    bool needsReconnect = false;
-    
-    if (_channel == null) {
-      print('WebSocket is null, needs reconnection');
-      needsReconnect = true;
-    } else {
-      // Try to check if connection is still alive by checking the stream
-      // If the stream is closed, we need to reconnect
-      try {
-        // The stream might be closed, but we can't directly check it
-        // So we'll just try to reconnect if channel exists but visible_connected is 0
-        if (_visibleConnected == 0) {
-          print('WebSocket exists but visible_connected is 0, attempting reconnection');
-          needsReconnect = true;
-        }
-      } catch (e) {
-        print('Error checking WebSocket state: $e, will reconnect');
-        needsReconnect = true;
-      }
-    }
-    
-    if (needsReconnect) {
-      print('Reconnecting WebSocket...');
-      _connectWebSocket();
-    } else {
-      print('WebSocket is already connected');
-    }
-  }
-
-  // Handle WebSocket disconnection
-  void _handleWebSocketDisconnection() {
-    if (_suppressWebSocketReconnect || _logoutInProgress) {
-      print('WebSocket reconnect suppressed (logout in progress)');
-      return;
-    }
-    if (_disconnectionHandlerRunning) {
-      print('Disconnection handler already running, skipping...');
-      return;
-    }
-    
-    _disconnectionHandlerRunning = true;
-    final reconnectSessionId = _webSocketSessionId;
-    // Backoff: 1s, 2s, 4s, 8s, 16s, 30s... to avoid reconnect spam when URL is wrong
-    final baseUrl = DatabaseService.baseUrl;
-    final useBackoff = kIsWeb && baseUrl.contains('localhost');
-    final delaySeconds = useBackoff
-        ? (1 << _webSocketReconnectAttempts.clamp(0, 5)).clamp(1, 30)
-        : 1;
-    _webSocketReconnectAttempts = (_webSocketReconnectAttempts + 1).clamp(0, 10);
-    print('WebSocket disconnected, reconnecting in ${delaySeconds}s (attempt $_webSocketReconnectAttempts)...');
-    
-    Future.delayed(Duration(seconds: delaySeconds), () async {
-      if (!mounted ||
-          _suppressWebSocketReconnect ||
-          _logoutInProgress ||
-          reconnectSessionId != _webSocketSessionId) {
-        _disconnectionHandlerRunning = false;
-        return;
-      }
-      
-      // Check if we have valid local data first (faster check)
-      final userData = await UserDataService.getUserData();
-      if (userData != null && userData['access_token'] != null && _userRole == 'player') {
-        print('Have valid local data, attempting immediate reconnection...');
-        _ensureWebSocketConnected();
-      }
-      
-      // Also check login status with backend (more thorough)
-      Future.delayed(const Duration(seconds: 1), () async {
-        if (!mounted ||
-            _suppressWebSocketReconnect ||
-            _logoutInProgress ||
-            reconnectSessionId != _webSocketSessionId) {
-          _disconnectionHandlerRunning = false;
-          return;
-        }
-        
-        try {
-          final loginCheck = await DatabaseService.checkLoginStatus();
-          print('Login check result: ${loginCheck['success']}, message: ${loginCheck['message']}');
-          
-          if (loginCheck['success'] == false) {
-            print('Login check failed after WebSocket disconnection, but checking if we have valid local data...');
-            // Check if we have valid local data before logging out
-            final userData = await UserDataService.getUserData();
-            if (userData != null && userData['access_token'] != null) {
-              print('Have valid local data, assuming still logged in and reconnecting...');
-              if (_userRole == 'player') {
-                _ensureWebSocketConnected();
-              }
-            } else {
-              print('No valid local data, logging out user');
-              await _logoutUser(reason: LogoutReason.signedOut);
-            }
-          } else {
-            print('User still logged in after WebSocket disconnection, ensuring WebSocket is connected...');
-            // User is still logged in, ensure WebSocket is connected
-            if (_userRole == 'player') {
-              _ensureWebSocketConnected();
-            }
-          }
-        } catch (e) {
-          print('Error during login check after WebSocket disconnection: $e');
-          // Check if we have valid local data before giving up
-          final userData = await UserDataService.getUserData();
-          if (userData != null && userData['access_token'] != null) {
-            print('Network error but have valid local data, attempting to reconnect...');
-            if (_userRole == 'player') {
-              _ensureWebSocketConnected();
-            }
-          } else {
-            print('No valid local data and network error, logging out user');
-            await _logoutUser(reason: LogoutReason.signedOut);
-          }
-        }
-        
-        _disconnectionHandlerRunning = false;
-      });
-    });
-  }
-
   // Logout user and redirect to login
   Future<void> _logoutUser({
     LogoutReason reason = LogoutReason.signedOut,
@@ -1367,15 +1331,14 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
     if (_logoutInProgress) return;
     _logoutInProgress = true;
     _suppressWebSocketReconnect = true;
-    _webSocketSessionId++;
+    _webSocketConnectionGen++;
+    _cancelWebSocketReconnect();
+    _webSocketLive = false;
+    _webSocketConnecting = false;
+    StrictVisibilityService.instance.setWebSocketConnected(false);
 
     _echoTimer?.cancel();
-    try {
-      _channel?.sink.close();
-    } catch (e) {
-      print('Error closing WebSocket during logout: $e');
-    }
-    _channel = null;
+    _tearDownWebSocketChannel();
 
     final title = LogoutNotice.titleFor(reason);
     final userMessage = LogoutNotice.userMessage(
@@ -1443,7 +1406,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
 
   void _onStrictVisibleChanged() {
     if (!mounted) return;
-    if (StrictVisibilityService.instance.isStrictVisible && _userRole == 'player') {
+    if (_userRole == 'player' &&
+        StrictVisibilityService.instance.isStrictVisible) {
       _ensureWebSocketConnected();
       unawaited(_syncActiveTimersFromServer(force: true));
     }
@@ -1647,10 +1611,9 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
           const Duration(seconds: 5),
           onTimeout: () {
             print('ECHO call timed out');
-            // Mark as offline on timeout
             if (mounted) {
               setState(() {
-                _visibleConnected = 0;
+                _serverReachable = false;
               });
             }
             return {'success': false, 'should_logout': false};
@@ -1670,18 +1633,24 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
               LogoutReason.sessionTakenElsewhere;
           await _logoutUser(reason: reason, backendMessage: backendMsg);
         } else if (echoResult['success'] == true) {
-          // ECHO call successful, ensure WebSocket is connected
-          if (_userRole == 'player') {
+          if (_userRole == 'player' && !_isWebSocketHealthy) {
             _ensureWebSocketConnected();
           }
-          
-          // Update visible connected status
+
           final visibleConnected = echoResult['visible_connected'];
-          if (visibleConnected != null && visibleConnected != _visibleConnected) {
+          if (mounted &&
+              (!_serverReachable ||
+                  (visibleConnected != null &&
+                      visibleConnected != _visibleConnected))) {
             setState(() {
-              _visibleConnected = visibleConnected;
+              _serverReachable = true;
+              if (visibleConnected != null) {
+                _visibleConnected = visibleConnected;
+              }
             });
-            print('Visible connected status updated: $_visibleConnected');
+            print(
+              'Server reachable; visible_connected=$_visibleConnected',
+            );
           }
           
           // Handle writer status changes
@@ -1695,19 +1664,17 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
             await _applyActiveTimersPayload(activeTimers);
           }
         } else {
-          // Any non-success from echo means backend may be unavailable – show Offline
           if (mounted) {
             setState(() {
-              _visibleConnected = 0;
+              _serverReachable = false;
             });
           }
         }
       } catch (e) {
         print('Error during ECHO call: $e');
-        // On network errors mark as Offline, do not logout
         if (mounted) {
           setState(() {
-            _visibleConnected = 0;
+            _serverReachable = false;
           });
         }
       }
@@ -1753,8 +1720,11 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
     appRouteObserver.unsubscribe(this);
     WidgetsBinding.instance.removeObserver(this);
     StrictVisibilityService.instance.strictVisible.removeListener(_onStrictVisibleChanged);
+    StrictVisibilityService.instance.effectiveVisible.removeListener(_onStrictVisibleChanged);
     _echoTimer?.cancel();
-    _channel?.sink.close();
+    _cancelWebSocketReconnect();
+    _webSocketConnectionGen++;
+    _tearDownWebSocketChannel();
     super.dispose();
   }
 }

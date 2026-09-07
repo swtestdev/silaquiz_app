@@ -45,12 +45,14 @@ class _SlotState {
   final String reference;
   String playerAnswer;
   int? isCorrect;
+  final int? storedIsCorrect;
 
   _SlotState({
     required this.col,
     required this.reference,
     required this.playerAnswer,
     required this.isCorrect,
+    required this.storedIsCorrect,
   });
 }
 
@@ -109,7 +111,8 @@ class _AdminQuestionReviewPageState extends State<AdminQuestionReviewPage> {
           col: col,
           reference: (s['reference'] ?? '').toString(),
           playerAnswer: answer,
-          isCorrect: _parseGrade(s['is_correct']),
+          isCorrect: parseStoredGrade(s['suggested_is_correct']),
+          storedIsCorrect: parseStoredGrade(s['stored_is_correct']),
         );
       }).toList();
       return _TeamReviewState(
@@ -128,12 +131,6 @@ class _AdminQuestionReviewPageState extends State<AdminQuestionReviewPage> {
       _teams = teams;
       _loading = false;
     });
-  }
-
-  int? _parseGrade(dynamic v) {
-    if (v == null) return null;
-    if (v is int) return v;
-    return int.tryParse(v.toString());
   }
 
   ParsedQuestionKind get _parsed =>
@@ -282,7 +279,7 @@ class _AdminQuestionReviewPageState extends State<AdminQuestionReviewPage> {
     final text = slot.playerAnswer.trim();
     final label = text.isEmpty ? 'No answer' : text;
     final grade = text.isEmpty ? 0 : (slot.isCorrect ?? 0);
-    return Material(
+    final chip = Material(
       color: verdictChipColor(grade),
       borderRadius: BorderRadius.circular(6),
       child: InkWell(
@@ -306,6 +303,7 @@ class _AdminQuestionReviewPageState extends State<AdminQuestionReviewPage> {
         ),
       ),
     );
+    return verdictChipWithStoredLine(storedGrade: slot.storedIsCorrect, chip: chip);
   }
 
   Widget _buildTable() {

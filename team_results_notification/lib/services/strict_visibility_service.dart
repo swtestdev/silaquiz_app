@@ -3,20 +3,21 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 
-// Web-only: PWA target. Non-web uses lifecycle only (doc + focus treated as always true).
-import 'dart:html' as html show document, window;
+import '../utils/browser/browser.dart';
 
 /// Attention-based visibility for Quze: visible only when tab/page is visible **and**
-/// window focused (web), and app lifecycle resumed.
+/// window focused (web), app lifecycle resumed, and WebSocket connected (players).
 class StrictVisibilityService extends WidgetsBindingObserver {
   StrictVisibilityService._();
   static final StrictVisibilityService instance = StrictVisibilityService._();
 
   final ValueNotifier<bool> strictVisible = ValueNotifier<bool>(true);
+  final ValueNotifier<bool> effectiveVisible = ValueNotifier<bool>(true);
 
   bool _docVisible = true;
   bool _windowFocused = true;
   bool _lifecycleResumed = true;
+  bool _webSocketConnected = true;
 
   Timer? _debounceVisible;
   bool _initialized = false;
@@ -24,7 +25,11 @@ class StrictVisibilityService extends WidgetsBindingObserver {
   /// Fired for audit / immediate echo: [reason] matches backend `visibility_reason` allowlist.
   void Function(String reason, bool appVisible)? onImmediateAuditPing;
 
+  /// Attention-only (tab/focus/lifecycle). Use for ECHO and admin APP tracking.
   bool get isStrictVisible => strictVisible.value;
+
+  /// Legacy: attention + WebSocket. Not used for admin visibility matrix.
+  bool get isEffectivelyVisible => effectiveVisible.value;
 
   void init({void Function(String reason, bool appVisible)? onImmediateAuditPing}) {
     if (_initialized) {
@@ -35,55 +40,70 @@ class StrictVisibilityService extends WidgetsBindingObserver {
     this.onImmediateAuditPing = onImmediateAuditPing;
 
     WidgetsBinding.instance.addObserver(this);
+    strictVisible.addListener(_syncEffectiveVisible);
 
     if (kIsWeb) {
-      _docVisible = html.document.visibilityState == 'visible';
+      _docVisible = initStrictVisibilityWeb(
+        StrictVisibilityWebCallbacks(
+          onDocumentVisibilityChange: (visible) {
+            _docVisible = visible;
+            if (!visible) {
+              _cancelDebouncedVisible();
+              _applyHidden('visibility_hidden');
+            } else {
+              _debounceTryBecomeVisible('visibility_visible');
+            }
+          },
+          onWindowBlur: () {
+            _windowFocused = false;
+            _cancelDebouncedVisible();
+            _applyHidden('blur');
+          },
+          onWindowFocus: () {
+            _windowFocused = true;
+            _debounceTryBecomeVisible('focus');
+          },
+          onBeforeUnload: () {
+            onImmediateAuditPing?.call('beforeunload', false);
+          },
+          onPageHide: () {
+            onImmediateAuditPing?.call('pagehide', false);
+          },
+        ),
+      );
       _windowFocused = true;
-
-      html.document.addEventListener('visibilitychange', (Object? _) {
-        final visible = html.document.visibilityState == 'visible';
-        _docVisible = visible;
-        if (!visible) {
-          _cancelDebouncedVisible();
-          _applyHidden('visibility_hidden');
-        } else {
-          _debounceTryBecomeVisible('visibility_visible');
-        }
-      });
-
-      html.window.onBlur.listen((Object? _) {
-        _windowFocused = false;
-        _cancelDebouncedVisible();
-        _applyHidden('blur');
-      });
-
-      html.window.onFocus.listen((Object? _) {
-        _windowFocused = true;
-        _debounceTryBecomeVisible('focus');
-      });
-
-      html.window.addEventListener('beforeunload', (Object? _) {
-        onImmediateAuditPing?.call('beforeunload', false);
-      });
-
-      html.window.addEventListener('pagehide', (Object? _) {
-        onImmediateAuditPing?.call('pagehide', false);
-      });
     } else {
       _docVisible = true;
       _windowFocused = true;
     }
 
     _syncInitialStrict();
+    _syncEffectiveVisible();
+  }
+
+  /// WebSocket status is tracked separately; it must not flip admin visibility.
+  void setWebSocketConnected(bool connected) {
+    if (_webSocketConnected == connected) return;
+    _webSocketConnected = connected;
+    if (!connected) {
+      _cancelDebouncedVisible();
+    }
+    _syncEffectiveVisible();
+  }
+
+  bool get _attentionVisible {
+    if (kIsWeb) {
+      return _lifecycleResumed && _docVisible && _windowFocused;
+    }
+    return _lifecycleResumed;
   }
 
   void _syncInitialStrict() {
-    if (kIsWeb) {
-      final v = _lifecycleResumed && _docVisible && _windowFocused;
-      strictVisible.value = v;
-    } else {
-      strictVisible.value = _lifecycleResumed;
-    }
+    strictVisible.value = _attentionVisible;
+  }
+
+  void _syncEffectiveVisible() {
+    effectiveVisible.value = strictVisible.value && _webSocketConnected;
   }
 
   void _cancelDebouncedVisible() {
@@ -95,16 +115,11 @@ class StrictVisibilityService extends WidgetsBindingObserver {
   void _debounceTryBecomeVisible(String reasonWhenVisible) {
     _cancelDebouncedVisible();
     _debounceVisible = Timer(const Duration(milliseconds: 220), () {
-      if (kIsWeb) {
-        if (_lifecycleResumed && _docVisible && _windowFocused) {
-          if (!strictVisible.value) {
-            strictVisible.value = true;
-            onImmediateAuditPing?.call(reasonWhenVisible, true);
-          }
-        }
-      } else {
-        if (_lifecycleResumed && !strictVisible.value) {
+      if (_attentionVisible) {
+        if (!strictVisible.value) {
           strictVisible.value = true;
+          onImmediateAuditPing?.call(reasonWhenVisible, true);
+        } else if (_attentionVisible) {
           onImmediateAuditPing?.call(reasonWhenVisible, true);
         }
       }

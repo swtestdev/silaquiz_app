@@ -34,6 +34,7 @@ class _AdminRoundAppTrackingPageState extends State<AdminRoundAppTrackingPage> {
   String? _error;
   String? _serverTime;
   List<Map<String, dynamic>> _teams = [];
+  List<Map<String, dynamic>> _playerColumns = [];
   Map<String, dynamic>? _roundTimer;
   Timer? _pollTimer;
 
@@ -77,6 +78,8 @@ class _AdminRoundAppTrackingPageState extends State<AdminRoundAppTrackingPage> {
 
     setState(() {
       _teams = (data['teams'] as List? ?? []).cast<Map<String, dynamic>>();
+      _playerColumns =
+          (data['player_columns'] as List? ?? []).cast<Map<String, dynamic>>();
       _roundTimer = data['round_timer'] as Map<String, dynamic>?;
       _serverTime = data['server_time']?.toString();
       _loading = false;
@@ -215,13 +218,7 @@ class _AdminRoundAppTrackingPageState extends State<AdminRoundAppTrackingPage> {
     );
   }
 
-  bool _hasTrackingCells() {
-    for (final team in _teams) {
-      final cells = team['cells'] as List?;
-      if (cells != null && cells.isNotEmpty) return true;
-    }
-    return false;
-  }
+  bool _hasTrackingCells() => _playerColumns.isNotEmpty;
 
   bool _cellIsVisible(Map<String, dynamic> cell) {
     return cell['is_visible'] == true ||
@@ -229,51 +226,52 @@ class _AdminRoundAppTrackingPageState extends State<AdminRoundAppTrackingPage> {
         '${cell['is_visible']}'.toLowerCase() == 'true';
   }
 
-  Widget _playerBlock(Map<String, dynamic> cell) {
+  Widget _playerCell(Map<String, dynamic>? cell, {required double width}) {
+    if (cell == null) {
+      return SizedBox(
+        width: width,
+        height: 52,
+        child: Center(
+          child: Text(
+            '—',
+            style: TextStyle(color: _textWhite.withValues(alpha: 0.35)),
+          ),
+        ),
+      );
+    }
+
     final isVisible = _cellIsVisible(cell);
     final seconds = int.tryParse('${cell['invisible_seconds']}') ?? 0;
     final userId = int.tryParse('${cell['user_id']}') ?? 0;
     final name = cell['display_name']?.toString() ?? 'Player';
     final blockColor = isVisible ? _liveGreen : _liveRed;
 
-    return Material(
-      color: blockColor,
-      borderRadius: BorderRadius.circular(8),
-      clipBehavior: Clip.antiAlias,
-      child: InkWell(
-        onTap: userId > 0 ? () => _openPlayerDialog(userId, name) : null,
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(minHeight: 44, minWidth: 72),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Text(
-                  name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                    color: _textWhite,
-                    fontSize: 14,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                if (!isVisible) ...[
-                  const SizedBox(height: 2),
+    return SizedBox(
+      width: width,
+      child: Material(
+        color: blockColor,
+        borderRadius: BorderRadius.circular(8),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: userId > 0 ? () => _openPlayerDialog(userId, name) : null,
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(minHeight: 52),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 8),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
                   Text(
-                    '${seconds}s',
+                    isVisible ? '0' : '${seconds}s',
                     textAlign: TextAlign.center,
                     style: const TextStyle(
                       color: _textWhite,
-                      fontSize: 14,
-                      fontWeight: FontWeight.w600,
+                      fontSize: 15,
+                      fontWeight: FontWeight.bold,
                     ),
                   ),
                 ],
-              ],
+              ),
             ),
           ),
         ),
@@ -281,11 +279,29 @@ class _AdminRoundAppTrackingPageState extends State<AdminRoundAppTrackingPage> {
     );
   }
 
+  Map<String, dynamic>? _teamPlayerCell(
+    Map<String, dynamic> team,
+    int userId,
+  ) {
+    final players = team['players'] as Map?;
+    if (players != null) {
+      final cell = players['$userId'];
+      if (cell is Map<String, dynamic>) return cell;
+    }
+    for (final cell in (team['cells'] as List? ?? [])) {
+      if (cell is Map && int.tryParse('${cell['user_id']}') == userId) {
+        return cell.cast<String, dynamic>();
+      }
+    }
+    return null;
+  }
+
   Widget _buildMatrix() {
     const rankW = 44.0;
     const teamW = 180.0;
+    const playerColW = 72.0;
     const headerH = 48.0;
-    const rowPadV = 8.0;
+    const rowH = 56.0;
 
     if (_teams.isEmpty) {
       return Padding(
@@ -318,16 +334,19 @@ class _AdminRoundAppTrackingPageState extends State<AdminRoundAppTrackingPage> {
         child: Align(
           alignment: align,
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 8),
+            padding: const EdgeInsets.symmetric(horizontal: 6),
             child: Text(
               label,
               maxLines: 2,
               overflow: TextOverflow.ellipsis,
+              textAlign: align == Alignment.center
+                  ? TextAlign.center
+                  : TextAlign.start,
               style: const TextStyle(
                 color: _textWhite,
                 fontWeight: FontWeight.bold,
-                fontSize: 13,
-                letterSpacing: 0.5,
+                fontSize: 12,
+                letterSpacing: 0.4,
               ),
             ),
           ),
@@ -335,88 +354,111 @@ class _AdminRoundAppTrackingPageState extends State<AdminRoundAppTrackingPage> {
       );
     }
 
-    final rows = <Widget>[
-      Padding(
-        padding: const EdgeInsets.fromLTRB(8, 12, 8, 4),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.center,
+    final playerHeader = Row(
+      children: [
+        for (final col in _playerColumns)
+          headerLabel(
+            col['user_name']?.toString() ?? 'Player',
+            width: playerColW,
+            align: Alignment.center,
+          ),
+      ],
+    );
+
+    final playerRows = Column(
+      children: [
+        for (var i = 0; i < _teams.length; i++)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 6),
+            child: Row(
+              children: [
+                for (final col in _playerColumns)
+                  Padding(
+                    padding: const EdgeInsets.only(right: 4),
+                    child: _playerCell(
+                      _teamPlayerCell(
+                        _teams[i],
+                        int.tryParse('${col['user_id']}') ?? 0,
+                      ),
+                      width: playerColW,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+      ],
+    );
+
+    final frozenColumn = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
           children: [
             headerLabel('#', width: rankW, align: Alignment.center),
             headerLabel('КОМАНДЫ', width: teamW, align: Alignment.centerLeft),
           ],
         ),
-      ),
-    ];
-
-    for (var i = 0; i < _teams.length; i++) {
-      final team = _teams[i];
-      final teamName = team['team_name']?.toString() ?? '';
-      final cells =
-          (team['cells'] as List? ?? []).cast<Map<String, dynamic>>();
-
-      rows.add(
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: rowPadV),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              SizedBox(
-                width: rankW,
-                child: Padding(
-                  padding: const EdgeInsets.only(top: 12),
+        for (var i = 0; i < _teams.length; i++)
+          SizedBox(
+            height: rowH,
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                SizedBox(
+                  width: rankW,
                   child: Text(
                     '${i + 1}',
                     textAlign: TextAlign.center,
                     style: const TextStyle(color: _textWhite, fontSize: 14),
                   ),
                 ),
-              ),
-              Container(
-                width: teamW,
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
-                decoration: BoxDecoration(
-                  color: _teamBg,
-                  borderRadius: BorderRadius.circular(6),
-                ),
-                child: Text(
-                  teamName,
-                  maxLines: 3,
-                  overflow: TextOverflow.ellipsis,
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                    color: _textWhite,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
+                Container(
+                  width: teamW,
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: _teamBg,
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: Text(
+                    _teams[i]['team_name']?.toString() ?? '',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: _textWhite,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
                   ),
                 ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: cells.isEmpty
-                    ? Padding(
-                        padding: const EdgeInsets.only(top: 12),
-                        child: Text(
-                          '—',
-                          style: TextStyle(
-                            color: _textWhite.withValues(alpha: 0.4),
-                          ),
-                        ),
-                      )
-                    : Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: cells.map(_playerBlock).toList(),
-                      ),
-              ),
-            ],
+              ],
+            ),
           ),
-        ),
-      );
-    }
+      ],
+    );
 
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: rows,
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 12, 8, 16),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          frozenColumn,
+          const SizedBox(width: 8),
+          Expanded(
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  playerHeader,
+                  const SizedBox(height: 4),
+                  playerRows,
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

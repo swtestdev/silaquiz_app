@@ -1,6 +1,6 @@
 import 'excel_local_save_result.dart';
 import 'excel_local_save_stub.dart'
-    if (dart.library.html) 'excel_local_save_web.dart' as impl;
+    if (dart.library.js_interop) 'excel_local_save_web.dart' as impl;
 
 export 'excel_local_save_result.dart';
 
