@@ -86,3 +86,39 @@ Color verdictChipColor(int? grade) {
 Color verdictChipTextColor(int? grade) {
   return Colors.white;
 }
+
+/// Parse API grade values (int, double, string) for chip / DB line display.
+int? parseStoredGrade(dynamic v) {
+  if (v == null) return null;
+  if (v is int) return v;
+  if (v is num) return v.round();
+  return int.tryParse(v.toString());
+}
+
+/// Persisted DB grade line: green = correct, red = wrong, none = unset/zero.
+Color? storedGradeLineColor(int? storedGrade) {
+  if (storedGrade == 1) return const Color(0xFF2E7D32);
+  if (storedGrade == -1) return const Color(0xFFC62828);
+  return null;
+}
+
+/// Answer chip with optional vertical DB-status bar on the left.
+Widget verdictChipWithStoredLine({required int? storedGrade, required Widget chip}) {
+  final lineColor = storedGradeLineColor(storedGrade);
+  if (lineColor == null) return chip;
+  return Row(
+    mainAxisSize: MainAxisSize.min,
+    crossAxisAlignment: CrossAxisAlignment.stretch,
+    children: [
+      Container(
+        width: 3,
+        margin: const EdgeInsets.only(right: 4),
+        decoration: BoxDecoration(
+          color: lineColor,
+          borderRadius: BorderRadius.circular(1),
+        ),
+      ),
+      Flexible(child: chip),
+    ],
+  );
+}

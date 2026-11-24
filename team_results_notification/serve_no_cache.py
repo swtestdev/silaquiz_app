@@ -8,6 +8,7 @@ Or: cd team_results_notification && python serve_no_cache.py
 import http.server
 import os
 import socketserver
+import sys
 
 PORT = 8080
 
@@ -18,18 +19,30 @@ class NoCacheHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Expires', '0')
         super().end_headers()
 
+def resolve_web_root() -> str:
+    """EXE: web\\ next to serve_no_cache.exe; dev: build\\web under project."""
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(os.path.abspath(sys.executable))
+        return os.path.join(base, "web")
+    base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "build", "web")
+
+
 def main():
-    build_dir = os.path.join(os.path.dirname(__file__), "build", "web")
-    if not os.path.exists(build_dir):
-        print(f"Error: Build directory not found: {build_dir}")
-        print("Run 'flutter build web --release' first")
+    build_dir = resolve_web_root()
+    if not os.path.isdir(build_dir):
+        print(f"Error: Web directory not found: {build_dir}")
+        if getattr(sys, "frozen", False):
+            print("Expected a 'web' folder next to this EXE (with index.html inside).")
+        else:
+            print("Run 'flutter build web --release' first")
         return
     os.chdir(build_dir)
 
     with socketserver.TCPServer(("", PORT), NoCacheHTTPRequestHandler) as httpd:
         print(f"Serving with NO-CACHE headers on http://0.0.0.0:{PORT}")
         print("Browsers will always fetch the latest build (but service worker may still cache)")
-        print("Use 'Force reload app' in Database Info dialog to clear service worker cache")
+        print("Hard-refresh the browser (Ctrl+Shift+R) to clear service worker cache after rebuilds")
         print("\nAccess at: http://YOUR_PC_IP:8080/   or   http://DESKTOP-638BFEB:8080/")
         print("Press Ctrl+C to stop")
         httpd.serve_forever()

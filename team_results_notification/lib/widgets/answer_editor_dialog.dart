@@ -349,7 +349,7 @@ class _AnswerEditorDialogState extends State<AnswerEditorDialog> {
               Navigator.of(context).pop();
             }));
           },
-          child: const Text('Close'),
+          child: const Text('Save'),
         ),
       ],
     );

@@ -7,7 +7,7 @@ import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../services/user_data_service.dart';
 import '../services/api_config_service.dart';
-import 'dart:html' as html;
+import '../utils/browser/browser.dart';
 import 'question_page.dart' show initializeTimerStatus;
 
 // API service class for authentication operations
@@ -635,12 +635,44 @@ class DatabaseService {
     }
   }
 
+  static Future<Map<String, String>?> _adminAuthHeaders() async {
+    final userData = await UserDataService.getUserData();
+    if (userData == null || userData['access_token'] == null) {
+      return null;
+    }
+    return {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ${userData['access_token']}',
+    };
+  }
+
+  static String _adminApiErrorMessage(dynamic data, int statusCode) {
+    if (data is Map) {
+      final message = data['message'];
+      if (message != null && message.toString().isNotEmpty) {
+        return message.toString();
+      }
+      final detail = data['detail'];
+      if (detail is String && detail.isNotEmpty) return detail;
+      if (detail is List && detail.isNotEmpty) {
+        return detail.map((e) => e.toString()).join('; ');
+      }
+    }
+    if (statusCode == 401) return 'Not authenticated — sign in again';
+    if (statusCode == 403) {
+      return 'Access denied — super admin sign-in required for this action';
+    }
+    return 'Request failed (HTTP $statusCode)';
+  }
+
   // Admin API methods
   static Future<List<Map<String, dynamic>>> getAllUsers() async {
     try {
+      final headers = await _adminAuthHeaders();
+      if (headers == null) return [];
       final response = await http.get(
         Uri.parse('$_baseUrl/admin/users'),
-        headers: {'Content-Type': 'application/json'},
+        headers: headers,
       );
       
       if (response.statusCode == 200) {
@@ -676,11 +708,57 @@ class DatabaseService {
     }
   }
 
+  static Future<Map<String, dynamic>> precheckRemoveUser(int userId) async {
+    try {
+      final headers = await _adminAuthHeaders();
+      if (headers == null) {
+        return {'success': false, 'can_remove': false, 'blockers': ['Not signed in']};
+      }
+      final response = await http.get(
+        Uri.parse('$_baseUrl/admin/users/$userId/remove-precheck'),
+        headers: headers,
+      );
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      return {
+        'success': data['success'] == true,
+        'can_remove': data['can_remove'] == true,
+        'blockers': (data['blockers'] as List?)?.map((e) => e.toString()).toList() ?? [],
+      };
+    } catch (e) {
+      return {'success': false, 'can_remove': false, 'blockers': [e.toString()]};
+    }
+  }
+
+  static Future<Map<String, dynamic>> removeUserAdmin(int userId) async {
+    try {
+      final headers = await _adminAuthHeaders();
+      if (headers == null) {
+        return {'success': false, 'message': 'Not signed in'};
+      }
+      final response = await http.post(
+        Uri.parse('$_baseUrl/admin/users/$userId/remove'),
+        headers: headers,
+      );
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      return {
+        'success': data['success'] == true,
+        'message': data['message']?.toString() ?? 'Remove failed',
+        'blockers': data['blockers'],
+      };
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
   static Future<Map<String, dynamic>> updateUserAdmin(int userId, Map<String, dynamic> userData) async {
     try {
+      final headers = await _adminAuthHeaders();
+      if (headers == null) {
+        return {'success': false, 'message': 'Not signed in'};
+      }
       final response = await http.put(
         Uri.parse('$_baseUrl/admin/users/$userId'),
-        headers: {'Content-Type': 'application/json'},
+        headers: headers,
         body: jsonEncode(userData),
       );
       
@@ -709,9 +787,13 @@ class DatabaseService {
 
   static Future<Map<String, dynamic>> createTeam(String teamName, String city) async {
     try {
+      final headers = await _adminAuthHeaders();
+      if (headers == null) {
+        return {'success': false, 'message': 'Not signed in'};
+      }
       final response = await http.post(
         Uri.parse('$_baseUrl/admin/teams'),
-        headers: {'Content-Type': 'application/json'},
+        headers: headers,
         body: jsonEncode({
           'team_name': teamName,
           'team_city': city,
@@ -729,7 +811,7 @@ class DatabaseService {
       } else {
         return {
           'success': false,
-          'message': data['message'] ?? 'Failed to create team'
+          'message': _adminApiErrorMessage(data, response.statusCode),
         };
       }
     } catch (e) {
@@ -743,9 +825,13 @@ class DatabaseService {
 
   static Future<Map<String, dynamic>> updateTeam(int teamId, Map<String, dynamic> teamData) async {
     try {
+      final headers = await _adminAuthHeaders();
+      if (headers == null) {
+        return {'success': false, 'message': 'Not signed in'};
+      }
       final response = await http.put(
         Uri.parse('$_baseUrl/admin/teams/$teamId'),
-        headers: {'Content-Type': 'application/json'},
+        headers: headers,
         body: jsonEncode(teamData),
       );
       
@@ -759,7 +845,7 @@ class DatabaseService {
       } else {
         return {
           'success': false,
-          'message': data['message'] ?? 'Failed to update team'
+          'message': _adminApiErrorMessage(data, response.statusCode),
         };
       }
     } catch (e) {
@@ -1411,7 +1497,7 @@ class DatabaseService {
     }
   }
 
-  /// Aggregated APP tracking (DIS/INV/BLUR + live status) for a round.
+  /// Per-player visibility matrix (visible/invisible/blur/disconnection) for a round.
   static Future<Map<String, dynamic>> getRoundAppTracking(
     int activeGameId,
     String roundName,
@@ -2003,6 +2089,8 @@ class _LoginPageState extends State<LoginPage> {
   final _confirmPasswordController = TextEditingController();
   bool _isLoading = false;
   bool _isSignUp = false;
+  bool _obscurePassword = true;
+  bool _obscureConfirmPassword = true;
   bool _databaseInitialized = false; // Add flag to prevent multiple calls
   
   // Version info
@@ -2481,99 +2569,9 @@ class _LoginPageState extends State<LoginPage> {
   Future<void> _deleteAllCachesAndReload() async {
     try {
       print('Starting aggressive cache deletion and reload...');
-      
-      // Step 1: Clear all storage (localStorage, sessionStorage)
-      try {
-        html.window.localStorage.clear();
-        html.window.sessionStorage.clear();
-        print('Local and session storage cleared');
-      } catch (e) {
-        print('Error clearing storage: $e');
-      }
-      
-      // Step 2: Delete all caches FIRST (before unregistering service worker)
-      final caches = html.window.caches;
-      if (caches != null) {
-        try {
-          final cacheNames = await caches.keys();
-          print('Found ${cacheNames.length} caches to delete');
-          for (var cacheName in cacheNames) {
-            await caches.delete(cacheName);
-            print('Cache deleted: $cacheName');
-          }
-          // Wait a bit to ensure cache deletion completes
-          await Future.delayed(const Duration(milliseconds: 200));
-        } catch (e) {
-          print('Error deleting caches: $e');
-        }
-      }
-      
-      // Step 3: Unregister all service workers
-      final serviceWorker = html.window.navigator.serviceWorker;
-      if (serviceWorker != null) {
-        try {
-          final registrations = await serviceWorker.getRegistrations();
-          print('Found ${registrations.length} service workers to unregister');
-          for (var registration in registrations) {
-            // Send message to skip waiting first
-            if (registration.installing != null) {
-              registration.installing!.postMessage({'type': 'SKIP_WAITING'});
-            }
-            if (registration.waiting != null) {
-              registration.waiting!.postMessage({'type': 'SKIP_WAITING'});
-            }
-            if (registration.active != null) {
-              registration.active!.postMessage({'type': 'SKIP_WAITING'});
-            }
-            // Now unregister
-            final unregistered = await registration.unregister();
-            print('Service worker unregistered: $unregistered');
-          }
-          // Wait for unregistration to complete
-          await Future.delayed(const Duration(milliseconds: 300));
-        } catch (e) {
-          print('Error unregistering service workers: $e');
-        }
-      }
-      
-      // Step 4: Force navigation to base URL with cache-busting parameters
-      print('Forcing page reload with cache bypass...');
-      final origin = html.window.location.origin;
-      final pathname = html.window.location.pathname;
-      final timestamp = DateTime.now().millisecondsSinceEpoch;
-      final random = (timestamp % 100000).toString();
-      
-      // Navigate to base URL with multiple cache-busting parameters
-      final reloadUrl = '$origin$pathname?_update=$timestamp&_cb=$random&_nocache=true';
-      
-      print('Navigating to: $reloadUrl');
-      
-      // Use location.replace to avoid history entry
-      html.window.location.replace(reloadUrl);
-      
-      // If that doesn't work, try location.href after a delay
-      Future.delayed(const Duration(milliseconds: 1000), () {
-        try {
-          print('Fallback: forcing reload via location.href');
-          html.window.location.href = reloadUrl;
-        } catch (e) {
-          print('Error with location.href fallback: $e');
-          // Last resort: regular reload
-          try {
-            html.window.location.reload();
-          } catch (e2) {
-            print('Error with final reload: $e2');
-          }
-        }
-      });
+      await deleteAllCachesAndReload();
     } catch (e) {
       print('Error in deleteAllCachesAndReload: $e');
-      // Last resort: try regular reload
-      try {
-        html.window.location.reload();
-      } catch (e2) {
-        print('Error with final reload attempt: $e2');
-      }
     }
   }
 
@@ -2608,127 +2606,18 @@ class _LoginPageState extends State<LoginPage> {
     }
   }
 
-  // Show database configuration information
   void _maybeShowVersionUpgradeSnackBar() {
     if (ApiConfigService.wasConfigVersionUpgraded && mounted) {
       ApiConfigService.clearConfigVersionUpgradedFlag();
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text(
-            'New version installed. Check server URL in Database Info if something doesn\'t work.',
+            'New version installed. Re-open the game link from the host if something doesn\'t work.',
           ),
           duration: Duration(seconds: 5),
         ),
       );
     }
-  }
-
-  void _showDatabaseInfo() {
-    final screenWidth = MediaQuery.of(context).size.width;
-    final isSmallScreen = screenWidth < 600;
-    final scrollController = ScrollController();
-    
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text(
-          'Authentication Info',
-          style: TextStyle(fontSize: isSmallScreen ? 18 : 20),
-        ),
-        contentPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
-        content: ConstrainedBox(
-          constraints: BoxConstraints(
-            maxHeight: MediaQuery.of(context).size.height * 0.6,
-            minHeight: 200,
-          ),
-          child: Scrollbar(
-            controller: scrollController,
-            thumbVisibility: true,
-            child: SingleChildScrollView(
-            controller: scrollController,
-            keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
-            child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'Current API Settings:',
-                style: TextStyle(
-                  fontWeight: FontWeight.bold,
-                  fontSize: isSmallScreen ? 14 : 16,
-                ),
-              ),
-              const SizedBox(height: 8),
-              Text(
-                'API URL: ${DatabaseService.baseUrl}',
-                style: TextStyle(fontSize: isSmallScreen ? 12 : 14),
-              ),
-              const SizedBox(height: 16),
-              Text(
-                'Switch Game Server:',
-                style: TextStyle(
-                  fontWeight: FontWeight.bold,
-                  fontSize: isSmallScreen ? 14 : 16,
-                ),
-              ),
-              const SizedBox(height: 8),
-              _EnvSelector(
-                current: DatabaseService.baseUrl,
-                scrollController: scrollController,
-                onChanged: (value) async {
-                  DatabaseService.setBaseUrl(value);
-                  await ApiConfigService.setApiBaseUrl(value);
-                  if (mounted) setState(() {});
-                  final isCustomUrl = !value.contains('localhost:8000') &&
-                      !value.contains('pythonanywhere.com');
-                  if (isCustomUrl && context.mounted) {
-                    Navigator.of(context).pop();
-                  }
-                },
-              ),
-              const SizedBox(height: 16),
-
-              Text(
-                'Sign Up Example:', 
-                style: TextStyle(
-                  fontWeight: FontWeight.bold,
-                  fontSize: isSmallScreen ? 14 : 16,
-                ),
-              ),
-              const SizedBox(height: 8),
-              SelectableText(
-                '1) Open Sign Up\n'
-                '2) Full Name: John Smith\n'
-                '3) Email: john.smith@example.com\n'
-                '4) Password: StrongPass123\n'
-                '5) Confirm Password: StrongPass123\n'
-                '6) Tap Sign Up',
-                style: TextStyle(fontSize: isSmallScreen ? 12 : 14),
-              ),
-              const SizedBox(height: 16),
-              Text(
-                'Tip: For local testing, ensure your FastAPI server is reachable from this device.',
-                style: TextStyle(
-                  fontSize: isSmallScreen ? 10 : 12, 
-                  fontStyle: FontStyle.italic,
-                ),
-              ),
-            ],
-            ),
-          ),
-        ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: Text(
-              'Close',
-              style: TextStyle(fontSize: isSmallScreen ? 14 : 16),
-            ),
-          ),
-        ],
-      ),
-    );
   }
 
   // Handle login
@@ -2783,13 +2672,16 @@ class _LoginPageState extends State<LoginPage> {
           
           // Navigate to main page immediately (data is already saved)
           if (mounted) {
+            if (kIsWeb) {
+              replaceWebHistoryRoute('/main');
+            }
             Navigator.pushReplacementNamed(context, '/main');
           }
         } else {
           final msg = result['message'] ?? 'Login failed';
           final isConnectionError = msg.toString().contains('Connection') || msg.toString().contains('Failed to fetch');
-          final hint = (kIsWeb && DatabaseService.baseUrl.contains('localhost') && isConnectionError)
-              ? '\n\nOn mobile: use Database Info to set your server IP (e.g. http://192.168.0.1:8000/api).'
+          final hint = (kIsWeb && isConnectionError)
+              ? '\n\nOpen the game using the link from the host (same Wi‑Fi), e.g. http://192.168.x.x:8080/#/login'
               : '';
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(content: Text('$msg$hint'), duration: const Duration(seconds: 8)),
@@ -2798,8 +2690,8 @@ class _LoginPageState extends State<LoginPage> {
       } catch (e) {
         final errMsg = e.toString();
         final isConnectionError = errMsg.contains('Connection') || errMsg.contains('Failed to fetch');
-        final hint = (kIsWeb && DatabaseService.baseUrl.contains('localhost') && isConnectionError)
-            ? '\n\nOn mobile: use Database Info to set your server IP (e.g. http://192.168.0.1:8000/api).'
+        final hint = (kIsWeb && isConnectionError)
+            ? '\n\nOpen the game using the link from the host (same Wi‑Fi), e.g. http://192.168.x.x:8080/#/login'
             : '';
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Error: $errMsg$hint'), duration: const Duration(seconds: 8)),
@@ -2882,6 +2774,8 @@ class _LoginPageState extends State<LoginPage> {
   void _toggleMode() {
     setState(() {
       _isSignUp = !_isSignUp;
+      _obscurePassword = true;
+      _obscureConfirmPassword = true;
       _emailController.clear();
       _passwordController.clear();
       _nameController.clear();
@@ -3033,13 +2927,27 @@ class _LoginPageState extends State<LoginPage> {
                         decoration: InputDecoration(
                           labelText: 'Password',
                           prefixIcon: Icon(Icons.lock, size: isVerySmallScreen ? 20 : 24),
+                          suffixIcon: IconButton(
+                            icon: Icon(
+                              _obscurePassword
+                                  ? Icons.visibility_outlined
+                                  : Icons.visibility_off_outlined,
+                              size: isVerySmallScreen ? 20 : 24,
+                            ),
+                            tooltip: _obscurePassword ? 'Show password' : 'Hide password',
+                            onPressed: () {
+                              setState(() {
+                                _obscurePassword = !_obscurePassword;
+                              });
+                            },
+                          ),
                           border: const OutlineInputBorder(),
                           contentPadding: EdgeInsets.symmetric(
                             horizontal: isVerySmallScreen ? 12 : 16,
                             vertical: isVerySmallScreen ? 12 : 16,
                           ),
                         ),
-                        obscureText: true,
+                        obscureText: _obscurePassword,
                         validator: (value) {
                           if (value == null || value.isEmpty) {
                             return 'Please enter your password';
@@ -3058,13 +2966,29 @@ class _LoginPageState extends State<LoginPage> {
                           decoration: InputDecoration(
                             labelText: 'Confirm Password',
                             prefixIcon: Icon(Icons.lock_outline, size: isVerySmallScreen ? 20 : 24),
+                            suffixIcon: IconButton(
+                              icon: Icon(
+                                _obscureConfirmPassword
+                                    ? Icons.visibility_outlined
+                                    : Icons.visibility_off_outlined,
+                                size: isVerySmallScreen ? 20 : 24,
+                              ),
+                              tooltip: _obscureConfirmPassword
+                                  ? 'Show password'
+                                  : 'Hide password',
+                              onPressed: () {
+                                setState(() {
+                                  _obscureConfirmPassword = !_obscureConfirmPassword;
+                                });
+                              },
+                            ),
                             border: const OutlineInputBorder(),
                             contentPadding: EdgeInsets.symmetric(
                               horizontal: isVerySmallScreen ? 12 : 16,
                               vertical: isVerySmallScreen ? 12 : 16,
                             ),
                           ),
-                          obscureText: true,
+                          obscureText: _obscureConfirmPassword,
                           validator: (value) {
                             if (value == null || value.isEmpty) {
                               return 'Please confirm your password';
@@ -3149,24 +3073,6 @@ class _LoginPageState extends State<LoginPage> {
                           textAlign: TextAlign.center,
                         ),
                       ),
-                      SizedBox(height: isVerySmallScreen ? 6 : 8),
-                      TextButton(
-                        onPressed: () {
-                          _showDatabaseInfo();
-                        },
-                        style: TextButton.styleFrom(
-                          padding: EdgeInsets.symmetric(
-                            horizontal: isVerySmallScreen ? 8 : 12,
-                            vertical: isVerySmallScreen ? 4 : 8,
-                          ),
-                        ),
-                        child: Text(
-                          'Database Info',
-                          style: TextStyle(
-                            fontSize: isVerySmallScreen ? 12 : 14,
-                          ),
-                        ),
-                      ),
                       // Version display at bottom
                       SizedBox(height: isVerySmallScreen ? 12 : 16),
                       Padding(
@@ -3194,254 +3100,4 @@ class _LoginPageState extends State<LoginPage> {
       ),
     );
   }
-}
-
-class _EnvSelector extends StatefulWidget {
-  final String current;
-  final ScrollController scrollController;
-  final ValueChanged<String> onChanged;
-
-  const _EnvSelector({
-    required this.current,
-    required this.scrollController,
-    required this.onChanged,
-  });
-
-  @override
-  State<_EnvSelector> createState() => _EnvSelectorState();
-}
-
-class _EnvSelectorState extends State<_EnvSelector> {
-  late String _selected;
-  final _customController = TextEditingController();
-  final _customFieldKey = GlobalKey();
-  final FocusNode _customFocusNode = FocusNode();
-  final FocusNode _localFocusNode = FocusNode();
-  final FocusNode _cloudFocusNode = FocusNode();
-  final FocusNode _customRadioFocusNode = FocusNode();
-  bool _showCustomExample = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _selected = _inferPreset(widget.current);
-    _customController.text = widget.current;
-    _showCustomExample = _selected == 'custom';
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      _focusSelectedOption();
-    });
-  }
-
-  @override
-  void didUpdateWidget(_EnvSelector oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (widget.current != oldWidget.current) {
-      _selected = _inferPreset(widget.current);
-      _customController.text = widget.current;
-      _showCustomExample = _selected == 'custom';
-      // Defer setState to next frame to avoid "RenderBox was not laid out" during build
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) setState(() {});
-      });
-    }
-  }
-
-  @override
-  void dispose() {
-    _customController.dispose();
-    _customFocusNode.dispose();
-    _localFocusNode.dispose();
-    _cloudFocusNode.dispose();
-    _customRadioFocusNode.dispose();
-    super.dispose();
-  }
-
-  String _inferPreset(String url) {
-    if (url.contains('localhost:8000')) return 'local';
-    if (url.contains('pythonanywhere.com')) return 'cloud';
-    return 'custom';
-  }
-
-  void _apply(String value) {
-    widget.onChanged(value);
-    setState(() {
-      _selected = _inferPreset(value);
-      _customController.text = value;
-      _showCustomExample = _selected == 'custom';
-    });
-    _focusSelectedOption();
-  }
-
-  void _focusSelectedOption() {
-    switch (_selected) {
-      case 'local':
-        _localFocusNode.requestFocus();
-        break;
-      case 'cloud':
-        _cloudFocusNode.requestFocus();
-        break;
-      case 'custom':
-      default:
-        _focusCustomField();
-        break;
-    }
-  }
-
-  void _focusCustomField() {
-    void doFocus() {
-      if (!mounted) return;
-      _customRadioFocusNode.unfocus();
-      _customFocusNode.requestFocus();
-      _customController.selection = const TextSelection.collapsed(offset: 0);
-    }
-    void scheduleFocus() {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        doFocus();
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          doFocus();
-          Future.delayed(const Duration(milliseconds: 150), doFocus);
-          Future.delayed(const Duration(milliseconds: 400), doFocus);
-        });
-      });
-    }
-    scheduleFocus();
-  }
-
-  Widget _buildCustomField(bool isSmallScreen) {
-    return RepaintBoundary(
-      key: _customFieldKey,
-      child: TextField(
-        controller: _customController,
-        focusNode: _customFocusNode,
-        autofocus: true,
-        keyboardType: TextInputType.url,
-        decoration: InputDecoration(
-          hintText: isSmallScreen
-              ? 'e.g. http://localhost:8000/api'
-              : 'e.g. http://DESKTOP-638BFEB:8000/api or http://192.168.2.14:8000/api',
-          helperText: _showCustomExample
-              ? (isSmallScreen
-                  ? 'Example: http://localhost:8000/api'
-                  : 'Example: http://DESKTOP-638BFEB:8000/api')
-              : null,
-          isDense: true,
-          border: const OutlineInputBorder(),
-          contentPadding: EdgeInsets.symmetric(
-            horizontal: isSmallScreen ? 8 : 12,
-            vertical: isSmallScreen ? 8 : 12,
-          ),
-        ),
-        style: TextStyle(fontSize: isSmallScreen ? 12 : 14),
-        onChanged: (_) {
-          if (_showCustomExample) {
-            setState(() {
-              _showCustomExample = false;
-            });
-          }
-        },
-      ),
-    );
-  }
-
-  Widget _buildApplyButton(bool isSmallScreen) {
-    return Align(
-      alignment: Alignment.centerRight,
-      child: ElevatedButton(
-        onPressed: () {
-          final value = _customController.text.trim();
-          if (value.isNotEmpty) {
-            _apply(value);
-          }
-        },
-        style: ElevatedButton.styleFrom(
-          padding: EdgeInsets.symmetric(
-            horizontal: isSmallScreen ? 12 : 16,
-            vertical: isSmallScreen ? 8 : 12,
-          ),
-        ),
-        child: Text(
-          'Apply',
-          style: TextStyle(fontSize: isSmallScreen ? 12 : 14),
-        ),
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final screenWidth = MediaQuery.of(context).size.width;
-    final isSmallScreen = screenWidth < 600;
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        RadioListTile<String>(
-          dense: true,
-          contentPadding: EdgeInsets.zero,
-          focusNode: _localFocusNode,
-          title: Text(
-            'Local PC (example: DESKTOP-638BFEB / 192.168.2.14)',
-            style: TextStyle(fontSize: isSmallScreen ? 12 : 14),
-          ),
-          subtitle: Text(
-            'http://localhost:8000/api',
-            style: TextStyle(fontSize: isSmallScreen ? 10 : 12),
-          ),
-          value: 'local',
-          groupValue: _selected,
-          onChanged: (v) {
-            if (v == null) return;
-            _apply('http://DESKTOP-638BFEB:8000/api');
-          },
-        ),
-        RadioListTile<String>(
-          dense: true,
-          contentPadding: EdgeInsets.zero,
-          focusNode: _cloudFocusNode,
-          title: Text(
-            'Cloud (PythonAnywhere)',
-            style: TextStyle(fontSize: isSmallScreen ? 12 : 14),
-          ),
-          subtitle: Text(
-            'https://<your-username>.pythonanywhere.com/api',
-            style: TextStyle(fontSize: isSmallScreen ? 10 : 12),
-          ),
-          value: 'cloud',
-          groupValue: _selected,
-          onChanged: (v) {
-            if (v == null) return;
-            _apply('https://<your-username>.pythonanywhere.com/api');
-          },
-        ),
-        RadioListTile<String>(
-          dense: true,
-          contentPadding: EdgeInsets.zero,
-          focusNode: _customRadioFocusNode,
-          title: Text(
-            'Custom',
-            style: TextStyle(fontSize: isSmallScreen ? 12 : 14),
-          ),
-          value: 'custom',
-          groupValue: _selected,
-          onChanged: (v) {
-            if (v == null) return;
-            setState(() {
-              _selected = 'custom';
-              _showCustomExample = true;
-            });
-            _focusCustomField();
-          },
-        ),
-        if (_selected == 'custom') ...[
-          _buildCustomField(isSmallScreen),
-          const SizedBox(height: 8),
-          _buildApplyButton(isSmallScreen),
-        ],
-      ],
-    );
-  }
-
-  // Note: _EnvSelectorState contains only selector UI; it intentionally does not
-  // access parent state like form controllers or loading flags.
 }

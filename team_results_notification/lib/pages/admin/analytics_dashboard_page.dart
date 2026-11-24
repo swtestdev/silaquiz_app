@@ -386,7 +386,7 @@ class _AnalyticsDashboardPageState extends State<AnalyticsDashboardPage> {
                   ),
                   const SizedBox(height: 8),
                   const Text(
-                    'Select a started round to open the scoring matrix or per-player visibility tracking.',
+                    'Select a started round for the scoring matrix or per-player APP tracking (visible / blur / disconnect).',
                     style: TextStyle(color: Colors.grey),
                   ),
                   const SizedBox(height: 24),

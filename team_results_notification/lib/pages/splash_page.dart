@@ -1,6 +1,8 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import '../services/user_data_service.dart';
 import '../services/api_config_service.dart';
+import '../utils/browser/browser.dart';
 import 'login_page.dart' show DatabaseService;
 
 class SplashPage extends StatefulWidget {
@@ -34,9 +36,15 @@ class _SplashPageState extends State<SplashPage> {
     if (mounted) {
       if (isLoggedIn) {
         print('User is logged in, navigating to main page');
+        if (kIsWeb) {
+          replaceWebHistoryRoute('/main');
+        }
         Navigator.pushReplacementNamed(context, '/main');
       } else {
         print('User not logged in, navigating to login page');
+        if (kIsWeb) {
+          replaceWebHistoryRoute('/login');
+        }
         Navigator.pushReplacementNamed(context, '/login');
       }
     } else {

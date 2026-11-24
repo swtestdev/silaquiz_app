@@ -15,6 +15,9 @@ import 'login_page.dart'; // For DatabaseService
 // Global callback for timer messages from WebSocket
 Function(Map<String, dynamic>)? _globalTimerMessageHandler;
 
+/// True while [QuestionPage] is mounted and listening for timer events.
+bool get isQuestionPageActive => _globalTimerMessageHandler != null;
+
 int _parseRoundTimerValue(dynamic v) => TimerStore.parseInt(v);
 
 bool _roundNameKeysMatch(String a, String b) =>
@@ -87,6 +90,24 @@ Future<void> reapplyGlobalStartTimerFromGameData(
   if (questionTimerSeconds <= 0) return;
   final action = message['timer_action']?.toString() ?? '';
   if (action != 'START_TIME' && action != 'START_TIMER') return;
+
+  // Do not reset countdown from game DB when server already has a live window.
+  final now = DateTime.now().toUtc();
+  final session = TimerStore.instance.questionSession;
+  if (session != null && session.isActiveAt(now)) {
+    print(
+      'QuestionPage: skip reapplyGlobalStartTimer — active TimerStore session',
+    );
+    return;
+  }
+  final d = TimerStore.instance.displayState;
+  if (d.startTimerStatus == 'Running' && d.remainingSeconds > 0) {
+    print(
+      'QuestionPage: skip reapplyGlobalStartTimer — display already Running',
+    );
+    return;
+  }
+
   final enriched = Map<String, dynamic>.from(message);
   enriched['question_timer'] = questionTimerSeconds;
   enriched['timer_action'] = action;
@@ -281,12 +302,54 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
 
   // Current game name for persistent storage
   String _currentGameNameForStorage = '';
+  static const _cachedActiveGameNameKey = 'cached_active_game_name';
+
+  Map<String, dynamic>? _cachedActiveGame;
+  DateTime? _cachedActiveGameAt;
+  static const _activeGameCacheTtl = Duration(seconds: 45);
+
+  String? _lastCompletedBoardKey;
+  String? _boardBuildKeyInFlight;
+  Future<void>? _boardBuildFuture;
   
   // Auto-save timer (debounced)
   Timer? _autoSaveTimer;
 
   /// When true, the next [build_question_board] seeds answer fields from the server DB.
   bool _seedAnswersFromDbOnNextBuild = true;
+
+  bool get _hasRealQuestionBoard =>
+      _roundName.isNotEmpty && _currentGameNameForStorage.isNotEmpty;
+
+  bool _isExpiredStartPayload(Map<String, dynamic> data) {
+    final action = data['timer_action']?.toString() ?? '';
+    if (action != 'START_TIME' && action != 'START_TIMER') return false;
+    final timerEnd = TimerStore.parseUtc(data['timer_end'] as String?);
+    return timerEnd != null && !timerEnd.isAfter(DateTime.now().toUtc());
+  }
+
+  /// Prefer live [TimerStore] question id when a per-question timer is running.
+  int _resolveEditableQuestionId({
+    required String startTimerStatus,
+    dynamic prefsQuestionId,
+  }) {
+    if (startTimerStatus != 'Running') return 0;
+    final fromStore = TimerStore.instance.activeQuestionId;
+    if (fromStore > 0) return fromStore;
+    final fromPrefs = TimerStore.parseInt(prefsQuestionId);
+    if (fromPrefs > 0) return fromPrefs;
+    if (_currentQuestionId != null && _currentQuestionId! > 0) {
+      return _currentQuestionId!;
+    }
+    return 0;
+  }
+
+  bool _boardMatchesActiveSession(TimerSession session) {
+    return _hasRealQuestionBoard &&
+        _roundNamesMatch(_roundName, session.roundName) &&
+        session.questionId > 0 &&
+        _currentQuestionId == session.questionId;
+  }
   
   @override
   void initState() {
@@ -299,7 +362,6 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
       if (mounted) _syncUiFromTimerStore();
     }));
     TimerStore.instance.addListener(_onTimerStoreUpdate);
-    _initializeAnswers(1); // Default to 1 answer
     _startWriterStatusCheck();
     
     // Register this page to receive timer messages
@@ -329,7 +391,22 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
       setState(() {
         _isWriter = true;
       });
+      await TimerStore.instance.loadFromPrefs();
+      try {
+        final activeResult = await DatabaseService.getActiveTimers();
+        if (activeResult['success'] == true && activeResult['data'] != null) {
+          await TimerStore.instance.syncFromActiveSnapshot(
+            activeResult['data'] as Map<String, dynamic>,
+            force: true,
+          );
+        }
+      } catch (e) {
+        print('QuestionPage: active timer sync on open failed: $e');
+      }
+      if (mounted) _syncUiFromTimerStore();
+      await _getActiveGameCached();
       await _loadQuestionBoardFromLastTimer();
+      if (mounted) await _updateAnswerEditability();
     } catch (e) {
       print('QuestionPage: _verifyWriterAccessAndInit failed: $e');
     }
@@ -394,7 +471,22 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
   void _onTimerStoreUpdate() {
     if (!mounted) return;
     _syncUiFromTimerStore();
-    unawaited(_updateAnswerEditability());
+    unawaited(() async {
+      if (_isWriter) {
+        final session = TimerStore.instance.questionSession;
+        final now = DateTime.now().toUtc();
+        final d = TimerStore.instance.displayState;
+        if (d.startTimerStatus == 'Running' &&
+            session != null &&
+            session.isActiveAt(now) &&
+            !_boardMatchesActiveSession(session)) {
+          await _tryLoadBoardFromActiveQuestionTimer();
+        } else if (!_hasRealQuestionBoard) {
+          await _tryLoadBoardFromActiveQuestionTimer();
+        }
+      }
+      await _updateAnswerEditability();
+    }());
   }
 
   /// Single UI sync from [TimerStore.displayState] (server timer_end anchored).
@@ -423,6 +515,11 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
         _stopBlinking();
       }
     });
+    if (_isWriter &&
+        !_hasRealQuestionBoard &&
+        d.startTimerStatus == 'Running') {
+      unawaited(_tryLoadBoardFromActiveQuestionTimer());
+    }
   }
 
   Future<void> _loadTimerStatus() async {
@@ -434,6 +531,17 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
   Future<void> _loadQuestionBoardFromLastTimer() async {
     try {
       print('QuestionPage: _loadQuestionBoardFromLastTimer called');
+
+      final session = TimerStore.instance.questionSession;
+      final now = DateTime.now().toUtc();
+      if (session != null && session.isActiveAt(now)) {
+        print('QuestionPage: Active TimerStore session found on open');
+        await _tryLoadBoardFromActiveQuestionTimer();
+        if (_boardMatchesActiveSession(session)) {
+          return;
+        }
+      }
+
       final prefs = await SharedPreferences.getInstance();
       final lastTimerDataStr = prefs.getString('last_timer_action_data');
       print('QuestionPage: last_timer_action_data from SharedPreferences: ${lastTimerDataStr != null ? "exists (${lastTimerDataStr.length} chars)" : "null"}');
@@ -444,13 +552,33 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
           print('QuestionPage: Parsed last_timer_action_data: $lastTimerData');
           final questionId = lastTimerData['question_id'];
           final roundName = lastTimerData['round_name'] as String?;
+          final timerAction = lastTimerData['timer_action']?.toString() ?? '';
+          final qidInt = questionId is int
+              ? questionId
+              : int.tryParse(questionId?.toString() ?? '') ?? 0;
+
+          // Stale STOP-at-slide payloads must not rebuild the board on page open.
+          if ((timerAction == 'STOP_TIMER' || timerAction == 'PAUSE_TIMER') &&
+              qidInt == 0) {
+            print(
+              'QuestionPage: Skipping board load from stale $timerAction payload',
+            );
+            await _tryLoadBoardFromActiveQuestionTimer();
+            return;
+          }
+
+          if (_isExpiredStartPayload(lastTimerData)) {
+            print(
+              'QuestionPage: Skipping board load from expired $timerAction payload',
+            );
+            await _tryLoadBoardFromActiveQuestionTimer();
+            return;
+          }
           
           print('QuestionPage: Extracted question_id=$questionId, round_name=$roundName');
           
           if (roundName != null && roundName.isNotEmpty) {
             print('QuestionPage: Loading question board from last_timer_setting: question_id=$questionId, round_name=$roundName');
-            // Wait a bit for the page to be fully initialized
-            await Future.delayed(const Duration(milliseconds: 500));
             if (mounted) {
               print('QuestionPage: Calling build_question_board with last_timer_data');
               await build_question_board(lastTimerData);
@@ -467,29 +595,115 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
       } else {
         print('QuestionPage: No last_timer_action_data found in SharedPreferences');
       }
+      await _tryLoadBoardFromActiveQuestionTimer();
     } catch (e) {
       print('QuestionPage: Error in _loadQuestionBoardFromLastTimer: $e');
       print('QuestionPage: Stack trace: ${StackTrace.current}');
     }
   }
+
+  Map<String, dynamic> _timerMessageFromQuestionSession(TimerSession session) {
+    return {
+      'timer_action': 'START_TIME',
+      'round_name': session.roundName,
+      'question_id': session.questionId,
+      'timer_start': session.startedAtUtc.toIso8601String(),
+      'timer_end': session.endsAtUtc.toIso8601String(),
+      'duration_seconds': session.totalSeconds,
+      'question_timer': session.totalSeconds,
+      'final_timer': 0,
+      'event_id': session.eventId,
+    };
+  }
+
+  /// When prefs still hold a stale STOP but [TimerStore] has a live question timer
+  /// (e.g. user opened QuestionPage after login sync), build the board from the session.
+  Future<void> _tryLoadBoardFromActiveQuestionTimer() async {
+    if (!mounted || !_isWriter) return;
+
+    final now = DateTime.now().toUtc();
+    final session = TimerStore.instance.questionSession;
+    if (session == null || !session.isActiveAt(now)) {
+      return;
+    }
+    if (session.roundName.isEmpty) {
+      print('QuestionPage: Active question session missing round_name');
+      return;
+    }
+
+    if (_boardMatchesActiveSession(session)) {
+      return;
+    }
+
+    var message = _timerMessageFromQuestionSession(session);
+
+    if (TimerStore.parseInt(message['question_id']) <= 0) {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString('last_timer_action_data');
+      if (raw != null) {
+        try {
+          final prev = jsonDecode(raw) as Map<String, dynamic>;
+          final action = prev['timer_action']?.toString() ?? '';
+          final qid = TimerStore.parseInt(prev['question_id']);
+          if ((action == 'START_TIME' || action == 'START_TIMER') && qid > 0) {
+            message = Map<String, dynamic>.from(message);
+            message['question_id'] = qid;
+          }
+        } catch (_) {}
+      }
+    }
+
+    if (TimerStore.parseInt(message['question_id']) <= 0) {
+      try {
+        final activeResult = await DatabaseService.getActiveTimers();
+        if (activeResult['success'] == true && activeResult['data'] != null) {
+          final data = activeResult['data'] as Map<String, dynamic>;
+          final qWin = data['question_window'] as Map<String, dynamic>?;
+          final qid = TimerStore.parseInt(qWin?['question_id']);
+          if (qid > 0) {
+            message = Map<String, dynamic>.from(message);
+            message['question_id'] = qid;
+          }
+          final rn = qWin?['round_name']?.toString();
+          if (rn != null && rn.isNotEmpty) {
+            message['round_name'] = rn;
+          }
+        }
+      } catch (e) {
+        print('QuestionPage: getActiveTimers for board load failed: $e');
+      }
+    }
+
+    final qid = TimerStore.parseInt(message['question_id']);
+    if (qid <= 0) {
+      print('QuestionPage: Active question timer but question_id unknown');
+      return;
+    }
+
+    print(
+      'QuestionPage: Loading board from active TimerStore session '
+      'q=$qid round=${message['round_name']}',
+    );
+    await build_question_board(message);
+  }
   
   /// Update answer editability based on current timer status
   Future<void> _updateAnswerEditability() async {
     try {
-      final timerSnapshot = await getCurrentTimerStatus();
-      final startTimerStatus =
-          timerSnapshot['start_timer_status'] as String? ?? 'Idle';
+      await TimerStore.instance.getCurrentTimerStatus();
+      final d = TimerStore.instance.displayState;
+      final startTimerStatus = d.startTimerStatus;
 
       // Get question_id from last_timer_setting or current message
       final prefs = await SharedPreferences.getInstance();
       final lastTimerDataStr = prefs.getString('last_timer_action_data');
-      dynamic questionId;
+      dynamic prefsQuestionId;
       String? roundName;
       
       if (lastTimerDataStr != null) {
         try {
           final lastTimerData = jsonDecode(lastTimerDataStr) as Map<String, dynamic>;
-          questionId = lastTimerData['question_id'];
+          prefsQuestionId = lastTimerData['question_id'];
           roundName = lastTimerData['round_name'] as String?;
         } catch (e) {
           print('Error parsing last_timer_action_data: $e');
@@ -498,7 +712,16 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
       if ((roundName == null || roundName.isEmpty) && _roundName.isNotEmpty) {
         roundName = _roundName;
       }
-      if (roundName == null) {
+      if (roundName == null || roundName.isEmpty) {
+        final session = TimerStore.instance.questionSession;
+        final now = DateTime.now().toUtc();
+        if (session != null &&
+            session.isActiveAt(now) &&
+            session.roundName.isNotEmpty) {
+          roundName = session.roundName;
+        }
+      }
+      if (roundName == null || roundName.isEmpty) {
         return;
       }
 
@@ -517,10 +740,16 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
         _roundTimer = 0;
       }
 
-      final intQuestionId = questionId is int
-          ? questionId
-          : (questionId is String ? int.tryParse(questionId) : int.tryParse('$questionId'));
-      if (!roundMode && intQuestionId == null) {
+      final resolvedQuestionId = !roundMode
+          ? _resolveEditableQuestionId(
+              startTimerStatus: startTimerStatus,
+              prefsQuestionId: prefsQuestionId,
+            )
+          : 0;
+      // Classic mode with no active question: still run the loop to disable fields.
+      if (!roundMode &&
+          startTimerStatus == 'Running' &&
+          resolvedQuestionId == 0) {
         return;
       }
       
@@ -531,7 +760,8 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
       bool needsUpdate = false;
       for (var i = 0; i < _answers.length; i++) {
         final answer = _answers[i];
-        final qId = answer['id'] as int;
+        final qId = TimerStore.parseInt(answer['id']);
+        if (qId <= 0) continue;
         final question = _gameData[qId];
         if (question == null) continue;
         
@@ -547,7 +777,7 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
             shouldBeEnabled = true;
           }
         } else {
-          if (startTimerStatus == 'Running' && intQuestionId != null && qId == intQuestionId) {
+          if (startTimerStatus == 'Running' && qId == resolvedQuestionId) {
             shouldBeEnabled = true;
           }
         }
@@ -561,7 +791,7 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
       if (needsUpdate && mounted) {
         print(
           'QuestionPage: _updateAnswerEditability roundMode=$roundMode roundTimer=$_roundTimer '
-          'start=$startTimerStatus qId=$intQuestionId '
+          'start=$startTimerStatus qId=$resolvedQuestionId '
           'roundExpired=$roundFinalTimerExpired enabled='
           '${_answers.where((a) => a['enabled'] == true).length}/${_answers.length}',
         );
@@ -584,8 +814,7 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
 
     _pageScrollController.dispose();
     _answerPoolRevision.dispose();
-    // Save answers before disposing
-    _saveAnswers();
+    unawaited(_saveAnswers());
     
     // Unregister timer message handler
     if (_globalTimerMessageHandler == _handleTimerTrigger) {
@@ -671,7 +900,36 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
     // TODO: Implement get_game_for_round
   }
 
+  static String _boardBuildKey(Map<String, dynamic> message) {
+    final eventId = message['event_id']?.toString();
+    if (eventId != null && eventId.isNotEmpty) return eventId;
+    return '${message['timer_action']}_${message['slide_number']}_${message['question_id']}';
+  }
+
   Future<void> build_question_board(Map<String, dynamic> message) async {
+    final key = _boardBuildKey(message);
+    if (key == _lastCompletedBoardKey) {
+      print('QuestionPage: skip build_question_board — already built for $key');
+      if (mounted) {
+        _syncUiFromTimerStore();
+        unawaited(_updateAnswerEditability());
+      }
+      return;
+    }
+    if (_boardBuildKeyInFlight == key && _boardBuildFuture != null) {
+      print('QuestionPage: coalesce build_question_board for $key');
+      return _boardBuildFuture!;
+    }
+    _boardBuildKeyInFlight = key;
+    _boardBuildFuture = _buildQuestionBoardBody(message).whenComplete(() {
+      _lastCompletedBoardKey = key;
+      _boardBuildKeyInFlight = null;
+      _boardBuildFuture = null;
+    });
+    return _boardBuildFuture!;
+  }
+
+  Future<void> _buildQuestionBoardBody(Map<String, dynamic> message) async {
     try {
       print('QuestionPage: build_question_board called with message: $message');
       
@@ -709,7 +967,7 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
       
       // Get active game to get game name
       print('QuestionPage: Getting active game...');
-      final activeGame = await _getActiveGame();
+      final activeGame = await _getActiveGameCached();
       if (activeGame == null) {
         print('QuestionPage: No active game found');
         return;
@@ -748,8 +1006,7 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
           ? scoreQuestionId
           : int.tryParse(scoreQuestionId?.toString() ?? '');
       
-      // Update current game name for storage
-      _currentGameNameForStorage = gameName;
+      await _setGameNameForStorage(gameName);
       
       // Load game data into cache if not already loaded or if round changed
       final currentRound = _gameData.isNotEmpty 
@@ -814,9 +1071,14 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
           tta = int.tryParse(ttaRaw.toString()) ?? 0;
         }
         if (canReapplyStart && tta > 0) {
-          print('QuestionPage: Re-applying global START timer with time_to_get_answer=$tta from game data');
+          print(
+            'QuestionPage: Re-applying global START timer with time_to_get_answer=$tta from game data',
+          );
           await reapplyGlobalStartTimerFromGameData(message, tta);
-          if (mounted) await _loadTimerStatus();
+          if (mounted) {
+            _syncUiFromTimerStore();
+            await _updateAnswerEditability();
+          }
         }
       }
       
@@ -920,6 +1182,10 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
       print('QuestionPage: Updating game info for question_id: $scoreQuestionId');
       await _updateGameInfo(activeGame, scoreQuestionId);
       print('QuestionPage: Game info updated - _gameName=$_gameName, _roundName=$_roundName, _regScore=$_regScore/$_regScoreTotal, _bonusScore=$_bonusScore/$_bonusScoreTotal');
+
+      if (mounted) {
+        await _updateAnswerEditability();
+      }
       
     } catch (e, stackTrace) {
       print('QuestionPage: Error in build_question_board: $e');
@@ -1067,11 +1333,11 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
       print('QuestionPage: _buildAnswersFromGameData called - roundName=$roundName, questionId=$questionId, savedAnswers count=${savedAnswers.length}, gameData count=${_gameData.length}');
       final mergedAnswers = <Map<String, dynamic>>[];
       
-      // Get timer status to determine editability
-      final timerStatus = await getCurrentTimerStatus();
-      var startTimerStatus = timerStatus['start_timer_status'] as String? ?? 'Idle';
-      var lastTimerStatus = timerStatus['last_timer_status'] as String? ?? 'Idle';
-      final activeTimer = timerStatus['active_timer'] as String? ?? 'Idle';
+      await TimerStore.instance.getCurrentTimerStatus();
+      final timerDisplay = TimerStore.instance.displayState;
+      var startTimerStatus = timerDisplay.startTimerStatus;
+      var lastTimerStatus = timerDisplay.lastTimerStatus;
+      final activeTimer = timerDisplay.activeTimer;
       
       // Round mode only when type_game != 0 on the round (classic: one question per START timer).
       final typeGame = _resolveTypeGameForRound(roundName);
@@ -1107,8 +1373,15 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
         'roundExpired=$roundFinalTimerExpired (round-mode editability)',
       );
       
-      // Convert questionId to int for comparison
-      final intQuestionId = questionId is int ? questionId : (questionId is String ? int.tryParse(questionId) : null);
+      var intQuestionId = !roundMode
+          ? _resolveEditableQuestionId(
+              startTimerStatus: startTimerStatus,
+              prefsQuestionId: questionId,
+            )
+          : TimerStore.parseInt(questionId);
+      if (roundMode && intQuestionId == 0) {
+        intQuestionId = TimerStore.parseInt(questionId);
+      }
       print('QuestionPage: intQuestionId=$intQuestionId (from questionId: $questionId, type: ${questionId.runtimeType})');
       
       // Filter questions based on round_timer and question_id:
@@ -1135,7 +1408,7 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
         print('QuestionPage: round mode, publishing all ${questionsToProcess.length} questions in round');
       } else {
         // Classic mode (type_game == 0)
-        if (intQuestionId != null && intQuestionId != 0) {
+        if (intQuestionId > 0) {
           if (_gameData.containsKey(intQuestionId)) {
             questionsToProcess.add(MapEntry(intQuestionId, _gameData[intQuestionId]!));
             print('QuestionPage: classic mode, publishing only question_id=$intQuestionId');
@@ -1261,7 +1534,7 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
             isEnabled = true;
           }
         } else {
-          if (startTimerStatus == 'Running' && intQuestionId != null && qId == intQuestionId) {
+          if (startTimerStatus == 'Running' && intQuestionId > 0 && qId == intQuestionId) {
             isEnabled = true;
           }
         }
@@ -1463,7 +1736,7 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
       
       setState(() {
         _answers = mergedAnswers;
-        _currentQuestionId = intQuestionId;
+        _currentQuestionId = intQuestionId > 0 ? intQuestionId : null;
         _roundTimer = roundTimer;
       });
       _bumpAnswerPoolRevision();
@@ -1683,6 +1956,53 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
     }
   }
   
+  Future<void> _setGameNameForStorage(String gameName) async {
+    if (gameName.isEmpty) return;
+    _currentGameNameForStorage = gameName;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_cachedActiveGameNameKey, gameName);
+    } catch (_) {}
+  }
+
+  Future<bool> _ensureGameNameForStorage() async {
+    if (_currentGameNameForStorage.isNotEmpty) return true;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final cached = prefs.getString(_cachedActiveGameNameKey);
+      if (cached != null && cached.isNotEmpty) {
+        _currentGameNameForStorage = cached;
+        return true;
+      }
+    } catch (_) {}
+    final activeGame = await _getActiveGameCached();
+    final gameName = activeGame?['game_name'] as String?;
+    if (gameName != null && gameName.isNotEmpty) {
+      await _setGameNameForStorage(gameName);
+      return true;
+    }
+    return false;
+  }
+
+  Future<Map<String, dynamic>?> _getActiveGameCached() async {
+    final now = DateTime.now();
+    if (_cachedActiveGame != null &&
+        _cachedActiveGameAt != null &&
+        now.difference(_cachedActiveGameAt!) < _activeGameCacheTtl) {
+      return _cachedActiveGame;
+    }
+    final game = await _getActiveGame();
+    if (game != null) {
+      _cachedActiveGame = game;
+      _cachedActiveGameAt = now;
+      final gameName = game['game_name'] as String?;
+      if (gameName != null && gameName.isNotEmpty) {
+        await _setGameNameForStorage(gameName);
+      }
+    }
+    return game;
+  }
+
   /// Get active game from backend
   Future<Map<String, dynamic>?> _getActiveGame() async {
     try {
@@ -1871,7 +2191,7 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
   /// Save answers to persistent storage
   Future<void> _saveAnswers() async {
     try {
-      if (_currentGameNameForStorage.isEmpty) {
+      if (!await _ensureGameNameForStorage()) {
         print('QuestionPage: Cannot save answers - no game name set');
         return;
       }
@@ -2004,29 +2324,35 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
       case 'START_TIMER':
         print('QuestionPage: START_TIMER received');
         if (mounted) _syncUiFromTimerStore();
-        build_question_board(message).then((_) async {
-          if (mounted) _syncUiFromTimerStore();
-          await _updateAnswerEditability();
-        }).catchError((e) {
-          print('QuestionPage: Error in build_question_board for START_TIMER: $e');
-        });
+        unawaited(_updateAnswerEditability());
+        unawaited(
+          build_question_board(message).then((_) async {
+            if (mounted) await _updateAnswerEditability();
+          }).catchError((e) {
+            print('QuestionPage: Error in build_question_board for START_TIMER: $e');
+          }),
+        );
         break;
-        
+
       case 'STOP_TIMER':
-        print('QuestionPage: STOP_TIMER received');
+      case 'PAUSE_TIMER':
+        print('QuestionPage: $timerAction received');
+        _lastCompletedBoardKey = null;
         if (mounted) _syncUiFromTimerStore();
         unawaited(_updateAnswerEditability());
         break;
-        
+
       case 'LAST_TIMER':
         print('QuestionPage: LAST_TIMER received');
         if (mounted) _syncUiFromTimerStore();
-        build_question_board(message).then((_) async {
-          if (mounted) _syncUiFromTimerStore();
-          await _updateAnswerEditability();
-        }).catchError((e) {
-          print('QuestionPage: Error in build_question_board for LAST_TIMER: $e');
-        });
+        unawaited(_updateAnswerEditability());
+        unawaited(
+          build_question_board(message).then((_) async {
+            if (mounted) await _updateAnswerEditability();
+          }).catchError((e) {
+            print('QuestionPage: Error in build_question_board for LAST_TIMER: $e');
+          }),
+        );
         break;
         
       default:

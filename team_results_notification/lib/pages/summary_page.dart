@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import '../services/timer_store.dart';
 import '../services/user_data_service.dart';
 import 'login_page.dart'; // For DatabaseService
 
@@ -18,6 +19,8 @@ class _SummaryPageState extends State<SummaryPage> {
   List<String> _rounds = [];
   Map<String, List<Map<String, dynamic>>> _roundQuestions = {};
   Map<int, Map<String, dynamic>> _teamAnswers = {}; // Key: question_id, Value: answer data
+  /// Per-question: may player see right/wrong yet (timer gating).
+  Map<int, bool> _gradesRevealedByQuestionId = {};
 
   /// Matches game table nonempty answer1..answer4; 0 nonempty → single slot.
   int _expectedSlotCountFromQuestion(Map<String, dynamic> question) {
@@ -77,6 +80,68 @@ class _SummaryPageState extends State<SummaryPage> {
       return v.round();
     }
     return int.tryParse(v.toString());
+  }
+
+  int _resolveTypeGameForRound(
+    String roundName,
+    List<Map<String, dynamic>> questions,
+  ) {
+    Map<String, dynamic>? last;
+    var maxId = -1;
+    for (final q in questions) {
+      final id = _asInt(q['id']) ?? 0;
+      if (id > maxId) {
+        maxId = id;
+        last = q;
+      }
+    }
+    if (last == null) {
+      return 0;
+    }
+    return _asInt(last['type_game']) ?? 0;
+  }
+
+  Future<bool> _gradesRevealedForQuestion(
+    String roundName,
+    int questionId,
+    List<Map<String, dynamic>> questions,
+  ) async {
+    final typeGame = _resolveTypeGameForRound(roundName, questions);
+    final store = TimerStore.instance;
+    final now = DateTime.now().toUtc();
+
+    if (typeGame != 0) {
+      final rf = store.roundFinalSession;
+      if (rf != null &&
+          rf.isActiveAt(now) &&
+          TimerStore.roundNameKeysMatch(rf.roundName, roundName)) {
+        return false;
+      }
+      return TimerStore.isRoundFinalTimerExpired(roundName);
+    }
+
+    final qs = store.questionSession;
+    if (qs != null && qs.isActiveAt(now) && qs.questionId == questionId) {
+      return false;
+    }
+    return true;
+  }
+
+  Map<String, dynamic>? _answerForPlayerDisplay(
+    Map<String, dynamic>? answer,
+    bool gradesRevealed,
+  ) {
+    if (answer == null || gradesRevealed) {
+      return answer;
+    }
+    final m = Map<String, dynamic>.from(answer);
+    m['is_correct'] = null;
+    m['is_correct_1'] = null;
+    m['is_correct_2'] = null;
+    m['is_correct_3'] = null;
+    m['is_correct_4'] = null;
+    m['final_score'] = null;
+    return m;
   }
 
   @override
@@ -177,6 +242,15 @@ class _SummaryPageState extends State<SummaryPage> {
 
       _rounds = rounds;
 
+      await TimerStore.instance.loadFromPrefs();
+      final timerSnap = await DatabaseService.getActiveTimers();
+      if (timerSnap['success'] == true && timerSnap['data'] is Map) {
+        await TimerStore.instance.syncFromActiveSnapshot(
+          Map<String, dynamic>.from(timerSnap['data'] as Map),
+          force: true,
+        );
+      }
+
       // Load questions for each round
       for (final roundName in _rounds) {
         final questions = await DatabaseService.getGameQuestionsByRound(_gameName!, roundName);
@@ -191,6 +265,23 @@ class _SummaryPageState extends State<SummaryPage> {
           _teamAnswers[questionId] = answer;
         }
       }
+
+      final revealed = <int, bool>{};
+      for (final roundName in _rounds) {
+        final questions = _roundQuestions[roundName] ?? [];
+        for (final question in questions) {
+          final questionId = _asInt(question['id']);
+          if (questionId == null) {
+            continue;
+          }
+          revealed[questionId] = await _gradesRevealedForQuestion(
+            roundName,
+            questionId,
+            questions,
+          );
+        }
+      }
+      _gradesRevealedByQuestionId = revealed;
 
       setState(() {
         _isLoading = false;
@@ -430,7 +521,10 @@ class _SummaryPageState extends State<SummaryPage> {
 
     for (final question in questions) {
       final questionId = _asInt(question['id']);
-      final answer = questionId != null ? _teamAnswers[questionId] : null;
+      final raw = questionId != null ? _teamAnswers[questionId] : null;
+      final gradesRevealed =
+          questionId != null && (_gradesRevealedByQuestionId[questionId] ?? true);
+      final answer = _answerForPlayerDisplay(raw, gradesRevealed);
       final score = _getResultScore(answer);
       roundTotalScore += score;
 
@@ -505,7 +599,7 @@ class _SummaryPageState extends State<SummaryPage> {
                   ),
                 ),
                 const SizedBox(height: 12),
-                ...questions.map((question) => _buildQuestionRow(question)),
+                ...questions.map((question) => _buildQuestionRow(question, roundName)),
               ],
             ),
           ),
@@ -633,10 +727,13 @@ class _SummaryPageState extends State<SummaryPage> {
     );
   }
 
-  Widget _buildQuestionRow(Map<String, dynamic> question) {
+  Widget _buildQuestionRow(Map<String, dynamic> question, String roundName) {
     final questionId = _asInt(question['id']);
     final questionNum = question['question_num']?.toString() ?? 'N/A';
-    final answer = questionId != null ? _teamAnswers[questionId] : null;
+    final raw = questionId != null ? _teamAnswers[questionId] : null;
+    final gradesRevealed =
+        questionId != null && (_gradesRevealedByQuestionId[questionId] ?? true);
+    final answer = _answerForPlayerDisplay(raw, gradesRevealed);
     final kSlots = _expectedSlotCountFromQuestion(question);
     final pa = _fourPlayerAnswers(answer);
     final syn = answer?['answer']?.toString().trim() ?? '';

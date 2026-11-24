@@ -45,12 +45,14 @@ class _SlotState {
   final String reference;
   String playerAnswer;
   int? isCorrect;
+  final int? storedIsCorrect;
 
   _SlotState({
     required this.col,
     required this.reference,
     required this.playerAnswer,
     required this.isCorrect,
+    required this.storedIsCorrect,
   });
 }
 
@@ -65,6 +67,9 @@ class _AdminQuestionReviewPageState extends State<AdminQuestionReviewPage> {
   static const _bg = Color(0xFF000000);
   static const _bannerGreen = Color(0xFF2E7D32);
   static const _textWhite = Colors.white;
+  /// Match player text slots (see AnswerEditorDialog.textSlotMaxLength).
+  static const _answerChipMaxLines = 3;
+  static const _slotColumnWidth = 132.0;
 
   @override
   void initState() {
@@ -109,7 +114,8 @@ class _AdminQuestionReviewPageState extends State<AdminQuestionReviewPage> {
           col: col,
           reference: (s['reference'] ?? '').toString(),
           playerAnswer: answer,
-          isCorrect: _parseGrade(s['is_correct']),
+          isCorrect: parseStoredGrade(s['suggested_is_correct']),
+          storedIsCorrect: parseStoredGrade(s['stored_is_correct']),
         );
       }).toList();
       return _TeamReviewState(
@@ -128,12 +134,6 @@ class _AdminQuestionReviewPageState extends State<AdminQuestionReviewPage> {
       _teams = teams;
       _loading = false;
     });
-  }
-
-  int? _parseGrade(dynamic v) {
-    if (v == null) return null;
-    if (v is int) return v;
-    return int.tryParse(v.toString());
   }
 
   ParsedQuestionKind get _parsed =>
@@ -282,30 +282,33 @@ class _AdminQuestionReviewPageState extends State<AdminQuestionReviewPage> {
     final text = slot.playerAnswer.trim();
     final label = text.isEmpty ? 'No answer' : text;
     final grade = text.isEmpty ? 0 : (slot.isCorrect ?? 0);
-    return Material(
+    final chip = Material(
       color: verdictChipColor(grade),
       borderRadius: BorderRadius.circular(6),
       child: InkWell(
         onTap: () => _onSlotTap(team, slot),
         borderRadius: BorderRadius.circular(6),
         child: Container(
+          width: double.infinity,
           constraints: const BoxConstraints(minWidth: 72, minHeight: 36),
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
           alignment: Alignment.center,
           child: Text(
             label,
             textAlign: TextAlign.center,
-            maxLines: 2,
+            maxLines: _answerChipMaxLines,
             overflow: TextOverflow.ellipsis,
             style: TextStyle(
               color: verdictChipTextColor(grade),
               fontSize: 12,
+              height: 1.25,
               fontWeight: FontWeight.w600,
             ),
           ),
         ),
       ),
     );
+    return verdictChipWithStoredLine(storedGrade: slot.storedIsCorrect, chip: chip);
   }
 
   Widget _buildTable() {
@@ -318,25 +321,27 @@ class _AdminQuestionReviewPageState extends State<AdminQuestionReviewPage> {
     const corrW = 56.0;
     const wrongW = 56.0;
     const teamW = 140.0;
-    const slotW = 100.0;
+    const slotW = _slotColumnWidth;
     const bonusW = 56.0;
-    const rowH = 52.0;
     const headerH = 56.0;
 
     Widget headerCell(String label, {double w = slotW}) {
       return Container(
         width: w,
-        height: headerH,
+        constraints: const BoxConstraints(minHeight: headerH),
         alignment: Alignment.center,
         padding: const EdgeInsets.all(4),
         color: _bannerGreen,
         child: Text(
           label,
           textAlign: TextAlign.center,
+          maxLines: _answerChipMaxLines,
+          overflow: TextOverflow.ellipsis,
           style: const TextStyle(
             color: _textWhite,
             fontWeight: FontWeight.bold,
             fontSize: 11,
+            height: 1.2,
           ),
         ),
       );
@@ -359,69 +364,69 @@ class _AdminQuestionReviewPageState extends State<AdminQuestionReviewPage> {
     );
 
     final rows = _teams.map((team) {
-      return Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Container(
-            width: corrW,
-            height: rowH,
-            alignment: Alignment.center,
-            color: _bg,
-            child: _scoreField(
-              label: '',
-              value: team.correctScore,
-              width: corrW - 4,
-              onChanged: (v) => setState(() => team.correctScore = v),
-            ),
-          ),
-          Container(
-            width: wrongW,
-            height: rowH,
-            alignment: Alignment.center,
-            color: _bg,
-            child: _scoreField(
-              label: '',
-              value: team.wrongScore,
-              width: wrongW - 4,
-              onChanged: (v) => setState(() => team.wrongScore = v),
-            ),
-          ),
-          Container(
-            width: teamW,
-            height: rowH,
-            alignment: Alignment.centerLeft,
-            padding: const EdgeInsets.symmetric(horizontal: 8),
-            color: _bg,
-            child: Text(
-              team.teamName,
-              style: const TextStyle(color: _textWhite, fontSize: 13),
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-            ),
-          ),
-          ...team.slots.map(
-            (slot) => Container(
-              width: slotW,
-              height: rowH,
+      return IntrinsicHeight(
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Container(
+              width: corrW,
               alignment: Alignment.center,
-              padding: const EdgeInsets.all(4),
               color: _bg,
-              child: _verdictChip(team, slot),
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              child: _scoreField(
+                label: '',
+                value: team.correctScore,
+                width: corrW - 4,
+                onChanged: (v) => setState(() => team.correctScore = v),
+              ),
             ),
-          ),
-          Container(
-            width: bonusW,
-            height: rowH,
-            alignment: Alignment.center,
-            color: _bg,
-            child: _scoreField(
-              label: '',
-              value: team.luckyBonus,
-              width: bonusW - 4,
-              onChanged: (v) => setState(() => team.luckyBonus = v),
+            Container(
+              width: wrongW,
+              alignment: Alignment.center,
+              color: _bg,
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              child: _scoreField(
+                label: '',
+                value: team.wrongScore,
+                width: wrongW - 4,
+                onChanged: (v) => setState(() => team.wrongScore = v),
+              ),
             ),
-          ),
-        ],
+            Container(
+              width: teamW,
+              alignment: Alignment.centerLeft,
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+              color: _bg,
+              child: Text(
+                team.teamName,
+                style: const TextStyle(color: _textWhite, fontSize: 13),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            ...team.slots.map(
+              (slot) => Container(
+                width: slotW,
+                alignment: Alignment.center,
+                padding: const EdgeInsets.all(4),
+                color: _bg,
+                child: _verdictChip(team, slot),
+              ),
+            ),
+            Container(
+              width: bonusW,
+              alignment: Alignment.center,
+              color: _bg,
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              child: _scoreField(
+                label: '',
+                value: team.luckyBonus,
+                width: bonusW - 4,
+                onChanged: (v) => setState(() => team.luckyBonus = v),
+              ),
+            ),
+          ],
+        ),
       );
     }).toList();
 
