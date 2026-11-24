@@ -23,3 +23,6 @@ Future<void> deleteAllCachesAndReload() async {}
 bool initStrictVisibilityWeb(StrictVisibilityWebCallbacks callbacks) => true;
 
 Future<void> downloadBytesAsFile(List<int> bytes, String filename) async {}
+
+/// Sync browser URL hash with [flutterRoute] (e.g. `/main`) without adding history.
+void replaceWebHistoryRoute(String flutterRoute) {}

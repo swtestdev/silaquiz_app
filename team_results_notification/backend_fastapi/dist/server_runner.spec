@@ -5,10 +5,11 @@ _passlib_handlers = collect_submodules('passlib.handlers')
 
 a = Analysis(
     ['server_runner.py'],
-    pathex=[],
+    pathex=['.'],
     binaries=[],
     datas=[],
     hiddenimports=_passlib_handlers + [
+        'tracking_episodes',
         'bcrypt',
         'passlib.handlers.bcrypt',
         'passlib.handlers.pbkdf2',

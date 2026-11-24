@@ -13,3 +13,6 @@ bool initStrictVisibilityWeb(StrictVisibilityWebCallbacks callbacks) =>
 
 Future<void> downloadBytesAsFile(List<int> bytes, String filename) =>
     impl.downloadBytesAsFile(bytes, filename);
+
+void replaceWebHistoryRoute(String flutterRoute) =>
+    impl.replaceWebHistoryRoute(flutterRoute);

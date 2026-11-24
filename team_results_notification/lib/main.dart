@@ -21,14 +21,13 @@ import 'pages/admin/admin_question_review_page.dart';
 import 'pages/admin/admin_round_list_review_page.dart';
 import 'pages/admin/admin_game_results_page.dart';
 import 'services/user_data_service.dart';
+import 'services/debug_console_service.dart';
 import 'navigation/app_route_observer.dart';
-
-final DebugConsoleController _debugConsole = DebugConsoleController();
 
 void main() {
   final enableDebugConsole =
       kIsWeb && Uri.base.queryParameters['debug']?.toLowerCase() == 'true';
-  _debugConsole.enabled = enableDebugConsole;
+  DebugConsoleService.instance.enabled = enableDebugConsole;
 
   runZonedGuarded(
     () {
@@ -36,14 +35,14 @@ void main() {
     },
     (error, stack) {
       if (enableDebugConsole) {
-        _debugConsole.addLog('ERROR: $error');
-        _debugConsole.addLog(stack.toString());
+        DebugConsoleService.instance.addLog('ERROR: $error');
+        DebugConsoleService.instance.addLog(stack.toString());
       }
     },
     zoneSpecification: ZoneSpecification(
       print: (self, parent, zone, message) {
         if (enableDebugConsole) {
-          _debugConsole.addLog(message);
+          DebugConsoleService.instance.addLog(message);
         }
         parent.print(zone, message);
       },
@@ -66,6 +65,13 @@ class PWAApp extends StatelessWidget {
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
       ),
       initialRoute: '/splash',
+      // Browser refresh on #/admin/... must not reopen that page without a stack.
+      onGenerateInitialRoutes: (String _) => [
+        MaterialPageRoute<void>(
+          settings: const RouteSettings(name: '/splash'),
+          builder: (BuildContext context) => const SplashPage(),
+        ),
+      ],
       navigatorObservers: [appRouteObserver],
       routes: {
         '/splash': (context) => const SplashPage(),
@@ -144,7 +150,7 @@ class PWAApp extends StatelessWidget {
           children: [
             if (child != null) Positioned.fill(child: child),
             if (enableDebugConsole)
-              DebugConsoleOverlay(controller: _debugConsole),
+              DebugConsoleOverlay(controller: DebugConsoleService.instance),
           ],
         );
       },
@@ -152,27 +158,8 @@ class PWAApp extends StatelessWidget {
   }
 }
 
-class DebugConsoleController {
-  bool enabled = false;
-  final ValueNotifier<List<String>> logs = ValueNotifier<List<String>>([]);
-
-  void addLog(String message) {
-    if (!enabled) return;
-    final next = List<String>.from(logs.value)..add(message);
-    const maxLines = 300;
-    if (next.length > maxLines) {
-      next.removeRange(0, next.length - maxLines);
-    }
-    logs.value = next;
-  }
-
-  void clear() {
-    logs.value = [];
-  }
-}
-
 class DebugConsoleOverlay extends StatefulWidget {
-  final DebugConsoleController controller;
+  final DebugConsoleService controller;
 
   const DebugConsoleOverlay({super.key, required this.controller});
 

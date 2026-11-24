@@ -1,5 +1,51 @@
 import 'package:flutter/material.dart';
+import '../../services/user_data_service.dart';
 import '../login_page.dart'; // For DatabaseService
+
+const String _kAdminRoleRequiresNoTeamMessage =
+    'Cannot assign the admin role while this user is on a team. '
+    'Remove them from the team first (Save as Player with “No Team”). '
+    'If they are captain, the team captain slot is cleared when they are removed.';
+
+bool _userHasTeamAssignment(
+  Map<String, dynamic> user,
+  List<Map<String, dynamic>> teams,
+) {
+  final userId = user['id'] is int
+      ? user['id'] as int
+      : int.tryParse(user['id']?.toString() ?? '');
+  if (userId == null) return false;
+
+  if (user['is_captain'] == true) return true;
+
+  final playing = user['playing_in_team_id'];
+  if (playing != null && playing.toString().trim().isNotEmpty) return true;
+
+  final teamName = user['team_name'];
+  if (teamName != null && teamName.toString().trim().isNotEmpty) return true;
+
+  for (final team in teams) {
+    final captain = team['team_captain'];
+    if (captain == userId || captain?.toString() == userId.toString()) {
+      return true;
+    }
+    final raw = team['team_members_ids']?.toString() ?? '';
+    for (final part in raw.split(',')) {
+      if (int.tryParse(part.trim()) == userId) return true;
+    }
+  }
+  return false;
+}
+
+void _showAdminRoleTeamBlockNotice(BuildContext context) {
+  ScaffoldMessenger.of(context).showSnackBar(
+    const SnackBar(
+      content: Text(_kAdminRoleRequiresNoTeamMessage),
+      backgroundColor: Colors.orange,
+      duration: Duration(seconds: 6),
+    ),
+  );
+}
 
 class UserManagementPage extends StatefulWidget {
   const UserManagementPage({super.key});
@@ -14,12 +60,29 @@ class _UserManagementPageState extends State<UserManagementPage> {
   List<Map<String, dynamic>> _teams = [];
   bool _isLoading = true;
   String _searchQuery = '';
+  int? _currentUserId;
+  String _currentRole = 'player';
+
+  bool get _isSuperAdmin => _currentRole == 'super_admin';
+  bool get _isFloorAdmin => _currentRole == 'admin';
 
   @override
   void initState() {
     super.initState();
+    _loadCurrentAdmin();
     _loadUsers();
     _loadTeams();
+  }
+
+  Future<void> _loadCurrentAdmin() async {
+    final u = await UserDataService.getUserData();
+    if (!mounted) return;
+    setState(() {
+      _currentUserId = u?['id'] is int
+          ? u!['id'] as int
+          : int.tryParse('${u?['id']}');
+      _currentRole = u?['role']?.toString() ?? 'player';
+    });
   }
 
   Future<void> _loadUsers() async {
@@ -64,6 +127,30 @@ class _UserManagementPageState extends State<UserManagementPage> {
     }
   }
 
+  bool _userOnTeamMatchingQuery(Map<String, dynamic> user, String queryLower) {
+    final userId = user['id'] is int
+        ? user['id'] as int
+        : int.tryParse(user['id']?.toString() ?? '');
+    if (userId == null) return false;
+
+    for (final team in _teams) {
+      final teamName = team['team_name']?.toString().toLowerCase() ?? '';
+      if (!teamName.contains(queryLower)) continue;
+
+      final captain = team['team_captain'];
+      if (captain == userId || captain?.toString() == userId.toString()) {
+        return true;
+      }
+
+      final rawMembers = team['team_members_ids']?.toString() ?? '';
+      for (final part in rawMembers.split(',')) {
+        final mid = int.tryParse(part.trim());
+        if (mid == userId) return true;
+      }
+    }
+    return false;
+  }
+
   List<Map<String, dynamic>> get _filteredUsers {
     List<Map<String, dynamic>> filtered = _users;
     
@@ -91,9 +178,10 @@ class _UserManagementPageState extends State<UserManagementPage> {
         final teamName = user['team_name']?.toString().toLowerCase() ?? '';
         final query = _searchQuery.toLowerCase();
         
-        return name.contains(query) || 
-               email.contains(query) || 
-               teamName.contains(query);
+        return name.contains(query) ||
+            email.contains(query) ||
+            teamName.contains(query) ||
+            _userOnTeamMatchingQuery(user, query);
       }).toList();
     }
     
@@ -226,25 +314,41 @@ class _UserManagementPageState extends State<UserManagementPage> {
                           itemCount: _filteredUsers.length,
                           itemBuilder: (context, index) {
                             final user = _filteredUsers[index];
-                            final isAdmin = user['role'] == 'admin';
+                            final role = user['role']?.toString() ?? 'player';
+                            final isSuperAdminRow = role == 'super_admin';
+                            final isAdmin = role == 'admin' || isSuperAdminRow;
                             final isCaptain = user['is_captain'] == true;
                             final isActive = user['is_active'] == true;
+                            final userId = user['id'] is int
+                                ? user['id'] as int
+                                : int.tryParse('${user['id']}');
+                            final canManageRow = _isSuperAdmin;
+                            final canRemoveSelf = _isFloorAdmin &&
+                                userId != null &&
+                                userId == _currentUserId &&
+                                !isSuperAdminRow;
                             
                             return Card(
                               child: ListTile(
                                 leading: CircleAvatar(
-                                  backgroundColor: isAdmin 
+                                  backgroundColor: isSuperAdminRow
+                                      ? Colors.deepPurple.shade100
+                                      : isAdmin 
                                       ? Colors.red.shade100 
                                       : isCaptain 
                                           ? Colors.orange.shade100 
                                           : Colors.blue.shade100,
                                   child: Icon(
-                                    isAdmin 
+                                    isSuperAdminRow
+                                        ? Icons.shield
+                                        : isAdmin 
                                         ? Icons.admin_panel_settings 
                                         : isCaptain 
                                             ? Icons.star 
                                             : Icons.person,
-                                    color: isAdmin 
+                                    color: isSuperAdminRow
+                                        ? Colors.deepPurple
+                                        : isAdmin 
                                         ? Colors.red 
                                         : isCaptain 
                                             ? Colors.orange 
@@ -288,19 +392,26 @@ class _UserManagementPageState extends State<UserManagementPage> {
                                       ),
                                   ],
                                 ),
-                                trailing: Row(
-                                  mainAxisSize: MainAxisSize.min,
-                                  children: [
-                                    IconButton(
-                                      icon: const Icon(Icons.edit),
-                                      onPressed: () => _editUser(user),
-                                    ),
-                                    IconButton(
-                                      icon: const Icon(Icons.more_vert),
-                                      onPressed: () => _showUserMenu(user),
-                                    ),
-                                  ],
-                                ),
+                                trailing: (canManageRow || canRemoveSelf)
+                                    ? Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          if (canManageRow)
+                                            IconButton(
+                                              icon: const Icon(Icons.edit),
+                                              onPressed: () => _editUser(user),
+                                            ),
+                                          if (canManageRow || canRemoveSelf)
+                                            IconButton(
+                                              icon: const Icon(Icons.more_vert),
+                                              onPressed: () => _showUserMenu(
+                                                user,
+                                                allowRemoveSelf: canRemoveSelf,
+                                              ),
+                                            ),
+                                        ],
+                                      )
+                                    : null,
                               ),
                             );
                           },
@@ -392,39 +503,143 @@ class _UserManagementPageState extends State<UserManagementPage> {
     );
   }
 
-  void _showUserMenu(Map<String, dynamic> user) {
+  void _showUserMenu(
+    Map<String, dynamic> user, {
+    bool allowRemoveSelf = false,
+  }) {
+    final role = user['role']?.toString() ?? 'player';
+    final isSuperAdminRow = role == 'super_admin';
     showModalBottomSheet(
       context: context,
       builder: (context) => Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          ListTile(
-            leading: const Icon(Icons.edit),
-            title: const Text('Edit User'),
-            onTap: () {
-              Navigator.pop(context);
-              _editUser(user);
-            },
+          if (_isSuperAdmin && !isSuperAdminRow) ...[
+            ListTile(
+              leading: const Icon(Icons.edit),
+              title: const Text('Edit User'),
+              onTap: () {
+                Navigator.pop(context);
+                _editUser(user);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.security),
+              title: const Text('Change Role'),
+              onTap: () {
+                Navigator.pop(context);
+                _showRoleChangeDialog(user);
+              },
+            ),
+            ListTile(
+              leading: Icon(user['is_active'] ? Icons.block : Icons.check_circle),
+              title: Text(user['is_active'] ? 'Deactivate' : 'Activate'),
+              onTap: () {
+                Navigator.pop(context);
+                _toggleUserStatus(user);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.delete_forever, color: Colors.red),
+              title: const Text('Remove user'),
+              onTap: () {
+                Navigator.pop(context);
+                _confirmRemoveUser(user);
+              },
+            ),
+          ],
+          if (allowRemoveSelf)
+            ListTile(
+              leading: const Icon(Icons.delete_forever, color: Colors.red),
+              title: const Text('Remove my account'),
+              onTap: () {
+                Navigator.pop(context);
+                _confirmRemoveUser(user);
+              },
+            ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _confirmRemoveUser(Map<String, dynamic> user) async {
+    final userId = user['id'] is int
+        ? user['id'] as int
+        : int.tryParse('${user['id']}');
+    if (userId == null) return;
+
+    final precheck = await DatabaseService.precheckRemoveUser(userId);
+    if (!mounted) return;
+
+    final blockers = (precheck['blockers'] as List?)?.cast<String>() ?? [];
+    if (precheck['can_remove'] != true) {
+      final msg = blockers.isNotEmpty
+          ? blockers.join('\n')
+          : precheck['message']?.toString() ?? 'Cannot remove this user.';
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Cannot remove user'),
+          content: Text(msg),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Remove user permanently?'),
+        content: Text(
+          'This will permanently delete "${user['name']}" from the database. '
+          'This cannot be undone.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
           ),
-          ListTile(
-            leading: const Icon(Icons.security),
-            title: const Text('Change Role'),
-            onTap: () {
-              Navigator.pop(context);
-              _showRoleChangeDialog(user);
-            },
-          ),
-          ListTile(
-            leading: Icon(user['is_active'] ? Icons.block : Icons.check_circle),
-            title: Text(user['is_active'] ? 'Deactivate' : 'Activate'),
-            onTap: () {
-              Navigator.pop(context);
-              _toggleUserStatus(user);
-            },
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Remove'),
           ),
         ],
       ),
     );
+    if (confirmed != true || !mounted) return;
+
+    final result = await DatabaseService.removeUserAdmin(userId);
+    if (!mounted) return;
+
+    if (result['success'] == true) {
+      if (userId == _currentUserId) {
+        await UserDataService.clearUserData();
+        if (mounted) {
+          Navigator.pushNamedAndRemoveUntil(context, '/login', (_) => false);
+        }
+        return;
+      }
+      await _loadUsers();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('User removed'),
+          backgroundColor: Colors.green,
+        ),
+      );
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(result['message']?.toString() ?? 'Remove failed'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
   }
 
   void _showRoleChangeDialog(Map<String, dynamic> user) {
@@ -464,6 +679,12 @@ class _UserManagementPageState extends State<UserManagementPage> {
   }
 
   void _confirmRoleChange(Map<String, dynamic> user) {
+    if ((user['role']?.toString() ?? '') == 'super_admin') {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Super admin role cannot be changed here')),
+      );
+      return;
+    }
     String newRole = user['role'] == 'admin' ? 'player' : 'admin';
     
     showDialog(
@@ -514,6 +735,12 @@ class _UserManagementPageState extends State<UserManagementPage> {
   }
 
   Future<void> _performRoleChange(Map<String, dynamic> user, String newRole) async {
+    if (newRole == 'admin' &&
+        _userHasTeamAssignment(user, _teams)) {
+      _showAdminRoleTeamBlockNotice(context);
+      return;
+    }
+
     try {
       final result = await DatabaseService.updateUserAdmin(user['id'], {'role': newRole});
       
@@ -796,8 +1023,39 @@ class _UserEditDialogState extends State<UserEditDialog> {
                     setState(() {
                       _selectedRole = value!;
                     });
+                    if (value == 'admin' &&
+                        _userHasTeamAssignment(widget.user, widget.teams) &&
+                        _selectedTeamId != null) {
+                      _showAdminRoleTeamBlockNotice(context);
+                    }
                   },
                 ),
+                if (_selectedRole == 'admin' &&
+                    _userHasTeamAssignment(widget.user, widget.teams) &&
+                    _selectedTeamId != null) ...[
+                  const SizedBox(height: 8),
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.orange.shade50,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: Colors.orange.shade200),
+                    ),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Icon(Icons.info_outline, color: Colors.orange.shade800),
+                        const SizedBox(width: 8),
+                        const Expanded(
+                          child: Text(
+                            _kAdminRoleRequiresNoTeamMessage,
+                            style: TextStyle(fontSize: 13),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 16),
 
                 // Team Selection (only for players)
@@ -909,6 +1167,20 @@ class _UserEditDialogState extends State<UserEditDialog> {
       userData['email'] = _emailController.text.trim();
     }
     
+    final promotingToAdmin = _selectedRole == 'admin' &&
+        (widget.user['role']?.toString() ?? 'player') != 'admin';
+    if (promotingToAdmin &&
+        _userHasTeamAssignment(widget.user, widget.teams)) {
+      if (_selectedTeamId != null) {
+        _showAdminRoleTeamBlockNotice(context);
+        setState(() {
+          _errorMessage = _kAdminRoleRequiresNoTeamMessage;
+        });
+        return;
+      }
+      userData['playing_in_team_id'] = '';
+    }
+
     if (_selectedRole != widget.user['role']) {
       userData['role'] = _selectedRole;
     }

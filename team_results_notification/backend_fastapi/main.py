@@ -15,8 +15,11 @@ import string
 import jwt
 import uvicorn
 import os
+import sys
 import logging
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+from sqlalchemy.engine.url import make_url
 
 load_dotenv()
 import json
@@ -28,6 +31,18 @@ from typing import Optional, List, Dict, Any, Union, Set, Tuple, FrozenSet
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+from tracking_episodes import (  # noqa: E402
+    apply_discon_event as _te_apply_discon_event,
+    compute_discon_for_windows,
+    compute_discon_episodes_in_window,
+    format_discon_label,
+    graph_points_for_round,
+    is_unavailable as _te_is_unavailable,
+    merge_episode_durations,
+    normalize_utc as _te_normalize_utc,
+    sum_episode_seconds,
+)
 
 
 def _parse_trigger_time_segment(raw: Optional[str]) -> int:
@@ -175,12 +190,61 @@ def _clear_round_track_window() -> None:
     _round_track_final_timer = 0
 
 
+def _activate_round_tracking_window(
+    active_game_id: int,
+    round_name: str,
+    started_at: datetime,
+    type_game: int,
+) -> None:
+    """Open round-scope recording (classic + round mode) until round is finalized."""
+    global _round_track_active, _round_track_active_game_id, _round_track_round_name
+    global _round_track_window_id, _round_track_ends_at, _round_track_start_utc
+    global _round_track_duration_sec, _round_track_final_timer
+    rn = (round_name or "").strip()
+    if not rn:
+        return
+    ts = _te_normalize_utc(started_at)
+    _round_track_active = True
+    _round_track_active_game_id = int(active_game_id)
+    _round_track_round_name = rn
+    _round_track_window_id = f"{active_game_id}:{rn}:r:{int(ts.timestamp())}"
+    _round_track_ends_at = None
+    _round_track_start_utc = ts
+    _round_track_duration_sec = 0
+    _round_track_final_timer = int(type_game)
+
+
+def _finalize_round_tracking_and_summary(
+    db: Session,
+    active_game: ActiveGame,
+    game: GamesList,
+    round_name: str,
+    ended_at: datetime,
+) -> None:
+    rn = (round_name or "").strip()
+    if not rn:
+        return
+    _set_round_summary_ended(db, active_game, game, rn, ended_at)
+    _materialize_round_summary_discon(db, active_game, game, rn)
+    if (_round_track_round_name or "").strip() == rn:
+        _clear_round_track_window()
+
+
 def _is_round_tracking_window_active() -> bool:
     if not _round_track_active or not _round_track_window_id:
         return False
     if _round_track_ends_at is not None and _utc_now() >= _round_track_ends_at:
         return False
     return True
+
+
+def _round_scope_still_open() -> bool:
+    """Round mode (type_game != 0) still in progress — not closed by STOP/LAST end."""
+    return (
+        _round_track_active
+        and _round_track_ends_at is None
+        and _round_track_final_timer != 0
+    )
 
 
 def _freeze_question_tracking_count(round_name: str, at_utc: datetime) -> None:
@@ -634,6 +698,7 @@ def _build_active_timer_snapshot() -> Dict[str, Any]:
     return {
         "server_time_utc": _format_utc_iso_z(now),
         "round_mode": round_mode,
+        "round_scope_open": _round_scope_still_open(),
         "question_window": question_window,
         "round_final_window": round_window,
         "last_trigger": last_trigger,
@@ -650,6 +715,8 @@ async def _emit_server_stop_timer(
     question_id: int = 0,
     final_timer: int = 0,
     active_game_id: Optional[int] = None,
+    game_table_name: Optional[str] = None,
+    game_name_safe: Optional[str] = None,
 ) -> None:
     global last_timer_setting
     try:
@@ -669,10 +736,60 @@ async def _emit_server_stop_timer(
                 and _round_track_ends_at is not None
                 and now >= _round_track_ends_at
             ):
+                if active_game_id is not None:
+                    db_end: Session = SessionLocal()
+                    try:
+                        ag = (
+                            db_end.query(ActiveGame)
+                            .filter(ActiveGame.id == active_game_id)
+                            .first()
+                        )
+                        g = (
+                            db_end.query(GamesList)
+                            .filter(GamesList.id == ag.game_id)
+                            .first()
+                            if ag
+                            else None
+                        )
+                        if ag and g:
+                            _set_round_summary_ended(db_end, ag, g, round_name, now)
+                            _materialize_round_summary_discon(db_end, ag, g, round_name)
+                    finally:
+                        db_end.close()
                 _clear_round_track_window()
         else:
             _freeze_question_tracking_count(round_name, now)
             _clear_server_answer_window()
+            if (
+                active_game_id is not None
+                and game_table_name
+                and question_id > 0
+            ):
+                db_classic: Session = SessionLocal()
+                try:
+                    ag_c = (
+                        db_classic.query(ActiveGame)
+                        .filter(ActiveGame.id == active_game_id)
+                        .first()
+                    )
+                    g_c = (
+                        db_classic.query(GamesList)
+                        .filter(GamesList.id == ag_c.game_id)
+                        .first()
+                        if ag_c
+                        else None
+                    )
+                    if ag_c and g_c and _resolve_type_game_for_round(
+                        db_classic, game_table_name, round_name
+                    ) == 0:
+                        if _question_is_last_in_round(
+                            db_classic, game_table_name, round_name, question_id
+                        ):
+                            _finalize_round_tracking_and_summary(
+                                db_classic, ag_c, g_c, round_name, now
+                            )
+                finally:
+                    db_classic.close()
 
         stop_event_id = str(uuid.uuid4())
         payload = {
@@ -691,6 +808,8 @@ async def _emit_server_stop_timer(
             "timer_end": _format_utc_iso_z(now),
             "duration_seconds": 0,
         }
+        if expired_kind == "round_final":
+            payload["round_scope_open"] = False
         await manager.broadcast_to_all_players(json.dumps(payload))
         last_timer_setting = {
             "timer_action": "STOP_TIMER",
@@ -707,6 +826,8 @@ async def _emit_server_stop_timer(
             "stops_event_id": source_event_id,
             "expired_kind": expired_kind,
         }
+        if expired_kind == "round_final":
+            last_timer_setting["round_scope_open"] = False
         if active_game_id is not None:
             db: Session = SessionLocal()
             try:
@@ -718,6 +839,45 @@ async def _emit_server_stop_timer(
             expired_kind,
             source_event_id,
         )
+
+        if (
+            expired_kind == "question"
+            and question_id > 0
+            and active_game_id is not None
+            and game_table_name
+            and game_name_safe
+        ):
+            await asyncio.sleep(AUTO_GRADE_DELAY_SEC)
+            db_grade: Session = SessionLocal()
+            try:
+                active_game = (
+                    db_grade.query(ActiveGame)
+                    .filter(ActiveGame.id == active_game_id)
+                    .first()
+                )
+                if active_game and active_game.is_started == "running":
+                    _apply_grading_on_timer_end(
+                        db_grade,
+                        active_game,
+                        game_table_name,
+                        game_name_safe,
+                        question_id=question_id,
+                    )
+                    logger.info(
+                        "Server expiry auto-grade (question) game=%s qid=%s",
+                        game_name_safe,
+                        question_id,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.exception("Timer-end grading on server STOP failed: %s", e)
+                try:
+                    db_grade.rollback()
+                except Exception:  # noqa: S110
+                    pass
+            finally:
+                db_grade.close()
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -915,15 +1075,399 @@ def create_action_game_control_table(active_game_id: int, db: Session) -> None:
                 question_id INT AUTO_INCREMENT PRIMARY KEY,
                 slide_number INTEGER UNIQUE NOT NULL,
                 round_name VARCHAR(255),
-                timer_start TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                timer_start TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                timer_end TIMESTAMP NULL DEFAULT NULL
             )
             """
         )
         logger.info(f"Ensuring control table exists: {table_name}")
         db.execute(create_sql)
         db.commit()
+        _ensure_action_game_control_timer_end_column(db, table_name)
     except Exception as e:
         logger.error(f"Error creating control table: {e}")
+
+
+def _ensure_action_game_control_timer_end_column(db: Session, table_name: str) -> None:
+    try:
+        row = db.execute(
+            text(
+                "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :tn AND COLUMN_NAME = 'timer_end'"
+            ),
+            {"tn": table_name},
+        ).scalar()
+        if not row:
+            db.execute(text(f"ALTER TABLE `{table_name}` ADD COLUMN timer_end TIMESTAMP NULL DEFAULT NULL"))
+            db.commit()
+    except Exception as e:
+        logger.warning("Could not ensure timer_end on %s: %s", table_name, e)
+        try:
+            db.rollback()
+        except Exception:  # noqa: S110
+            pass
+
+
+def _game_round_summary_table_name(game: GamesList) -> str:
+    game_name_safe = str(game.game_name).strip().lower().replace(" ", "_").replace("-", "_")
+    return f"game_round_summary_{game_name_safe}"
+
+
+def ensure_game_round_summary_table(db: Session, active_game: ActiveGame) -> None:
+    """Per-game round DISCON summary (one row per round_key, dynamic team_* columns)."""
+    game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
+    if not game:
+        return
+    team_ids = _active_game_team_ids(active_game)
+    table_name = _game_round_summary_table_name(game)
+    team_cols = ", ".join(
+        f"`team_{tid}` VARCHAR(512) NULL DEFAULT NULL" for tid in team_ids
+    )
+    team_cols_sql = f", {team_cols}" if team_cols else ""
+    create_sql = text(
+        f"""
+        CREATE TABLE IF NOT EXISTS `{table_name}` (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            round_key VARCHAR(64) NOT NULL,
+            round_name VARCHAR(255) NOT NULL,
+            round_slide INT NULL,
+            round_started_at TIMESTAMP NULL,
+            round_ended_at TIMESTAMP NULL
+            {team_cols_sql},
+            UNIQUE KEY uq_round_key (round_key)
+        )
+        """
+    )
+    db.execute(create_sql)
+    db.commit()
+    for tid in team_ids:
+        col = f"team_{tid}"
+        exists = db.execute(
+            text(
+                "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :tn AND COLUMN_NAME = :cn"
+            ),
+            {"tn": table_name, "cn": col},
+        ).scalar()
+        if not exists:
+            db.execute(
+                text(f"ALTER TABLE `{table_name}` ADD COLUMN `{col}` VARCHAR(512) NULL DEFAULT NULL")
+            )
+    db.commit()
+
+
+def _parse_host_at_timestamp(raw: Optional[str]) -> datetime:
+    """Best-effort parse of VBA '#at#...' segment; fallback UTC now."""
+    if raw is None:
+        return _utc_now()
+    s = str(raw).strip()
+    if not s:
+        return _utc_now()
+    if isinstance(raw, datetime):
+        return _te_normalize_utc(raw)
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %I:%M:%S %p",
+        "%Y-%m-%d %I:%M:%S %p".replace("  ", " "),
+    ):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return _te_normalize_utc(dt)
+    except ValueError:
+        return _utc_now()
+
+
+def _round_summary_table_exists(db: Session, game: GamesList) -> bool:
+    tname = _game_round_summary_table_name(game)
+    return bool(
+        db.execute(
+            text(
+                "SELECT COUNT(*) FROM information_schema.TABLES "
+                "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :tn"
+            ),
+            {"tn": tname},
+        ).scalar()
+    )
+
+
+def _fetch_round_summary_for_name(
+    db: Session, game: GamesList, round_name: str
+) -> Optional[dict]:
+    if not round_name or not _round_summary_table_exists(db, game):
+        return None
+    tname = _game_round_summary_table_name(game)
+    row = db.execute(
+        text(
+            f"""
+            SELECT round_key, round_name, round_slide, round_started_at, round_ended_at
+            FROM `{tname}` WHERE round_name = :rn LIMIT 1
+            """
+        ),
+        {"rn": round_name},
+    ).fetchone()
+    if not row:
+        return None
+    started = row[3]
+    ended = row[4]
+    if isinstance(started, datetime) and started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    if isinstance(ended, datetime) and ended.tzinfo is None:
+        ended = ended.replace(tzinfo=timezone.utc)
+    return {
+        "round_key": row[0],
+        "round_name": row[1],
+        "round_slide": row[2],
+        "round_started_at": started,
+        "round_ended_at": ended,
+    }
+
+
+def _upsert_round_summary_started(
+    db: Session,
+    active_game: ActiveGame,
+    game: GamesList,
+    round_key: str,
+    round_name: str,
+    round_slide: Optional[int],
+    started_at: datetime,
+    *,
+    update_slide: bool = True,
+) -> None:
+    """
+    Record round_started_at in server UTC (same basis as action_game_control.timer_start).
+    update_slide=True only for START_GAME (round intro slide); START_TIME must not overwrite slide.
+    """
+    ensure_game_round_summary_table(db, active_game)
+    tname = _game_round_summary_table_name(game)
+    started_naive = _te_normalize_utc(started_at).replace(tzinfo=None)
+    if update_slide:
+        sql = f"""
+            INSERT INTO `{tname}` (round_key, round_name, round_slide, round_started_at)
+            VALUES (:rk, :rn, :rs, :started)
+            ON DUPLICATE KEY UPDATE
+                round_name = VALUES(round_name),
+                round_slide = VALUES(round_slide),
+                round_started_at = COALESCE(round_started_at, VALUES(round_started_at))
+            """
+    else:
+        sql = f"""
+            INSERT INTO `{tname}` (round_key, round_name, round_slide, round_started_at)
+            VALUES (:rk, :rn, :rs, :started)
+            ON DUPLICATE KEY UPDATE
+                round_name = VALUES(round_name),
+                round_started_at = COALESCE(round_started_at, VALUES(round_started_at))
+            """
+    db.execute(
+        text(sql),
+        {
+            "rk": round_key,
+            "rn": round_name,
+            "rs": round_slide,
+            "started": started_naive,
+        },
+    )
+    db.commit()
+
+
+def _min_question_timer_start_utc(
+    db: Session, game: GamesList, round_name: str
+) -> Optional[datetime]:
+    table = _action_game_control_table_name(game)
+    if not _action_game_control_table_exists(db, table):
+        return None
+    row = db.execute(
+        text(f"SELECT MIN(timer_start) FROM `{table}` WHERE round_name = :rn"),
+        {"rn": round_name},
+    ).fetchone()
+    if not row or row[0] is None:
+        return None
+    ts = row[0]
+    if isinstance(ts, datetime) and ts.tzinfo is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts
+
+
+# Legacy rows stored VBA local clock as fake UTC; ignore summary if it skews this far from timers.
+_ROUND_START_SUMMARY_MAX_SKEW_SEC = 3 * 3600
+
+
+def _question_is_last_in_round(
+    db: Session, game_table: str, round_name: str, question_id: int
+) -> bool:
+    if question_id <= 0:
+        return False
+    row = db.execute(
+        text(
+            f"""
+            SELECT id FROM `{game_table}`
+            WHERE round_name = :rn
+            ORDER BY question_num DESC, id DESC
+            LIMIT 1
+            """
+        ),
+        {"rn": round_name},
+    ).fetchone()
+    if not row:
+        return False
+    try:
+        return int(row[0]) == int(question_id)
+    except (TypeError, ValueError):
+        return False
+
+
+def _set_round_summary_ended(
+    db: Session,
+    active_game: ActiveGame,
+    game: GamesList,
+    round_name: str,
+    ended_at: datetime,
+) -> None:
+    if not round_name:
+        return
+    ensure_game_round_summary_table(db, active_game)
+    tname = _game_round_summary_table_name(game)
+    ended_naive = _te_normalize_utc(ended_at).replace(tzinfo=None)
+    db.execute(
+        text(
+            f"""
+            UPDATE `{tname}` SET round_ended_at = :ended
+            WHERE round_name = :rn AND (round_ended_at IS NULL OR round_ended_at < :ended)
+            """
+        ),
+        {"rn": round_name, "ended": ended_naive},
+    )
+    db.commit()
+
+
+def _resolve_question_timer_sec_for_control_slide(
+    db: Session,
+    control_table: str,
+    game_table: str,
+    slide_number: int,
+    round_name: str,
+) -> int:
+    resolved = _resolve_game_question_for_slide(
+        db, control_table, game_table, slide_number, round_name
+    )
+    if resolved:
+        return int(resolved[2] or 0)
+    return 0
+
+
+def _build_round_scoring_windows(
+    db: Session,
+    game: GamesList,
+    round_name: str,
+    server_now: datetime,
+) -> List[Tuple[datetime, datetime]]:
+    """UTC windows where unavailability counts (classic = pre-Q1 + per question; round mode = whole round)."""
+    rn = (round_name or "").strip()
+    if not rn:
+        return []
+    type_game = _resolve_type_game_for_round(db, game.game_name, rn)
+    summary = _fetch_round_summary_for_name(db, game, rn)
+    now = _te_normalize_utc(server_now)
+
+    if type_game != 0:
+        start = _round_start_utc(db, game, rn)
+        end = summary.get("round_ended_at") if summary else None
+        if end is None:
+            end = now
+        else:
+            end = min(_te_normalize_utc(end), now)
+        if start is not None:
+            start = _te_normalize_utc(start)
+            if end > start:
+                return [(start, end)]
+        return []
+
+    table = _action_game_control_table_name(game)
+    game_table = game.game_name
+    round_start = _round_start_utc(db, game, rn)
+    rows: List[Any] = []
+    if _action_game_control_table_exists(db, table):
+        rows = db.execute(
+            text(
+                f"""
+                SELECT slide_number, timer_start, timer_end
+                FROM `{table}` WHERE round_name = :rn ORDER BY timer_start ASC
+                """
+            ),
+            {"rn": rn},
+        ).fetchall()
+
+    windows: List[Tuple[datetime, datetime]] = []
+    if round_start is not None:
+        rs = _te_normalize_utc(round_start)
+        first_q_start: Optional[datetime] = None
+        for _slide, timer_start, _te in rows:
+            if timer_start is not None:
+                first_q_start = _te_normalize_utc(timer_start)
+                break
+        if first_q_start is not None and first_q_start > rs:
+            pre_end = min(first_q_start, now)
+            if pre_end > rs:
+                windows.append((rs, pre_end))
+        elif not rows and now > rs:
+            windows.append((rs, now))
+
+    for slide_number, timer_start, timer_end in rows:
+        if timer_start is None:
+            continue
+        ws = _te_normalize_utc(timer_start)
+        if timer_end is not None:
+            we = min(_te_normalize_utc(timer_end), now)
+        else:
+            qsec = _resolve_question_timer_sec_for_control_slide(
+                db, table, game_table, int(slide_number), rn
+            )
+            we = min(ws + timedelta(seconds=max(qsec, 0)), now) if qsec > 0 else now
+        if we > ws:
+            windows.append((ws, we))
+    return windows
+
+
+def _materialize_round_summary_discon(
+    db: Session,
+    active_game: ActiveGame,
+    game: GamesList,
+    round_name: str,
+) -> None:
+    """Write team_* DISCON labels on round summary row after round ends."""
+    rn = (round_name or "").strip()
+    if not rn or not _round_summary_table_exists(db, game):
+        return
+    server_now = _utc_now()
+    windows = _build_round_scoring_windows(db, game, rn, server_now)
+    if not windows:
+        return
+    discon_events = _fetch_round_discon_events(db, game, rn)
+    by_player: Dict[int, List[dict]] = {}
+    player_team: Dict[int, int] = {}
+    for ev in discon_events:
+        uid = int(ev["user_id"])
+        by_player.setdefault(uid, []).append(ev)
+        player_team[uid] = int(ev["team_id"])
+
+    team_eps: Dict[int, List[Tuple[datetime, int]]] = {}
+    for uid, evs in by_player.items():
+        tid = player_team[uid]
+        eps = compute_discon_for_windows(evs, windows, include_leading_gap=True)
+        team_eps.setdefault(tid, []).extend(eps)
+
+    tname = _game_round_summary_table_name(game)
+    for tid in _active_game_team_ids(active_game):
+        label = format_discon_label(merge_episode_durations(team_eps.get(tid, [])))
+        db.execute(
+            text(f"UPDATE `{tname}` SET `team_{tid}` = :lbl WHERE round_name = :rn"),
+            {"lbl": label or None, "rn": rn},
+        )
+    db.commit()
 
 
 def _action_game_control_table_name(game: GamesList) -> str:
@@ -1128,10 +1672,27 @@ except Exception as e:
 # JWT settings (SECRET_KEY from env in production)
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+ACCESS_TOKEN_EXPIRE_MINUTES = 300  # 5h — full games can run ~3.5h
+SUPER_ADMIN_EMAIL = os.getenv("SUPER_ADMIN_EMAIL", "admin@silaquiz.com").strip().lower()
+SUPER_ADMIN_DEFAULT_PASSWORD = os.getenv("SUPER_ADMIN_DEFAULT_PASSWORD", "admin123")
+MYSQL_SETUP_HELP = (
+    "MySQL is not reachable. Install MySQL from https://dev.mysql.com/downloads/mysql/ "
+    "then set DATABASE_URL in .env (example: "
+    "mysql+pymysql://user:password@localhost:3306/game_sila_misly)."
+)
+
+
+class StartupFatalError(Exception):
+    """Fatal misconfiguration; server must not start."""
+
+
+@asynccontextmanager
+async def _app_lifespan(_app: FastAPI):
+    yield
+
 
 # FastAPI app
-app = FastAPI(title="Quze Game API", version="1.0.0")
+app = FastAPI(title="Quze Game API", version="1.0.0", lifespan=_app_lifespan)
 
 # CORS middleware (CORS_ORIGINS env: comma-separated, or "*" for allow-all)
 _cors_origins = os.getenv("CORS_ORIGINS", "*")
@@ -1171,11 +1732,14 @@ async def os_error_handler(request: Request, exc: OSError):
     # Re-raise other OS errors
     raise exc
 
+LOG_VERBOSE_HTTP = os.getenv("LOG_VERBOSE_HTTP", "0") == "1"
+
 # Request logging middleware
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    logger.info(f"Request: {request.method} {request.url}")
-    logger.info(f"Headers: {dict(request.headers)}")
+    logger.info(f"Request: {request.method} {request.url.path}")
+    if LOG_VERBOSE_HTTP:
+        logger.info(f"Headers: {dict(request.headers)}")
     try:
         response = await call_next(request)
         logger.info(f"Response: {response.status_code}")
@@ -1201,7 +1765,11 @@ class User(Base):
     email = Column(String(44), unique=True, index=True, nullable=False)
     password_hash = Column(String(255), nullable=False)
     name = Column(String(44), nullable=False)
-    role = Column(Enum('player', 'admin', name='user_roles'), default="player", nullable=False)
+    role = Column(
+        Enum('player', 'admin', 'super_admin', name='user_roles'),
+        default="player",
+        nullable=False,
+    )
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     playing_in_team_id = Column(String(6), nullable=True)  # Team ID(6 symbols) where the user is playing (null means not assigned to any team)
@@ -1250,11 +1818,133 @@ class GamesList(Base):
     game_description = Column(String(255), nullable=True)
     game_created_at = Column(DateTime, default=datetime.utcnow)
 
-# Create tables
-Base.metadata.create_all(bind=engine)
-Teams.metadata.create_all(bind=engine)
-ActiveGame.metadata.create_all(bind=engine)
-GamesList.metadata.create_all(bind=engine)
+def _ensure_mysql_database_exists() -> None:
+    """Create the database from DATABASE_URL if MySQL is up but schema is missing."""
+    try:
+        url = make_url(DATABASE_URL)
+    except Exception as e:
+        raise StartupFatalError(f"Invalid DATABASE_URL: {e}") from e
+    if not str(url.drivername).startswith("mysql"):
+        return
+    db_name = url.database
+    if not db_name:
+        return
+    server_url = url.set(database=None)
+    bootstrap = create_engine(server_url, pool_pre_ping=True)
+    try:
+        with bootstrap.connect() as conn:
+            conn.execute(
+                text(
+                    f"CREATE DATABASE IF NOT EXISTS `{db_name}` "
+                    "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                )
+            )
+            conn.commit()
+    except Exception as e:
+        raise StartupFatalError(f"{MYSQL_SETUP_HELP} Connection error: {e}") from e
+    finally:
+        bootstrap.dispose()
+
+
+def _ensure_user_role_enum(db: Session) -> None:
+    try:
+        db.execute(
+            text(
+                "ALTER TABLE users MODIFY COLUMN role "
+                "ENUM('player','admin','super_admin') NOT NULL DEFAULT 'player'"
+            )
+        )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.warning("users.role enum migration skipped or already applied: %s", e)
+
+
+def _bootstrap_super_admin_user(db: Session) -> None:
+    """
+    Ensure exactly one super_admin exists.
+    - >1 super_admin: fatal.
+    - ==1: skip default bootstrap (any email).
+    - ==0: create SUPER_ADMIN_EMAIL, replacing player/admin row at that email if needed.
+    """
+    super_count = db.query(User).filter(User.role == "super_admin").count()
+    if super_count > 1:
+        raise StartupFatalError(
+            "More than one super_admin user exists. Fix the users table manually."
+        )
+    if super_count == 1:
+        logger.info(
+            "super_admin already present (%s total); skipping default bootstrap",
+            super_count,
+        )
+        return
+
+    email = SUPER_ADMIN_EMAIL
+    existing = get_user_by_email(db, email)
+    if existing is not None and existing.role != "super_admin":
+        logger.warning(
+            "Recreating %s as super_admin (was %s)", email, existing.role
+        )
+        db.delete(existing)
+        db.commit()
+        existing = None
+
+    if existing is None:
+        existing = get_user_by_email(db, email)
+    if existing is None:
+        existing = User(
+            email=email,
+            password_hash=get_password_hash(SUPER_ADMIN_DEFAULT_PASSWORD),
+            name="Super Admin",
+            role="super_admin",
+            is_active=True,
+        )
+        db.add(existing)
+        db.commit()
+        db.refresh(existing)
+        logger.info("Created super_admin user %s", email)
+    elif existing.role != "super_admin":
+        existing.role = "super_admin"
+        db.commit()
+
+    final_count = db.query(User).filter(User.role == "super_admin").count()
+    if final_count != 1:
+        raise StartupFatalError(
+            f"Expected exactly 1 super_admin, found {final_count}."
+        )
+
+
+def _startup_fatal(message: str) -> None:
+    logger.error("STARTUP FAILED: %s", message)
+    print(f"\nQuze server startup failed:\n{message}\n")
+    sys.exit(1)
+
+
+def _initialize_database_on_startup() -> None:
+    try:
+        _ensure_mysql_database_exists()
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except StartupFatalError as e:
+        _startup_fatal(str(e))
+    except Exception as e:
+        _startup_fatal(f"{MYSQL_SETUP_HELP} Details: {e}")
+
+    Base.metadata.create_all(bind=engine)
+    Teams.metadata.create_all(bind=engine)
+    ActiveGame.metadata.create_all(bind=engine)
+    GamesList.metadata.create_all(bind=engine)
+
+    db = SessionLocal()
+    try:
+        _ensure_user_role_enum(db)
+    except Exception as e:
+        logger.warning("users.role enum migration: %s", e)
+    finally:
+        db.close()
+
+
+_initialize_database_on_startup()
 
 # Retrieve backup data on startup (if there's a running active game)
 try:
@@ -1291,7 +1981,7 @@ class UserResponse(BaseModel):
     role: str
     is_active: bool
     created_at: datetime
-    playing_in_team_id: constr(max_length=6)  # Team ID 6 symbols where the user is playing (Null means not assigned to any team)
+    playing_in_team_id: Optional[constr(max_length=6)] = None  # Team code/id when assigned to a team
     logged_in_at: datetime
     visible_connected: int  # 1 if user is connected and visible, 0 if disconnected or not visible
 
@@ -1424,6 +2114,21 @@ def authenticate_user(db: Session, email: str, password: str):
         return False
     return user
 
+
+def _finalize_super_admin_bootstrap() -> None:
+    db = SessionLocal()
+    try:
+        _bootstrap_super_admin_user(db)
+    except StartupFatalError as e:
+        _startup_fatal(str(e))
+    except Exception as e:
+        _startup_fatal(f"Database bootstrap failed: {e}")
+    finally:
+        db.close()
+
+
+_finalize_super_admin_bootstrap()
+
 # Generate unique team code (6 characters)
 def generate_team_code():
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
@@ -1468,6 +2173,117 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         # raise session_invalid_exception
     
     return user
+
+
+def _is_super_admin(user: User) -> bool:
+    return (user.role or "").strip() == "super_admin"
+
+
+def _is_game_admin(user: User) -> bool:
+    return user.role in ("admin", "super_admin")
+
+
+async def get_current_game_admin(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    if not _is_game_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return current_user
+
+
+async def get_current_super_admin(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    if not _is_super_admin(current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="Only the super admin can perform this action",
+        )
+    return current_user
+
+
+def _user_assigned_to_any_team(db: Session, user_id: int) -> Optional[str]:
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        return "User not found"
+    if user.playing_in_team_id and str(user.playing_in_team_id).strip():
+        return "User is still assigned to a team (playing_in_team_id)."
+    for team in db.query(Teams).all():
+        if team.team_captain == user_id:
+            return f"User is still captain of team {team.team_name}."
+        if team.writer_user_id == user_id:
+            return f"User is still writer for team {team.team_name}."
+        if team.team_members_ids:
+            member_ids = [
+                int(mid.strip())
+                for mid in team.team_members_ids.split(",")
+                if mid.strip().isdigit()
+            ]
+            if user_id in member_ids:
+                return f"User is still listed on team {team.team_name}."
+    return None
+
+
+def _detach_user_from_all_teams(db: Session, user_id: int) -> None:
+    """Remove user from roster/captain/writer on all teams; clear playing_in_team_id."""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        return
+    for team in db.query(Teams).all():
+        if team.team_captain == user_id:
+            team.team_captain = None
+        if team.writer_user_id == user_id:
+            team.writer_user_id = None
+        if team.team_members_ids:
+            member_ids = [
+                int(mid.strip())
+                for mid in team.team_members_ids.split(",")
+                if mid.strip().isdigit()
+            ]
+            if user_id in member_ids:
+                member_ids = [mid for mid in member_ids if mid != user_id]
+                team.team_members_ids = (
+                    ",".join(map(str, member_ids)) if member_ids else None
+                )
+    user.playing_in_team_id = None
+
+
+def _active_games_block_remove(db: Session) -> Optional[str]:
+    rows = db.query(ActiveGame).filter(ActiveGame.is_started != "idle").all()
+    if rows:
+        ids = ", ".join(str(r.id) for r in rows[:5])
+        return (
+            "Cannot remove user while a game is active or running "
+            f"(active_games not idle: {ids})."
+        )
+    return None
+
+
+def _user_still_connected(user: User, user_id: int) -> Optional[str]:
+    if manager.is_user_connected(user_id):
+        return "User is still connected (WebSocket). Ask them to sign out first."
+    if user.session_token and str(user.session_token).strip():
+        return "User still has an active session. They must sign out first."
+    if user.visible_connected and int(user.visible_connected) != 0:
+        return "User is still marked as connected on the server."
+    return None
+
+
+def _evaluate_user_remove_prechecks(db: Session, user_id: int) -> List[str]:
+    blockers: List[str] = []
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        return ["User not found"]
+    team_msg = _user_assigned_to_any_team(db, user_id)
+    if team_msg:
+        blockers.append(team_msg)
+    games_msg = _active_games_block_remove(db)
+    if games_msg:
+        blockers.append(games_msg)
+    conn_msg = _user_still_connected(user, user_id)
+    if conn_msg:
+        blockers.append(conn_msg)
+    return blockers
 
 
 def _game_name_to_safe(s: str) -> str:
@@ -2017,9 +2833,18 @@ def _persist_multislot_grade(
 
 
 def _coerce_kind_for_expected_slots(kind: str, pairs: List[Tuple[int, str]]) -> str:
-    """If answers_for_selection is blank/unrecognized but the game row has answer cells, grade as synonym text (=)."""
+    """
+    Admin suggestions / review UI only — not used for timer auto-grade.
+    If answers_for_selection is blank but the game row has answer cells, suggest synonym text (=).
+    """
     if pairs and kind == "none":
         return "equals"
+    return kind
+
+
+def _auto_grade_kind_from_answers_for_selection(raw) -> str:
+    """Timer auto-grade runs only for explicit =, Radio:, or List: in answers_for_selection."""
+    kind, _opts = _parse_answers_for_selection(raw)
     return kind
 
 
@@ -2352,18 +3177,24 @@ def _round_start_utc(
     round_name: str,
     fallback_events: Optional[List[dict]] = None,
 ) -> Optional[datetime]:
-    """Earliest timer_start for round from action_game_control (UTC)."""
-    table = _action_game_control_table_name(game)
-    if _action_game_control_table_exists(db, table):
-        row = db.execute(
-            text(f"SELECT MIN(timer_start) FROM `{table}` WHERE round_name = :rn"),
-            {"rn": round_name},
-        ).fetchone()
-        if row and row[0] is not None:
-            ts = row[0]
-            if isinstance(ts, datetime) and ts.tzinfo is None:
-                return ts.replace(tzinfo=timezone.utc)
-            return ts
+    """Round timeline zero: round slide (summary) aligned with action_game_control UTC."""
+    summary = _fetch_round_summary_for_name(db, game, round_name)
+    min_timer = _min_question_timer_start_utc(db, game, round_name)
+    if summary and summary.get("round_started_at") is not None:
+        summary_start = _te_normalize_utc(summary["round_started_at"])
+        if min_timer is not None:
+            skew = (min_timer - summary_start).total_seconds()
+            if skew > _ROUND_START_SUMMARY_MAX_SKEW_SEC:
+                logger.warning(
+                    "round_start skew for %r: summary=%s min_timer=%s; using min_timer",
+                    round_name,
+                    summary_start.isoformat(),
+                    min_timer.isoformat(),
+                )
+                return min_timer
+        return summary_start
+    if min_timer is not None:
+        return min_timer
     if fallback_events:
         first_ts = min(ev["timestamp"] for ev in fallback_events if ev.get("timestamp"))
         if isinstance(first_ts, datetime):
@@ -2371,6 +3202,136 @@ def _round_start_utc(
                 return first_ts.replace(tzinfo=timezone.utc)
             return first_ts
     return None
+
+
+DISCON_EVENT_REASONS: FrozenSet[str] = (
+    PLAYER_MATRIX_REASONS | frozenset({"connection", "disconnection"})
+)
+
+
+def _fetch_round_discon_events(
+    db: Session,
+    game: GamesList,
+    round_name: str,
+) -> List[dict]:
+    """Visibility + WebSocket connection rows for DISCON episode aggregation."""
+    game_name_safe = str(game.game_name).strip().lower().replace(" ", "_").replace("-", "_")
+    tname = f"active_round_tracking_{game_name_safe}"
+    exists = db.execute(
+        text(
+            "SELECT COUNT(*) FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :tn"
+        ),
+        {"tn": tname},
+    ).scalar()
+    if not exists:
+        return []
+    reasons = ", ".join(f"'{r}'" for r in sorted(DISCON_EVENT_REASONS))
+    rows = db.execute(
+        text(
+            f"""
+            SELECT team_id, user_id, reason, `timestamp`
+            FROM `{tname}`
+            WHERE round_name = :round_name AND reason IN ({reasons})
+            ORDER BY user_id ASC, `timestamp` ASC, id ASC
+            """
+        ),
+        {"round_name": round_name},
+    ).fetchall()
+    out: List[dict] = []
+    for row in rows:
+        ts = row[3]
+        if ts is not None and isinstance(ts, datetime) and ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        out.append(
+            {
+                "team_id": int(row[0]),
+                "user_id": int(row[1]),
+                "reason": str(row[2]),
+                "timestamp": ts,
+            }
+        )
+    return out
+
+
+def _discon_apply_event(attention_visible: bool, ws_connected: bool, reason: str) -> Tuple[bool, bool]:
+    av, ws = _te_apply_discon_event(attention_visible, ws_connected, reason)
+    if reason in PLAYER_MATRIX_VISIBLE:
+        av = True
+    elif reason in PLAYER_MATRIX_NOT_VISIBLE:
+        av = False
+    return av, ws
+
+
+def _discon_is_unavailable(attention_visible: bool, ws_connected: bool) -> bool:
+    return _te_is_unavailable(attention_visible, ws_connected)
+
+
+def _compute_completed_discon_episodes(
+    events: List[dict],
+    *,
+    count_until: datetime,
+    server_now: datetime,
+    scoring_windows: Optional[List[Tuple[datetime, datetime]]] = None,
+) -> List[Tuple[datetime, int]]:
+    """
+    Completed unavailability episodes inside scoring windows (closed episodes only).
+    Legacy count_until: caps each window end when no explicit windows passed.
+    """
+    if not events:
+        return []
+    until = _te_normalize_utc(count_until)
+    if scoring_windows:
+        capped: List[Tuple[datetime, datetime]] = []
+        for ws, we in scoring_windows:
+            capped.append((ws, min(_te_normalize_utc(we), until)))
+        return compute_discon_for_windows(events, capped, include_leading_gap=True)
+
+    sorted_events = sorted(
+        events,
+        key=lambda e: (e.get("timestamp") or datetime.min.replace(tzinfo=timezone.utc)),
+    )
+    attention_visible = True
+    ws_connected = True
+    in_episode = False
+    episode_start: Optional[datetime] = None
+    completed: List[Tuple[datetime, int]] = []
+    server_now_n = _te_normalize_utc(server_now)
+
+    for ev in sorted_events:
+        ts = ev.get("timestamp")
+        if ts is None:
+            continue
+        ts = _te_normalize_utc(ts)
+        if ts > until:
+            break
+
+        was_available = not _discon_is_unavailable(attention_visible, ws_connected)
+        attention_visible, ws_connected = _discon_apply_event(
+            attention_visible, ws_connected, str(ev["reason"])
+        )
+        now_available = not _discon_is_unavailable(attention_visible, ws_connected)
+
+        if was_available and not now_available:
+            in_episode = True
+            episode_start = ts
+        elif not was_available and now_available and in_episode and episode_start is not None:
+            dur = max(0, int((ts - episode_start).total_seconds()))
+            if dur > 0:
+                completed.append((episode_start, dur))
+            in_episode = False
+            episode_start = None
+
+    if in_episode and episode_start is not None and until < server_now_n:
+        dur = max(0, int((until - episode_start).total_seconds()))
+        if dur > 0:
+            completed.append((episode_start, dur))
+
+    return completed
+
+
+def _format_team_discon_label(episodes: List[Tuple[datetime, int]]) -> str:
+    return format_discon_label(episodes)
 
 
 def _fetch_round_visibility_events(
@@ -2423,14 +3384,12 @@ def _compute_player_tracking_cell(
     server_now: datetime,
     *,
     count_until: Optional[datetime] = None,
+    discon_events: Optional[List[dict]] = None,
+    scoring_windows: Optional[List[Tuple[datetime, datetime]]] = None,
 ) -> dict:
     """
-    Last state green/red from final visible/invisible/blur event.
-    Episode seconds: first blur/invisible in episode -> 0; second+ counts from first not-visible.
-    visible freezes duration until next episode.
-    count_until caps live counting when the relevant timer has ended or been stopped.
+    Cell color from last visible/invisible/blur; seconds = sum of DISCON episodes in scoring windows.
     """
-    effective_now = count_until if count_until is not None else server_now
     if not events:
         return {
             "last_reason": None,
@@ -2441,47 +3400,16 @@ def _compute_player_tracking_cell(
     last_reason = str(events[-1]["reason"])
     is_visible = last_reason in PLAYER_MATRIX_VISIBLE
 
-    frozen_seconds = 0
-    in_episode = False
-    episode_first_ts: Optional[datetime] = None
-    episode_not_visible_count = 0
-
-    for ev in events:
-        reason = str(ev["reason"])
-        ts = ev["timestamp"]
-        if reason in PLAYER_MATRIX_VISIBLE:
-            if (
-                in_episode
-                and episode_not_visible_count >= 2
-                and episode_first_ts is not None
-                and ts is not None
-            ):
-                cap_ts = ts if ts <= effective_now else effective_now
-                frozen_seconds = max(
-                    0, int((cap_ts - episode_first_ts).total_seconds())
-                )
-            in_episode = False
-            episode_first_ts = None
-            episode_not_visible_count = 0
-        elif reason in PLAYER_MATRIX_NOT_VISIBLE:
-            if not in_episode:
-                in_episode = True
-                episode_first_ts = ts
-                episode_not_visible_count = 1
-            else:
-                episode_not_visible_count += 1
-
-    invisible_seconds = frozen_seconds
-    if not is_visible and in_episode:
-        if (
-            episode_not_visible_count >= 2
-            and episode_first_ts is not None
-        ):
-            invisible_seconds = max(
-                0, int((effective_now - episode_first_ts).total_seconds())
-            )
-        else:
-            invisible_seconds = 0
+    invisible_seconds = 0
+    if discon_events and scoring_windows:
+        until = count_until if count_until is not None else server_now
+        eps = _compute_completed_discon_episodes(
+            discon_events,
+            count_until=until,
+            server_now=server_now,
+            scoring_windows=scoring_windows,
+        )
+        invisible_seconds = sum_episode_seconds(eps)
 
     return {
         "last_reason": last_reason,
@@ -2493,29 +3421,19 @@ def _compute_player_tracking_cell(
 def _build_player_tracking_graph_points(
     events: List[dict],
     round_start: Optional[datetime],
+    *,
+    round_end: Optional[datetime] = None,
+    scoring_windows: Optional[List[Tuple[datetime, datetime]]] = None,
+    discon_events: Optional[List[dict]] = None,
 ) -> List[dict]:
-    """Step graph: t_sec from round_start; y=+1 visible, -1 invisible/blur, 0 idle before first event."""
-    if not events or round_start is None:
-        return []
-    points: List[dict] = [{"t_sec": 0, "y": 0}]
-    for ev in events:
-        ts = ev.get("timestamp")
-        if ts is None:
-            continue
-        if isinstance(ts, datetime) and ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        t_sec = max(0, int((ts - round_start).total_seconds()))
-        reason = str(ev["reason"])
-        if reason in PLAYER_MATRIX_VISIBLE:
-            y = 1
-        elif reason in PLAYER_MATRIX_NOT_VISIBLE:
-            y = -1
-        else:
-            continue
-        if points[-1]["t_sec"] == t_sec and points[-1]["y"] == y:
-            continue
-        points.append({"t_sec": t_sec, "y": y})
-    return points
+    """Step graph with visibility + disconnect; classic mode clips to question timer segments."""
+    graph_events = discon_events if discon_events is not None else events
+    return graph_points_for_round(
+        graph_events,
+        round_start,
+        round_end,
+        scoring_segments=scoring_windows,
+    )
 
 
 def _build_round_player_tracking_matrix(
@@ -2565,19 +3483,45 @@ def _build_round_player_tracking_matrix(
         )
 
     teams_out: List[dict] = []
+    scoring_windows = _build_round_scoring_windows(db, game, round_name, server_time)
     count_until = _player_tracking_count_until(
         db, game.game_name, round_name, server_time
     )
+    discon_events = _fetch_round_discon_events(db, game, round_name)
+    discon_by_player: Dict[int, List[dict]] = {}
+    discon_player_team: Dict[int, int] = {}
+    for ev in discon_events:
+        uid = int(ev["user_id"])
+        discon_by_player.setdefault(uid, []).append(ev)
+        discon_player_team[uid] = int(ev["team_id"])
+
     for tm in teams_meta:
         tid = int(tm["team_id"])
         cells: List[dict] = []
         players_map: Dict[str, dict] = {}
+        team_episodes: List[Tuple[datetime, int]] = []
+        for uid, evs in discon_by_player.items():
+            if discon_player_team.get(uid) != tid:
+                continue
+            team_episodes.extend(
+                _compute_completed_discon_episodes(
+                    evs,
+                    count_until=count_until,
+                    server_now=server_time,
+                    scoring_windows=scoring_windows,
+                )
+            )
         for uid in player_ids:
             if player_team.get(uid) != tid:
                 continue
             evs = by_player.get(uid, [])
+            devs = discon_by_player.get(uid, [])
             cell = _compute_player_tracking_cell(
-                evs, server_time, count_until=count_until
+                evs,
+                server_time,
+                count_until=count_until,
+                discon_events=devs,
+                scoring_windows=scoring_windows,
             )
             cell_payload = {
                 "user_id": uid,
@@ -2592,6 +3536,7 @@ def _build_round_player_tracking_matrix(
                 "team_name": tm["team_name"],
                 "cells": cells,
                 "players": players_map,
+                "discon": _format_team_discon_label(team_episodes),
             }
         )
 
@@ -2647,11 +3592,22 @@ def _build_round_player_tracking_detail(
     user = db.query(User).filter(User.id == user_id).first()
     round_start = _round_start_utc(db, game, round_name, fallback_events=all_events)
     server_time = _utc_now()
+    scoring_windows = _build_round_scoring_windows(db, game, round_name, server_time)
+    summary = _fetch_round_summary_for_name(db, game, round_name)
+    round_end = summary.get("round_ended_at") if summary else None
+    if round_end is None and scoring_windows:
+        round_end = max(we for _, we in scoring_windows)
+    discon_player = _fetch_round_discon_events(db, game, round_name)
+    discon_player = [ev for ev in discon_player if int(ev["user_id"]) == int(user_id)]
     count_until = _player_tracking_count_until(
         db, game.game_name, round_name, server_time
     )
     cell = _compute_player_tracking_cell(
-        player_events, server_time, count_until=count_until
+        player_events,
+        server_time,
+        count_until=count_until,
+        discon_events=discon_player,
+        scoring_windows=scoring_windows,
     )
 
     events_out: List[dict] = []
@@ -2677,7 +3633,13 @@ def _build_round_player_tracking_detail(
         "round_start_utc": round_start.isoformat() if round_start else None,
         **cell,
         "events": events_out,
-        "graph_points": _build_player_tracking_graph_points(player_events, round_start),
+        "graph_points": _build_player_tracking_graph_points(
+            player_events,
+            round_start,
+            round_end=round_end,
+            scoring_windows=scoring_windows,
+            discon_events=discon_player,
+        ),
     }
 
 
@@ -3649,8 +4611,7 @@ def _auto_grade_single_team_question(
     k = len(pairs)
     if k == 0:
         return False
-    kind, _opts = _parse_answers_for_selection(afs)
-    kind = _coerce_kind_for_expected_slots(kind, pairs)
+    kind = _auto_grade_kind_from_answers_for_selection(afs)
     if kind == "none":
         return False
     expected_cells = [p[1] for p in pairs]
@@ -3718,8 +4679,7 @@ def _auto_grade_round_multislot(
         k = len(pairs)
         if k == 0:
             continue
-        kind, _ = _parse_answers_for_selection(afs)
-        kind = _coerce_kind_for_expected_slots(kind, pairs)
+        kind = _auto_grade_kind_from_answers_for_selection(afs)
         if kind == "none":
             continue
         expected_cells = [p[1] for p in pairs]
@@ -3882,7 +4842,7 @@ async def login_user(user_credentials: UserLogin, db: Session = Depends(get_db))
     if not user.is_active:
         raise HTTPException(
             status_code=400,
-            detail="Inactive user"
+            detail="Account deactivated",
         )
     
     # Generate new session token (this will invalidate any previous session)
@@ -3999,27 +4959,32 @@ async def logout_user(
         raise HTTPException(status_code=500, detail="Logout failed")
 
 @app.post("/api/admin/init-db")
-async def initialize_database(db: Session = Depends(get_db)):
-    """Initialize database with admin users"""
+async def initialize_database(
+    db: Session = Depends(get_db),
+    _super: User = Depends(get_current_super_admin),
+):
+    """Ensure super_admin bootstrap (legacy endpoint)."""
     try:
-        # Check if admin user exists
-        admin_user = get_user_by_email(db, "admin@silaquiz.com")
-        if not admin_user:
-            admin_user = User(
-                email="admin@silaquiz.com",
-                password_hash=get_password_hash("admin123"),
-                name="Admin User",
-                role="admin"
-            )
-            db.add(admin_user)
-        db.commit()
+        _bootstrap_super_admin_user(db)
         return {"message": "Database for Admin initialized successfully"}
+    except StartupFatalError as e:
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database initialization failed: {str(e)}")
 
 @app.get("/api/users/me", response_model=UserResponse)
 async def read_users_me(current_user: User = Depends(get_current_user)):
-    return current_user
+    return UserResponse(
+        id=current_user.id,
+        email=current_user.email,
+        name=current_user.name,
+        role=current_user.role,
+        is_active=current_user.is_active,
+        created_at=current_user.created_at,
+        playing_in_team_id=current_user.playing_in_team_id,
+        logged_in_at=current_user.logged_in_at,
+        visible_connected=current_user.visible_connected,
+    )
 
 
 @app.put("/api/users/{user_id}/profile", response_model=dict)
@@ -4292,7 +5257,10 @@ async def get_active_game(game_id: int, db: Session = Depends(get_db)):
 
 # Admin APIs for User Management
 @app.get("/api/admin/users", response_model=List[dict])
-async def get_all_users(db: Session = Depends(get_db)):
+async def get_all_users(
+    db: Session = Depends(get_db),
+    _admin: User = Depends(get_current_game_admin),
+):
     """
     Get all users for admin management
     """
@@ -4316,21 +5284,17 @@ async def get_all_users(db: Session = Depends(get_db)):
                 "team_name": None,
             }
             
-            # Check if user is a team captain
-            if user.playing_in_team_id:
-                team = db.query(Teams).filter(Teams.team_captain == user.id).first()
-                if team:
-                    user_data["is_captain"] = True
-                    user_data["team_name"] = team.team_name
-                else:
-                    # Check if user is in team_members_ids
-                    teams = db.query(Teams).all()
-                    for team in teams:
-                        if team.team_members_ids:
-                            member_ids = [int(mid.strip()) for mid in team.team_members_ids.split(',') if mid.strip().isdigit()]
-                            if user.id in member_ids and str(user.id) == user.playing_in_team_id:
-                                user_data["team_name"] = team.team_name
-                                break
+            captain_team = db.query(Teams).filter(Teams.team_captain == user.id).first()
+            if captain_team:
+                user_data["is_captain"] = True
+                user_data["team_name"] = captain_team.team_name
+            elif user.playing_in_team_id:
+                team_id = _resolve_user_team_id_int(user, db)
+                if team_id:
+                    team = db.query(Teams).filter(Teams.id == team_id).first()
+                    if team:
+                        user_data["team_name"] = team.team_name
+                        user_data["is_captain"] = team.team_captain == user.id
             
             result.append(user_data)
         
@@ -4367,7 +5331,11 @@ async def get_all_teams(db: Session = Depends(get_db)):
         return []
 
 @app.post("/api/admin/teams", response_model=dict)
-async def create_team(team_data: TeamCreate, db: Session = Depends(get_db)):
+async def create_team(
+    team_data: TeamCreate,
+    db: Session = Depends(get_db),
+    _super: User = Depends(get_current_super_admin),
+):
     """
     Create a new team
     """
@@ -4427,7 +5395,12 @@ class TeamUpdate(BaseModel):
     team_captain: Optional[int] = None
 
 @app.put("/api/admin/teams/{team_id}", response_model=dict)
-async def update_team(team_id: int, team_data: TeamUpdate, db: Session = Depends(get_db)):
+async def update_team(
+    team_id: int,
+    team_data: TeamUpdate,
+    db: Session = Depends(get_db),
+    _super: User = Depends(get_current_super_admin),
+):
     """
     Update team information (name, city, captain)
     """
@@ -4446,13 +5419,29 @@ async def update_team(team_id: int, team_data: TeamUpdate, db: Session = Depends
         
         # Update team captain if provided
         if team_data.team_captain is not None:
-            # Validate that the captain is a member of the team
+            new_captain_id = int(team_data.team_captain)
+            member_ids: list[int] = []
             if team.team_members_ids:
-                member_ids = [int(mid.strip()) for mid in team.team_members_ids.split(',') if mid.strip().isdigit()]
-                if team_data.team_captain not in member_ids:
-                    return {"success": False, "message": "Captain must be a member of the team"}
-            
-            team.team_captain = team_data.team_captain
+                member_ids = [
+                    int(mid.strip())
+                    for mid in team.team_members_ids.split(",")
+                    if mid.strip().isdigit()
+                ]
+            if new_captain_id not in member_ids:
+                member_ids.append(new_captain_id)
+                team.team_members_ids = ",".join(str(i) for i in member_ids)
+
+            captain_user = db.query(User).filter(User.id == new_captain_id).first()
+            if not captain_user:
+                return {"success": False, "message": "Captain user not found"}
+            if captain_user.role != "player":
+                return {
+                    "success": False,
+                    "message": "Team captain must be a player account",
+                }
+
+            team.team_captain = new_captain_id
+            captain_user.playing_in_team_id = str(team.id)
         
         db.commit()
         
@@ -6051,7 +7040,7 @@ async def post_question_review_batch(
     current_user: User = Depends(get_current_user),
 ):
     try:
-        if current_user.role != "admin":
+        if not _is_game_admin(current_user):
             return {"success": False, "message": "Admin access required"}
         active_game = db.query(ActiveGame).filter(ActiveGame.id == active_game_id).first()
         if not active_game:
@@ -6115,7 +7104,7 @@ async def post_round_list_review_batch(
     current_user: User = Depends(get_current_user),
 ):
     try:
-        if current_user.role != "admin":
+        if not _is_game_admin(current_user):
             return {"success": False, "message": "Admin access required"}
         active_game = db.query(ActiveGame).filter(ActiveGame.id == active_game_id).first()
         if not active_game:
@@ -6166,7 +7155,7 @@ async def post_admin_grade(
 ):
     """Persist admin manual grade (is_correct slots, optional player answers, final_score)."""
     try:
-        if current_user.role != "admin":
+        if not _is_game_admin(current_user):
             return {"success": False, "message": "Admin access required"}
 
         active_game = db.query(ActiveGame).filter(ActiveGame.id == active_game_id).first()
@@ -6514,6 +7503,8 @@ async def resume_active_game(active_game_id: int, db: Session = Depends(get_db))
         if game:
             gname = str(game.game_name).replace(" ", "_").replace("-", "_").lower()
             ensure_active_round_tracking_table(db, gname)
+            create_action_game_control_table(active_game_id, db)
+            ensure_game_round_summary_table(db, active_game)
         # Update game status to running
         active_game.is_started = 'running'
         active_game.timer_on_at = datetime.utcnow()
@@ -6606,6 +7597,8 @@ async def run_active_game(active_game_id: int, db: Session = Depends(get_db)):
         if game:
             game_name = game.game_name.replace(' ', '_').replace('-', '_').lower()
             ensure_active_round_tracking_table(db, game_name)
+            create_action_game_control_table(active_game_id, db)
+            ensure_game_round_summary_table(db, active_game)
             scores_table_name = f"active_new_scores_{game_name}"
             
             # Remove all unselected bonus options (where player_approved IS NULL)
@@ -7205,59 +8198,58 @@ class ConnectionManager:
         else:
             logger.warning(f"User {user_id} not connected, cannot send message")
 
+    async def _send_broadcast_to_connection(self, connection_id: str, websocket: WebSocket, message: str) -> bool:
+        try:
+            await websocket.send_text(message)
+            return True
+        except (ConnectionResetError, BrokenPipeError, OSError) as e:
+            logger.debug(
+                "Client %s disconnected during broadcast: %s",
+                connection_id,
+                type(e).__name__,
+            )
+        except Exception as e:
+            logger.error("Error broadcasting to %s: %s", connection_id, e)
+        self._remove_connection(connection_id)
+        return False
+
+    def _remove_connection(self, connection_id: str) -> None:
+        try:
+            if connection_id in self.active_connections:
+                del self.active_connections[connection_id]
+            user_id_to_remove = None
+            for uid, cid in self.user_connections.items():
+                if cid == connection_id:
+                    user_id_to_remove = uid
+                    break
+            if user_id_to_remove is not None:
+                del self.user_connections[user_id_to_remove]
+        except Exception as cleanup_error:
+            logger.debug("Error cleaning up connection %s: %s", connection_id, cleanup_error)
+
     async def broadcast_to_all_players(self, message: str):
-        """Broadcast message to all connected players one by one"""
-        logger.info(f"Broadcasting message to all players. Active connections: {len(self.active_connections)}")
-        logger.info(f"Active connection IDs: {list(self.active_connections.keys())}")
-        logger.info(f"User connections mapping: {self.user_connections}")
-        
-        if len(self.active_connections) == 0:
+        """Broadcast message to all connected players in parallel."""
+        conn_items = list(self.active_connections.items())
+        conn_count = len(conn_items)
+        logger.info("Broadcasting to %s player connection(s)", conn_count)
+
+        if conn_count == 0:
             logger.warning("No active WebSocket connections to broadcast to!")
             return
-        
-        sent_count = 0
-        for connection_id, websocket in self.active_connections.items():
-            try:
-                logger.info(f"Sending message to connection {connection_id}")
-                logger.info(f"Message content: {message}")
-                await websocket.send_text(message)
-                sent_count += 1
-                logger.info(f"Message successfully sent to {connection_id}")
-            except (ConnectionResetError, BrokenPipeError, OSError) as e:
-                # Client disconnected abruptly - this is normal and not an error
-                logger.debug(f"Client {connection_id} disconnected during broadcast: {type(e).__name__}")
-                # Remove failed connection
-                try:
-                    del self.active_connections[connection_id]
-                    # Also remove from user_connections if it exists
-                    user_id_to_remove = None
-                    for uid, cid in self.user_connections.items():
-                        if cid == connection_id:
-                            user_id_to_remove = uid
-                            break
-                    if user_id_to_remove:
-                        del self.user_connections[user_id_to_remove]
-                    logger.debug(f"Removed disconnected connection {connection_id}")
-                except Exception as cleanup_error:
-                    logger.debug(f"Error cleaning up disconnected connection {connection_id}: {cleanup_error}")
-            except Exception as e:
-                logger.error(f"Error broadcasting to {connection_id}: {e}")
-                # Remove failed connection
-                try:
-                    del self.active_connections[connection_id]
-                    # Also remove from user_connections if it exists
-                    user_id_to_remove = None
-                    for uid, cid in self.user_connections.items():
-                        if cid == connection_id:
-                            user_id_to_remove = uid
-                            break
-                    if user_id_to_remove:
-                        del self.user_connections[user_id_to_remove]
-                    logger.info(f"Removed failed connection {connection_id}")
-                except Exception as cleanup_error:
-                    logger.error(f"Error cleaning up failed connection {connection_id}: {cleanup_error}")
-        
-        logger.info(f"Broadcast completed: {sent_count} messages sent out of {len(self.active_connections)} connections")
+
+        results = await asyncio.gather(
+            *[
+                self._send_broadcast_to_connection(connection_id, websocket, message)
+                for connection_id, websocket in conn_items
+            ],
+            return_exceptions=True,
+        )
+        sent_count = sum(1 for r in results if r is True)
+        logger.info(
+            "Broadcast completed: %s messages sent (attempted %s)",
+            sent_count,
+            conn_count,
+        )
 
     def get_connection_stats(self) -> dict:
         """Get connection statistics"""
@@ -7309,18 +8301,125 @@ class TimerTriggerResponse(BaseModel):
 # Initialize connection manager
 manager = ConnectionManager()
 
+
+@app.get("/api/admin/users/{user_id}/remove-precheck", response_model=dict)
+async def precheck_remove_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_game_admin),
+):
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        return {"success": False, "can_remove": False, "blockers": ["User not found"]}
+
+    if _is_super_admin(target):
+        return {
+            "success": False,
+            "can_remove": False,
+            "blockers": ["The super admin account cannot be removed."],
+        }
+
+    if _is_super_admin(current_user):
+        if user_id == current_user.id:
+            return {
+                "success": False,
+                "can_remove": False,
+                "blockers": ["Super admin cannot remove their own account."],
+            }
+    elif current_user.role == "admin":
+        if user_id != current_user.id:
+            return {
+                "success": False,
+                "can_remove": False,
+                "blockers": ["Only the super admin can remove other users."],
+            }
+        if target.role == "admin":
+            return {
+                "success": False,
+                "can_remove": False,
+                "blockers": ["Change this admin to player before removal."],
+            }
+    else:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    blockers = _evaluate_user_remove_prechecks(db, user_id)
+    return {
+        "success": True,
+        "can_remove": len(blockers) == 0,
+        "blockers": blockers,
+    }
+
+
+@app.post("/api/admin/users/{user_id}/remove", response_model=dict)
+async def remove_user_admin(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_game_admin),
+):
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        return {"success": False, "message": "User not found"}
+
+    if _is_super_admin(target):
+        return {"success": False, "message": "The super admin account cannot be removed."}
+
+    if _is_super_admin(current_user):
+        if user_id == current_user.id:
+            return {"success": False, "message": "Super admin cannot remove their own account."}
+    elif current_user.role == "admin":
+        if user_id != current_user.id:
+            return {"success": False, "message": "Only the super admin can remove other users."}
+        if target.role == "admin":
+            return {
+                "success": False,
+                "message": "Change this admin to player before removal.",
+            }
+    else:
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    blockers = _evaluate_user_remove_prechecks(db, user_id)
+    if blockers:
+        return {"success": False, "message": blockers[0], "blockers": blockers}
+
+    try:
+        await manager.force_disconnect_user(user_id, db)
+        target.session_token = None
+        db.commit()
+        db.delete(target)
+        db.commit()
+        return {"success": True, "message": "User removed"}
+    except Exception as e:
+        logger.error("remove user %s: %s", user_id, e)
+        db.rollback()
+        return {"success": False, "message": f"Error removing user: {e}"}
+
+
 @app.put("/api/admin/users/{user_id}", response_model=dict)
-async def update_user_admin(user_id: int, user_data: AdminUserUpdate, db: Session = Depends(get_db)):
+async def update_user_admin(
+    user_id: int,
+    user_data: AdminUserUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_game_admin),
+):
     """
     Update user information by admin
     """
     try:
+        if not _is_super_admin(current_user):
+            raise HTTPException(
+                status_code=403,
+                detail="Only the super admin can edit or deactivate users",
+            )
+
         logger.info(f"Admin updating user {user_id}")
         
         # Get the user
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
             return {"success": False, "message": "User not found"}
+
+        if user_id == current_user.id and user_data.is_active is False:
+            return {"success": False, "message": "Super admin cannot deactivate their own account."}
         
         # Update fields if provided
         if user_data.name is not None:
@@ -7335,55 +8434,31 @@ async def update_user_admin(user_id: int, user_data: AdminUserUpdate, db: Sessio
         
         if user_data.password is not None:
             user.password_hash = get_password_hash(user_data.password)
-        
-        if user_data.role is not None:
-            if user_data.role not in ['player', 'admin']:
-                return {"success": False, "message": "Invalid role. Must be 'player' or 'admin'"}
-            user.role = user_data.role
-        
+
         if user_data.is_active is not None:
+            if not user_data.is_active and user.is_active:
+                await manager.force_disconnect_user(user_id, db)
+                user.session_token = None
             user.is_active = user_data.is_active
         
         if user_data.playing_in_team_id is not None:
+            effective_role = (
+                user_data.role if user_data.role is not None else user.role
+            )
+            if effective_role == "admin" and user_data.playing_in_team_id != "":
+                return {
+                    "success": False,
+                    "message": "Admin users cannot be assigned to a team.",
+                }
+
             # Handle team removal (set to empty/null)
             if user_data.playing_in_team_id == "":
-                logger.info(f"Removing user {user_id} from team. Current team: {user.playing_in_team_id}")
-                
-                # Remove user from their current team if they have one
-                if user.playing_in_team_id and user.playing_in_team_id.strip():
-                    # Try to find team by team_code first
-                    current_team = db.query(Teams).filter(Teams.team_code == user.playing_in_team_id).first()
-                    
-                    # If not found by team_code, try by team_id (in case playing_in_team_id contains team ID)
-                    if not current_team:
-                        try:
-                            team_id_int = int(user.playing_in_team_id)
-                            current_team = db.query(Teams).filter(Teams.id == team_id_int).first()
-                        except (ValueError, TypeError):
-                            pass
-                    
-                    if current_team:
-                        logger.info(f"Found current team: {current_team.team_name} (ID: {current_team.id})")
-                        
-                        # Remove user from team_members_ids
-                        if current_team.team_members_ids:
-                            member_ids = [int(mid.strip()) for mid in current_team.team_members_ids.split(',') if mid.strip().isdigit()]
-                            logger.info(f"Current team members: {member_ids}")
-                            member_ids = [mid for mid in member_ids if mid != user_id]
-                            current_team.team_members_ids = ','.join(map(str, member_ids)) if member_ids else None
-                            logger.info(f"Updated team members: {current_team.team_members_ids}")
-                        
-                        # Remove user from team_captain if they were the captain
-                        if current_team.team_captain == user_id:
-                            logger.info(f"Removing user {user_id} from team captain role")
-                            current_team.team_captain = None
-                    else:
-                        logger.warning(f"Current team not found for code: {user.playing_in_team_id}")
-                else:
-                    logger.info(f"User {user_id} has no current team to remove from")
-                
-                user.playing_in_team_id = None
-                logger.info(f"Set user {user_id} playing_in_team_id to None")
+                logger.info(
+                    "Removing user %s from all teams (was playing_in_team_id=%s)",
+                    user_id,
+                    user.playing_in_team_id,
+                )
+                _detach_user_from_all_teams(db, user_id)
             else:
                 # Handle team assignment
                 # First, remove user from their current team if they have one
@@ -7424,6 +8499,25 @@ async def update_user_admin(user_id: int, user_data: AdminUserUpdate, db: Sessio
                         team.team_members_ids = ','.join(map(str, member_ids))
                 else:
                     team.team_members_ids = str(user_id)
+
+        if user_data.role is not None:
+            if _is_super_admin(user):
+                return {"success": False, "message": "Cannot change the super admin role."}
+            if user_data.role not in ["player", "admin"]:
+                return {"success": False, "message": "Invalid role. Must be 'player' or 'admin'"}
+            if user_data.role == "admin" and user.role != "admin":
+                team_msg = _user_assigned_to_any_team(db, user_id)
+                if team_msg:
+                    return {
+                        "success": False,
+                        "message": (
+                            "Cannot assign the admin role while this user is on a team. "
+                            "Remove them from the team first; if they are captain, the team "
+                            "captain slot is cleared when they are removed."
+                        ),
+                        "blockers": [team_msg],
+                    }
+            user.role = user_data.role
         
         db.commit()
         
@@ -7552,6 +8646,45 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
         db.close()
 
 # Timer trigger API endpoint
+async def _persist_timer_trigger_state(
+    active_game_id: int,
+    pending_grade_qid: int,
+    pending_grade_round: str,
+    game_table_name: str,
+    game_name_safe: str,
+) -> None:
+    """Persist timer state and run STOP/PAUSE grading after broadcast (non-blocking)."""
+    db = SessionLocal()
+    try:
+        active_game = db.query(ActiveGame).filter(ActiveGame.id == active_game_id).first()
+        if not active_game:
+            logger.warning(
+                "persist_timer_trigger_state: active game %s not found",
+                active_game_id,
+            )
+            return
+        _save_last_timer_setting_to_db(active_game_id, db)
+        _save_rounds_info_to_db(active_game_id, db)
+        if pending_grade_qid > 0 or pending_grade_round:
+            try:
+                _apply_grading_on_timer_end(
+                    db,
+                    active_game,
+                    game_table_name,
+                    game_name_safe,
+                    question_id=pending_grade_qid,
+                    round_name=pending_grade_round,
+                )
+            except Exception as e:
+                logger.exception("Timer-end grading on STOP/PAUSE failed: %s", e)
+                try:
+                    db.rollback()
+                except Exception:  # noqa: S110
+                    pass
+    finally:
+        db.close()
+
+
 @app.post("/api/timer/trigger", response_model=TimerTriggerResponse)
 async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_db)):
     """
@@ -7777,12 +8910,12 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
             question_timer = 0
             pass
 
-        # Server timer: cancel previous auto-STOP / auto-grade, update windows
+        # Server timer: cancel previous auto-STOP, update windows
         pending_grade_qid = 0
         pending_grade_round = ""
         _cancel_pending_server_stop()
-        _cancel_pending_auto_grade()
         if timer_action == "START_TIME" and question_timer > 0 and _id > 0:
+            _cancel_pending_auto_grade()
             _set_server_answer_window(
                 ts_utc,
                 ts_utc + timedelta(seconds=question_timer),
@@ -7802,8 +8935,6 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
                         _question_track_round_name or round_name,
                         ts_utc,
                     )
-            else:
-                pending_grade_round = (round_name or _round_track_round_name or "").strip()
             if _round_track_active and _round_track_ends_at is not None:
                 _freeze_round_final_tracking_count(
                     _round_track_round_name or round_name,
@@ -7813,9 +8944,21 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
             # Per-slide STOP: keep round tracking open between questions (type_game != 0).
             # Clear round window only when LAST countdown was active (STOP ends the round early).
             if _round_track_active and _round_track_ends_at is not None:
+                rn_end = (round_name or _round_track_round_name or "").strip()
+                if rn_end:
+                    _set_round_summary_ended(db, active_game, game, rn_end, ts_utc)
+                    _materialize_round_summary_discon(db, active_game, game, rn_end)
                 _clear_round_track_window()
+            if type_game != 0 and not _round_scope_still_open():
+                pending_grade_round = (
+                    round_name or _round_track_round_name or ""
+                ).strip()
+            if pending_grade_qid > 0 or pending_grade_round:
+                _cancel_pending_auto_grade()
         elif timer_action == "LAST_TIMER":
             _clear_server_answer_window()
+            if _timer != 0:
+                _cancel_pending_auto_grade()
 
         event_id = str(uuid.uuid4())
         duration_seconds = 0
@@ -7826,6 +8969,45 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
         elif timer_action == "LAST_TIMER" and _timer != 0:
             duration_seconds = abs(int(_timer))
             timer_end_utc = ts_utc + timedelta(seconds=duration_seconds)
+
+        if timer_end_utc is not None and timer_action == "START_TIME":
+            try:
+                te_naive = timer_end_utc.replace(tzinfo=None)
+                db.execute(
+                    text(
+                        f"""
+                        UPDATE `{control_table_name}`
+                        SET timer_end = :te
+                        WHERE slide_number = :slide_num
+                        """
+                    ),
+                    {"te": te_naive, "slide_num": slide_number},
+                )
+                db.commit()
+            except Exception as e:
+                logger.warning("Could not persist timer_end for slide %s: %s", slide_number, e)
+                try:
+                    db.rollback()
+                except Exception:  # noqa: S110
+                    pass
+
+        round_key_for_summary = None
+        for key, value in rounds_info.items():
+            if value.get("Name") == round_name:
+                round_key_for_summary = key
+                break
+        if timer_action == "START_TIME" and round_key_for_summary:
+            ensure_game_round_summary_table(db, active_game)
+            _upsert_round_summary_started(
+                db,
+                active_game,
+                game,
+                round_key_for_summary,
+                round_name,
+                None,
+                ts_utc,
+                update_slide=False,
+            )
 
         # Round-scoped player tracking (type_game != 0): window_id fixed for the round until STOP / LAST end
         if timer_action == "START_TIME" and _id > 0 and _timer != 0:
@@ -7839,6 +9021,8 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
                 _round_track_round_name = round_name
                 _round_track_window_id = f"{active_game.id}:{round_name}:r:{int(ts_utc.timestamp())}"
                 _round_track_ends_at = None
+            # Keep round_mode true in /timer/active between per-question slides (before LAST).
+            _round_track_final_timer = int(_timer)
         if timer_action == "LAST_TIMER":
             if _timer != 0 and timer_end_utc is not None:
                 _round_track_ends_at = timer_end_utc
@@ -7865,12 +9049,26 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
         }
         if timer_end_str is not None:
             broadcast_obj["timer_end"] = timer_end_str
+        if timer_action in ("STOP_TIMER", "PAUSE_TIMER"):
+            broadcast_obj["round_scope_open"] = _round_scope_still_open()
         broadcast_message = json.dumps(broadcast_obj)
+
+        last_timer_setting = {
+            "timer_action": timer_action,
+            "slide_number": slide_number,
+            "round_name": round_name,
+            "timer_start": timer_start_str,
+            "question_id": _id,
+            "final_timer": _timer,
+            "question_timer": question_timer,
+            "event_id": event_id,
+            "duration_seconds": duration_seconds,
+            "timer_end": timer_end_str,
+        }
+        logger.info("Timer trigger event_id=%s action=%s slide=%s", event_id, timer_action, slide_number)
 
         if broadcast_message:
             await manager.broadcast_to_all_players(broadcast_message)
-            logger.info(f"Timer '{timer_action}' triggered for slide {slide_number} and round: {round_name},"
-                        f" broadcasted to {len(manager.active_connections)} connections")
         else:
             logger.warning(f"Timer '{timer_action}' triggered but no broadcast message was sent")
 
@@ -7887,20 +9085,12 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
                     question_id=int(_id) if expired_kind == "question" else 0,
                     final_timer=int(_timer),
                     active_game_id=active_game.id,
+                    game_table_name=game_table_name,
+                    game_name_safe=game_name_safe,
                 )
             )
             grade_delay = delay + AUTO_GRADE_DELAY_SEC
-            if timer_action == "START_TIME" and _id > 0 and _timer == 0:
-                _pending_auto_grade_task = asyncio.create_task(
-                    _run_scheduled_auto_grade_question(
-                        float(grade_delay),
-                        active_game.id,
-                        game_table_name,
-                        game_name_safe,
-                        _id,
-                    )
-                )
-            elif timer_action == "LAST_TIMER" and _timer != 0:
+            if timer_action == "LAST_TIMER" and _timer != 0:
                 _pending_auto_grade_task = asyncio.create_task(
                     _run_scheduled_auto_grade_round(
                         float(grade_delay),
@@ -7911,42 +9101,16 @@ async def trigger_timer(request: TimerTriggerRequest, db: Session = Depends(get_
                     )
                 )
 
-        last_timer_setting = {
-            "timer_action": timer_action,
-            "slide_number": slide_number,
-            "round_name": round_name,
-            "timer_start": timer_start_str,
-            "question_id": _id,
-            "final_timer": _timer,
-            "question_timer": question_timer,
-            "event_id": event_id,
-            "duration_seconds": duration_seconds,
-            "timer_end": timer_end_str,
-        }
-        logger.info(f">>>>>>> SET >>>>>>> - last_timer_setting value: {last_timer_setting}") #
-        logger.info(f">>>>>>> DATA in END >>>>>>> - rounds_info value: {rounds_info}")
-        
-        # Save both to database
-        _save_last_timer_setting_to_db(active_game.id, db)
-        _save_rounds_info_to_db(active_game.id, db)
+        asyncio.create_task(
+            _persist_timer_trigger_state(
+                active_game.id,
+                pending_grade_qid,
+                pending_grade_round,
+                game_table_name,
+                game_name_safe,
+            )
+        )
 
-        if pending_grade_qid > 0 or pending_grade_round:
-            try:
-                _apply_grading_on_timer_end(
-                    db,
-                    active_game,
-                    game_table_name,
-                    game_name_safe,
-                    question_id=pending_grade_qid,
-                    round_name=pending_grade_round,
-                )
-            except Exception as e:
-                logger.exception("Timer-end grading on STOP/PAUSE failed: %s", e)
-                try:
-                    db.rollback()
-                except Exception:  # noqa: S110
-                    pass
-        
         return TimerTriggerResponse(
             success=True,
             message=f"Timer {timer_action} triggered successfully",
@@ -8286,6 +9450,38 @@ async def be_ready_to_start(
             
             # Save rounds_info to database
             _save_rounds_info_to_db(active_game.id, db)
+
+            game = db.query(GamesList).filter(GamesList.id == active_game.game_id).first()
+            if game:
+                create_action_game_control_table(active_game.id, db)
+                # Same UTC clock as START_TIMER (_utc_now), not VBA #at# local wall time.
+                started_at = _utc_now()
+                try:
+                    slide_int = int(slide_number)
+                except (TypeError, ValueError):
+                    slide_int = None
+                _upsert_round_summary_started(
+                    db,
+                    active_game,
+                    game,
+                    round_number,
+                    round_data["Name"],
+                    slide_int,
+                    started_at,
+                    update_slide=True,
+                )
+                type_game = _resolve_type_game_for_round(
+                    db, game.game_name, round_data["Name"]
+                )
+                prev_rn = (_round_track_round_name or "").strip()
+                new_rn = (round_data["Name"] or "").strip()
+                if prev_rn and prev_rn != new_rn:
+                    _finalize_round_tracking_and_summary(
+                        db, active_game, game, prev_rn, _utc_now()
+                    )
+                _activate_round_tracking_window(
+                    active_game.id, new_rn, started_at, type_game
+                )
             
             # Update active_teams_answers table with all questions for each team
             try:
@@ -8379,21 +9575,6 @@ async def toggle_writer_status(
         logger.error(f"Error toggling writer status: {e}")
         db.rollback()
         return {"success": False, "message": f"Error toggling writer status: {str(e)}"}
-
-@app.get("/api/round/{round_id}")
-async def test_rounds_query(round_id: int):
-    """
-    Get data about the specific round
-    """
-    if rounds_info.get(f"round_{round_id}") is not None:
-        return {
-            "success": True,
-            "round_name": rounds_info[f"round_{id}"]["Name"],
-            "round_slide": rounds_info[f"round_{id}"]["Slide"],
-            "round_time": rounds_info[f"round_{id}"]["time_now"]
-        }
-    else:
-        return {"success": False, "message": "Round not found"}
 
 def _game_question_dict_one_row_round(
     row: tuple,
@@ -8788,7 +9969,7 @@ async def get_team_answers_for_game(
         game_table = game.game_name if game else None
         
         # Verify user has access (admin or belongs to the team)
-        if current_user.role != 'admin':
+        if not _is_game_admin(current_user):
             # Check if user belongs to the requested team
             try:
                 user_team_id = int(current_user.playing_in_team_id) if current_user.playing_in_team_id else None
@@ -8810,7 +9991,7 @@ async def get_team_answers_for_game(
         result = db.execute(query_sql, {"team_id": team_id})
         rows = result.fetchall()
 
-        is_admin = current_user.role == "admin"
+        is_admin = _is_game_admin(current_user)
         round_name_cache: Dict[int, str] = {}
 
         answers: List[Dict[str, Any]] = []
@@ -8889,7 +10070,7 @@ async def put_team_answers_batch(
         if not body.answers:
             return {"success": True, "updated": 0, "conflicts": []}
 
-        if current_user.role != "admin":
+        if not _is_game_admin(current_user):
             user_team_id = _resolve_user_team_id_int(current_user, db)
             if user_team_id is None or user_team_id != team_id:
                 raise HTTPException(status_code=403, detail="Access denied")
@@ -8898,7 +10079,7 @@ async def put_team_answers_batch(
         if not team:
             raise HTTPException(status_code=404, detail="Team not found")
 
-        if current_user.role != "admin":
+        if not _is_game_admin(current_user):
             if team.writer_user_id is None or team.writer_user_id != current_user.id:
                 raise HTTPException(status_code=403, detail="Only the team writer can update answers")
 
@@ -8965,7 +10146,7 @@ async def put_team_answers_batch(
                 keys_other == {"final_score"}
                 and "final_score" in dumped
             ):
-                if current_user.role != "admin":
+                if not _is_game_admin(current_user):
                     raise HTTPException(
                         status_code=403, detail="Only admin can adjust final_score"
                     )

@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import '../login_page.dart';
 import 'admin_round_player_tracking_dialog.dart';
+import 'admin_team_discon_dialog.dart';
 
 class AdminRoundAppTrackingPage extends StatefulWidget {
   final int activeGameId;
@@ -95,6 +96,10 @@ class _AdminRoundAppTrackingPageState extends State<AdminRoundAppTrackingPage> {
       userId: userId,
       displayName: displayName,
     );
+  }
+
+  void _openTeamDisconDialog() {
+    AdminTeamDisconDialog.show(context, teams: _teams);
   }
 
   @override
@@ -395,7 +400,20 @@ class _AdminRoundAppTrackingPageState extends State<AdminRoundAppTrackingPage> {
         Row(
           children: [
             headerLabel('#', width: rankW, align: Alignment.center),
-            headerLabel('КОМАНДЫ', width: teamW, align: Alignment.centerLeft),
+            InkWell(
+              onTap: _openTeamDisconDialog,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  headerLabel('КОМАНДЫ', width: teamW - 28, align: Alignment.centerLeft),
+                  Icon(
+                    Icons.list_alt,
+                    size: 20,
+                    color: _textWhite.withValues(alpha: 0.85),
+                  ),
+                ],
+              ),
+            ),
           ],
         ),
         for (var i = 0; i < _teams.length; i++)

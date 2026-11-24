@@ -2,6 +2,9 @@
 .env
 .env.local
 
+# CM_Quiz optional local installers (too large for GitHub; use mysql/installer/ or download)
+deploy/cm_quiz_installer/sql/instoller/
+
 # Miscellaneous
 *.class
 *.log

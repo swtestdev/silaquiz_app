@@ -117,6 +117,14 @@ bool initStrictVisibilityWeb(StrictVisibilityWebCallbacks callbacks) {
   return initialVisible;
 }
 
+void replaceWebHistoryRoute(String flutterRoute) {
+  try {
+    final path = flutterRoute.startsWith('/') ? flutterRoute : '/$flutterRoute';
+    final base = window.location.pathname;
+    window.history.replaceState(null, '', '$base#$path');
+  } catch (_) {}
+}
+
 Future<void> downloadBytesAsFile(List<int> bytes, String filename) async {
   final blob = Blob(
     [Uint8List.fromList(bytes).toJS].toJS,

@@ -110,10 +110,36 @@ fetch('http://localhost:8000/api/timer/trigger', {
 ```
 
 ## Testing
-Use the provided test script:
+
+### Automated
+
+Backend (from `backend_fastapi/`):
+
+```bash
+pip install pytest httpx
+pytest test_timer_websocket.py -v
+```
+
+Flutter:
+
+```bash
+flutter test test/echo_scheduler_test.dart
+```
+
+Manual trigger script:
+
 ```bash
 python test_timer_trigger.py
 ```
+
+### Latency rehearsal (pass/fail gates)
+
+1. **Setup:** PC host + at least one player phone. API URL must be `http://<pc-hostname>:8000/api` on phones (never `localhost`). App URL is `:8080`.
+2. **WebSocket:** Log in as player → `GET /api/connections/stats` shows `connected_users >= 1`. Server log contains `WebSocket connected for user {id}`.
+3. **WS SLA:** Trigger START from VBHost → player timer bar updates in **< 500 ms** (target **< 100 ms** with WS).
+4. **Echo fallback:** Block WS or use wrong API briefly → timer still arrives within **≤ 2.5 s** (2 s echo interval when WS down).
+5. **Parallel UI:** On new question, timer bar and field editability update **before** question list finishes loading from API.
+6. **Gate for server Fix D:** Only needed if steps 2–5 pass but VBHost HTTP response or server broadcast log still shows multi-second delay.
 
 ## Frontend Integration
 The Flutter app automatically:

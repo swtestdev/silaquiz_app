@@ -9,7 +9,10 @@ import '../services/user_data_service.dart';
 import '../services/strict_visibility_service.dart';
 import '../services/logout_notice.dart';
 import '../services/timer_store.dart';
+import '../services/debug_console_service.dart';
 import '../utils/active_game_selection.dart';
+import '../utils/echo_scheduler.dart';
+import '../services/ws_connect.dart';
 import '../navigation/app_route_observer.dart';
 import 'login_page.dart'; // For DatabaseService
 import 'admin/admin_game_results_page.dart';
@@ -29,6 +32,8 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
   bool _hasShownTeamNotification = false;
   bool _hasTeam = false;
   String _userRole = 'player';
+  bool get _isGameAdminRole =>
+      _userRole == 'admin' || _userRole == 'super_admin';
   bool _eligibleForActiveGame = false;
   bool _adminHasLiveGame = false;
   int? _adminActiveGameId;
@@ -61,9 +66,16 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
   int _webSocketConnectionGen = 0;
   bool _hasShownLocalhostHint = false;
   int _webSocketReconnectAttempts = 0;
+  bool _sessionValidated = false;
+  bool _deferWebSocketUntilEcho = false;
 
   bool get _isWebSocketHealthy =>
       _webSocketLive && _channel != null && !_webSocketConnecting;
+
+  void _wsLog(String message) {
+    print(message);
+    DebugConsoleService.instance.addLog(message);
+  }
 
   @override
   void initState() {
@@ -92,7 +104,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text(
-              'New version installed. Check server URL in Database Info if something doesn\'t work.',
+              'New version installed. Re-open the game link from the host if something doesn\'t work.',
             ),
             duration: Duration(seconds: 5),
           ),
@@ -158,26 +170,16 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
       return;
     }
     
-    // For now, use local data directly to avoid session validation issues
-    // TODO: Re-enable session validation once the race condition is fixed
-    final userData = localUserData;
-    print('Using local user data: $userData');
-    print('User data keys: ${userData?.keys.toList()}');
-    print('Writer status: ${userData?['writer']}');
-    print('User name: ${userData?['name']}');
-    print('User role: ${userData?['role']}');
-    print('User ID: ${userData?['id']}');
-    
-    // Try to validate the session with the server (but don't fail if it doesn't work)
+    Map<String, dynamic> effectiveUser = Map<String, dynamic>.from(localUserData);
+    _sessionValidated = false;
+    _deferWebSocketUntilEcho = false;
+
+    // Validate session with server; prefer fresh user data when successful.
     if (!_sessionValidationInProgress) {
       print('Starting session validation...');
       _sessionValidationInProgress = true;
       try {
-        // Add a small delay to avoid race conditions with database commits
-        print('Waiting 1 second before session validation...');
         await Future.delayed(const Duration(milliseconds: 1000));
-        
-        print('Calling validateSession...');
         final sessionResult = await DatabaseService.validateSession().timeout(
           const Duration(seconds: 10),
           onTimeout: () {
@@ -185,85 +187,66 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
             return {'success': false, 'message': 'Timeout'};
           },
         );
-        print('Session validation result: ${sessionResult['success']}');
-        if (sessionResult['success']) {
-          print('Session validation successful, using fresh server data');
-          // Use fresh user data from server
+        if (sessionResult['success'] == true) {
           final freshUserData = sessionResult['user'];
-          print('Fresh user data: $freshUserData');
-          setState(() {
-            _userName = freshUserData?['name'] ?? 'User';
-            _isWriter = freshUserData?['writer'] ?? false;
-            _visibleConnected = freshUserData?['visible_connected'] ?? 0;
-            _serverReachable = true;
-            _userId = freshUserData?['id']?.toString() ?? '';
-            _userRole = freshUserData?['role'] ?? 'player';
-          });
-          print('State updated with fresh data - Name: $_userName, Role: $_userRole, ID: $_userId');
-          _sessionValidationInProgress = false;
-          print('Session validation complete, continuing with main page setup...');
-          // Don't return here - continue with the rest of the method
+          if (freshUserData is Map<String, dynamic>) {
+            effectiveUser = Map<String, dynamic>.from(freshUserData);
+          }
+          _sessionValidated = true;
+          _serverReachable = true;
+          print('Session validation successful');
         } else {
-          print('Session validation failed, using local data: ${sessionResult['message']}');
-          // Don't logout on initial session validation failure - this might be a race condition
-          print('Using local data due to session validation failure - this is normal during initial load');
+          print('Session validation failed: ${sessionResult['message']}');
+          _deferWebSocketUntilEcho =
+              effectiveUser['session_token'] != null &&
+              effectiveUser['session_token'].toString().isNotEmpty;
         }
       } catch (e) {
         print('Session validation error, using local data: $e');
+        _deferWebSocketUntilEcho =
+            effectiveUser['session_token'] != null &&
+            effectiveUser['session_token'].toString().isNotEmpty;
       }
       _sessionValidationInProgress = false;
     }
-    
-    // Ensure we have user data before proceeding
-    if (userData == null) {
-      print('No user data available, redirecting to login');
-      Navigator.pushReplacementNamed(context, '/login');
-      return;
-    }
-    
+
     // Soft sync: restore local timers, then apply server-authoritative snapshot (Option C)
     await TimerStore.instance.loadFromPrefs();
     await _syncActiveTimersFromServer(force: true);
 
-    // Set loading to false to show the UI
-    setState(() {
-      _isLoading = false;
-    });
-    print('Loading set to false, UI should now be visible');
-    
     // Check team assignment
-    final playingInTeamId = userData['playing_in_team_id'];
+    final playingInTeamId = effectiveUser['playing_in_team_id'];
     final teamName = await UserDataService.getTeamName();
-    bool hasTeamId = playingInTeamId != null && playingInTeamId.toString().isNotEmpty;
-    bool hasTeamName = teamName != null && teamName.isNotEmpty;
-    bool hasTeam = hasTeamId || hasTeamName;
-    
+    final hasTeamId =
+        playingInTeamId != null && playingInTeamId.toString().isNotEmpty;
+    final hasTeamName = teamName != null && teamName.isNotEmpty;
+    final hasTeam = hasTeamId || hasTeamName;
+
     setState(() {
-      _userName = userData['name'] ?? 'User';
-      _isWriter = userData['writer'] ?? false;
-      _visibleConnected = userData['visible_connected'] ?? 0;
-      _userId = userData['id']?.toString() ?? '';
+      _userName = effectiveUser['name']?.toString() ?? 'User';
+      _isWriter = effectiveUser['writer'] == true;
+      _visibleConnected = effectiveUser['visible_connected'] is int
+          ? effectiveUser['visible_connected'] as int
+          : int.tryParse(effectiveUser['visible_connected']?.toString() ?? '') ??
+              0;
+      _userId = effectiveUser['id']?.toString() ?? '';
       _hasTeam = hasTeam;
-      _userRole = userData['role'] ?? 'player';
+      _userRole = effectiveUser['role']?.toString() ?? 'player';
       _isLoading = false;
     });
-    
-    // Check if user has a team assigned
-    await _checkTeamAssignment(userData);
 
-    if (_userRole == 'admin') {
+    await _checkTeamAssignment(effectiveUser);
+
+    if (_isGameAdminRole) {
       await _checkAdminActiveGame();
-    } else if (_userRole == 'player') {
-      // Players with a team see the notice first; bonus prompt runs after dismiss.
-      if (!_hasTeam) {
-        await _checkForActiveGames();
-      }
+    } else if (_userRole == 'player' && !_hasTeam) {
+      await _checkForActiveGames();
     }
-    
-    // Connect to WebSocket for timer updates (only for players)
+
+    // Connect WebSocket only when session is confirmed (avoid rejected handshakes).
     if (_userRole == 'player') {
       StrictVisibilityService.instance.setWebSocketConnected(false);
-      _requestWebSocketConnect();
+      _requestWebSocketConnectIfReady();
     }
     
     // Start periodic session validation to catch session invalidation
@@ -316,23 +299,28 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
     // Check if user has a team assigned
     await _checkTeamAssignment(localUserData);
 
-    if (_userRole == 'admin') {
+    if (_isGameAdminRole) {
       await _checkAdminActiveGame();
     } else if (_userRole == 'player' && !hasTeam) {
       await _checkForActiveGames();
     }
     
-    // Connect WebSocket if player
+    _sessionValidated = localUserData['session_token'] != null;
+    _deferWebSocketUntilEcho = !_sessionValidated;
+
     if (_userRole == 'player') {
       StrictVisibilityService.instance.setWebSocketConnected(false);
-      _requestWebSocketConnect();
+      _requestWebSocketConnectIfReady();
     }
-    
+
+    print('Starting ECHO timer...');
+    _startEchoTimer();
+
     // Show notification popup only if user has a team
     if (_userRole == 'player' && hasTeam && !_hasShownNotification) {
       _showNotificationPopup();
     }
-    
+
     print('=== _loadUserDataFallback COMPLETE ===');
   }
 
@@ -361,7 +349,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
   /// Re-fetch active/running game state so Analytics / View Results buttons update.
   Future<void> _refreshGameEligibility() async {
     if (!mounted || _logoutInProgress) return;
-    if (_userRole == 'admin') {
+    if (_isGameAdminRole) {
       await _checkAdminActiveGame();
     } else if (_userRole == 'player' && _userId.isNotEmpty) {
       await _checkForActiveGames();
@@ -408,7 +396,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
     await _checkTeamAssignment(localUserData);
     
     // Re-evaluate active game eligibility after profile change
-    if (_userRole == 'admin') {
+    if (_isGameAdminRole) {
       await _checkAdminActiveGame();
     } else if (_userRole == 'player' && _userId.isNotEmpty) {
       await _checkForActiveGames();
@@ -835,7 +823,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
                     
                     // Role-based Quick Actions
                     Text(
-                      _userRole == 'admin' ? 'Admin Panel' : 'Game Action',
+                      _isGameAdminRole ? 'Admin Panel' : 'Game Action',
                       style: const TextStyle(
                         fontSize: 18,
                         fontWeight: FontWeight.bold,
@@ -857,7 +845,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
 
 
   Widget _buildRoleBasedActions() {
-    if (_userRole == 'admin') {
+    if (_isGameAdminRole) {
       // Admin buttons
       return Column(
         children: [
@@ -1009,7 +997,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
 
 
   Widget _buildViewSummaryCard() {
-    final isAdmin = _userRole == 'admin';
+    final isAdmin = _isGameAdminRole;
     final enabled = isAdmin
         ? _adminHasLiveGame
         : (_hasTeam && _eligibleForActiveGame);
@@ -1138,10 +1126,25 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
     Map<String, dynamic> snapshot, {
     bool force = false,
   }) async {
-    await question_page.applyActiveTimersSnapshot(snapshot, force: force);
+    // Echo fallback: force full sync on Question page or when WS is down so the
+    // timer bar updates without exit/re-enter.
+    final effectiveForce =
+        force || question_page.isQuestionPageActive || !_isWebSocketHealthy;
+    await question_page.applyActiveTimersSnapshot(
+      snapshot,
+      force: effectiveForce,
+    );
   }
 
   // WebSocket and Timer Management
+  void _requestWebSocketConnectIfReady() {
+    if (!_sessionValidated && _deferWebSocketUntilEcho) {
+      _wsLog('WebSocket connect deferred until echo confirms session');
+      return;
+    }
+    _requestWebSocketConnect();
+  }
+
   void _requestWebSocketConnect() {
     if (_suppressWebSocketReconnect || _logoutInProgress) return;
     if (_userId.isEmpty || _userRole != 'player') return;
@@ -1168,12 +1171,10 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
     _tearDownWebSocketChannel();
 
     final wsUrl = DatabaseService.getWebSocketUrl(_userId);
-    if (kDebugMode) {
-      print('WebSocket connect start (gen=$gen): $wsUrl');
-    }
+    _wsLog('WebSocket connect start (gen=$gen): $wsUrl');
 
     try {
-      _channel = WebSocketChannel.connect(Uri.parse(wsUrl));
+      _channel = connectTimerWebSocket(Uri.parse(wsUrl));
 
       _webSocketSubscription = _channel!.stream.listen(
         (data) => _onWebSocketData(gen, data),
@@ -1199,14 +1200,11 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
       _webSocketReconnectTimer?.cancel();
       _webSocketReconnectTimer = null;
       StrictVisibilityService.instance.setWebSocketConnected(true);
-      if (kDebugMode) {
-        print('WebSocket ready (gen=$gen)');
-      }
+      _wsLog('WebSocket ready (gen=$gen)');
+      _onWebSocketStateChanged();
     } catch (e) {
       if (gen != _webSocketConnectionGen) return;
-      if (kDebugMode) {
-        print('WebSocket connect failed (gen=$gen): $e');
-      }
+      _wsLog('WebSocket connect failed (gen=$gen): $e');
       _markWebSocketOffline(scheduleReconnect: true);
       _maybeShowLocalhostMobileHint();
     }
@@ -1225,27 +1223,25 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
         }
       }
     } catch (e) {
-      if (kDebugMode) {
-        print('WebSocket parse error: $e');
-      }
+      _wsLog('WebSocket parse error: $e');
     }
   }
 
   void _onWebSocketError(int gen, Object error) {
     if (gen != _webSocketConnectionGen) return;
-    if (kDebugMode) {
-      print('WebSocket error (gen=$gen): $error');
-    }
+    _wsLog('WebSocket error (gen=$gen): $error');
     _markWebSocketOffline(scheduleReconnect: true);
     _maybeShowLocalhostMobileHint();
   }
 
   void _onWebSocketClosed(int gen) {
     if (gen != _webSocketConnectionGen) return;
-    if (kDebugMode) {
-      print('WebSocket closed (gen=$gen)');
-    }
+    _wsLog('WebSocket closed (gen=$gen)');
     _markWebSocketOffline(scheduleReconnect: true);
+  }
+
+  void _onWebSocketStateChanged() {
+    _restartEchoScheduler();
   }
 
   void _markWebSocketOffline({required bool scheduleReconnect}) {
@@ -1261,6 +1257,7 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
     _webSocketConnecting = false;
     _tearDownWebSocketChannel();
     StrictVisibilityService.instance.setWebSocketConnected(false);
+    _onWebSocketStateChanged();
     if (scheduleReconnect) {
       _scheduleWebSocketReconnect();
     }
@@ -1279,12 +1276,10 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
     _webSocketReconnectAttempts =
         (_webSocketReconnectAttempts + 1).clamp(0, 10);
 
-    if (kDebugMode) {
-      print(
-        'WebSocket reconnect in ${delaySeconds}s '
-        '(attempt $_webSocketReconnectAttempts)',
-      );
-    }
+    _wsLog(
+      'WebSocket reconnect in ${delaySeconds}s '
+      '(attempt $_webSocketReconnectAttempts)',
+    );
 
     _webSocketReconnectTimer = Timer(Duration(seconds: delaySeconds), () {
       _webSocketReconnectTimer = null;
@@ -1314,12 +1309,33 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
 
   void _maybeShowLocalhostMobileHint() {
     if (_hasShownLocalhostHint || !mounted) return;
-    final baseUrl = DatabaseService.baseUrl;
-    if (!kIsWeb || !baseUrl.contains('localhost')) return;
+    if (!kIsWeb) return;
+
+    final baseUrl = DatabaseService.baseUrl.toLowerCase();
+    final pageHost = Uri.base.host.toLowerCase();
+    Uri? apiUri;
+    try {
+      apiUri = Uri.parse(baseUrl);
+    } catch (_) {
+      return;
+    }
+    final apiHost = apiUri.host.toLowerCase();
+    final localhostApi =
+        apiHost == 'localhost' || apiHost == '127.0.0.1' || apiHost == '::1';
+    final hostMismatch =
+        pageHost.isNotEmpty && apiHost.isNotEmpty && pageHost != apiHost;
+
+    if (!localhostApi && !hostMismatch) return;
+
     _hasShownLocalhostHint = true;
-    print(
-      'Localhost hint: on mobile, set server URL via Database Info on the login screen '
-      '(e.g. http://192.168.0.1:8000/api).',
+    final hint = localhostApi
+        ? 'API URL uses localhost — phones cannot reach it. Open the game via the host link '
+            '(e.g. http://192.168.x.x:8080/#/login).'
+        : 'API host ($apiHost) differs from page host ($pageHost). '
+            'Re-open the game using the link from the host PC.';
+    _wsLog('WS hint: $hint');
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(hint), duration: const Duration(seconds: 8)),
     );
   }
 
@@ -1589,97 +1605,102 @@ class _MainPageState extends State<MainPage> with WidgetsBindingObserver, RouteA
     });
   }
 
-  // Start ECHO call timer for session validation
   void _startEchoTimer() {
     print('=== _startEchoTimer START ===');
-    // Send ECHO call every 5 seconds to validate session
-    _echoTimer = Timer.periodic(const Duration(seconds: 5), (timer) async {
-      print('ECHO timer triggered');
-      if (!mounted) {
-        print('Widget not mounted, canceling ECHO timer');
-        timer.cancel();
-        return;
-      }
-      
-      try {
-        print('Sending ECHO call...');
-        final vis = StrictVisibilityService.instance.isStrictVisible;
-        final echoResult = await DatabaseService.sendEchoCall(
-          vis,
-          source: 'periodic',
-        ).timeout(
-          const Duration(seconds: 5),
-          onTimeout: () {
-            print('ECHO call timed out');
-            if (mounted) {
-              setState(() {
-                _serverReachable = false;
-              });
-            }
-            return {'success': false, 'should_logout': false};
-          },
-        );
-        print('ECHO call result: visible=$vis, success=${echoResult['success']}, should_logout=${echoResult['should_logout']}, visible_connected=${echoResult['visible_connected']}');
-        
-        if (echoResult['should_logout'] == true) {
-          print('ECHO call indicates session invalid, logging out user');
-          timer.cancel();
-          final backendMsg = echoResult['message'] as String?;
-          final logoutReason = echoResult['logout_reason'] as String?;
-          final reason = LogoutNotice.reasonFromBackendMessage(
-                backendMsg,
-                logoutReason: logoutReason,
-              ) ??
-              LogoutReason.sessionTakenElsewhere;
-          await _logoutUser(reason: reason, backendMessage: backendMsg);
-        } else if (echoResult['success'] == true) {
-          if (_userRole == 'player' && !_isWebSocketHealthy) {
-            _ensureWebSocketConnected();
-          }
+    _restartEchoScheduler();
+  }
 
-          final visibleConnected = echoResult['visible_connected'];
-          if (mounted &&
-              (!_serverReachable ||
-                  (visibleConnected != null &&
-                      visibleConnected != _visibleConnected))) {
-            setState(() {
-              _serverReachable = true;
-              if (visibleConnected != null) {
-                _visibleConnected = visibleConnected;
-              }
-            });
-            print(
-              'Server reachable; visible_connected=$_visibleConnected',
-            );
-          }
-          
-          // Handle writer status changes
-          final writerStatus = echoResult['writer_status'];
-          if (writerStatus != null) {
-            _handleWriterStatusChange(writerStatus);
-          }
+  void _restartEchoScheduler() {
+    _echoTimer?.cancel();
+    if (!mounted) return;
+    final interval = echoPollInterval(webSocketLive: _isWebSocketHealthy);
+    _echoTimer = Timer(interval, _runEchoTick);
+    print('ECHO scheduled in ${interval.inSeconds}s (wsLive=$_isWebSocketHealthy)');
+  }
 
-          final activeTimers = echoResult['active_timers'];
-          if (activeTimers is Map<String, dynamic>) {
-            await _applyActiveTimersPayload(activeTimers);
-          }
-        } else {
+  Future<void> _runEchoTick() async {
+    if (!mounted) return;
+
+    try {
+      final vis = StrictVisibilityService.instance.isStrictVisible;
+      final echoResult = await DatabaseService.sendEchoCall(
+        vis,
+        source: 'periodic',
+      ).timeout(
+        const Duration(seconds: 5),
+        onTimeout: () {
+          print('ECHO call timed out');
           if (mounted) {
             setState(() {
               _serverReachable = false;
             });
           }
+          return {'success': false, 'should_logout': false};
+        },
+      );
+
+      if (echoResult['should_logout'] == true) {
+        final backendMsg = echoResult['message'] as String?;
+        final logoutReason = echoResult['logout_reason'] as String?;
+        final reason = LogoutNotice.reasonFromBackendMessage(
+              backendMsg,
+              logoutReason: logoutReason,
+            ) ??
+            LogoutReason.sessionTakenElsewhere;
+        _echoTimer?.cancel();
+        await _logoutUser(reason: reason, backendMessage: backendMsg);
+        return;
+      }
+
+      if (echoResult['success'] == true) {
+        if (_deferWebSocketUntilEcho) {
+          _sessionValidated = true;
+          _deferWebSocketUntilEcho = false;
+          _wsLog('Session confirmed via echo; enabling WebSocket');
         }
-      } catch (e) {
-        print('Error during ECHO call: $e');
-        if (mounted) {
+        if (_userRole == 'player' && !_isWebSocketHealthy) {
+          _requestWebSocketConnect();
+        }
+
+        final visibleConnected = echoResult['visible_connected'];
+        if (mounted &&
+            (!_serverReachable ||
+                (visibleConnected != null &&
+                    visibleConnected != _visibleConnected))) {
           setState(() {
-            _serverReachable = false;
+            _serverReachable = true;
+            if (visibleConnected != null) {
+              _visibleConnected = visibleConnected;
+            }
           });
         }
+
+        final writerStatus = echoResult['writer_status'];
+        if (writerStatus != null) {
+          _handleWriterStatusChange(writerStatus);
+        }
+
+        final activeTimers = echoResult['active_timers'];
+        if (activeTimers is Map<String, dynamic>) {
+          await _applyActiveTimersPayload(activeTimers);
+        }
+      } else if (mounted) {
+        setState(() {
+          _serverReachable = false;
+        });
       }
-    });
-    print('ECHO timer started');
+    } catch (e) {
+      print('Error during ECHO call: $e');
+      if (mounted) {
+        setState(() {
+          _serverReachable = false;
+        });
+      }
+    } finally {
+      if (mounted) {
+        _restartEchoScheduler();
+      }
+    }
   }
 
   // Start periodic session validation

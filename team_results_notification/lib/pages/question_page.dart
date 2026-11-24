@@ -15,6 +15,9 @@ import 'login_page.dart'; // For DatabaseService
 // Global callback for timer messages from WebSocket
 Function(Map<String, dynamic>)? _globalTimerMessageHandler;
 
+/// True while [QuestionPage] is mounted and listening for timer events.
+bool get isQuestionPageActive => _globalTimerMessageHandler != null;
+
 int _parseRoundTimerValue(dynamic v) => TimerStore.parseInt(v);
 
 bool _roundNameKeysMatch(String a, String b) =>
@@ -87,6 +90,24 @@ Future<void> reapplyGlobalStartTimerFromGameData(
   if (questionTimerSeconds <= 0) return;
   final action = message['timer_action']?.toString() ?? '';
   if (action != 'START_TIME' && action != 'START_TIMER') return;
+
+  // Do not reset countdown from game DB when server already has a live window.
+  final now = DateTime.now().toUtc();
+  final session = TimerStore.instance.questionSession;
+  if (session != null && session.isActiveAt(now)) {
+    print(
+      'QuestionPage: skip reapplyGlobalStartTimer — active TimerStore session',
+    );
+    return;
+  }
+  final d = TimerStore.instance.displayState;
+  if (d.startTimerStatus == 'Running' && d.remainingSeconds > 0) {
+    print(
+      'QuestionPage: skip reapplyGlobalStartTimer — display already Running',
+    );
+    return;
+  }
+
   final enriched = Map<String, dynamic>.from(message);
   enriched['question_timer'] = questionTimerSeconds;
   enriched['timer_action'] = action;
@@ -281,6 +302,15 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
 
   // Current game name for persistent storage
   String _currentGameNameForStorage = '';
+  static const _cachedActiveGameNameKey = 'cached_active_game_name';
+
+  Map<String, dynamic>? _cachedActiveGame;
+  DateTime? _cachedActiveGameAt;
+  static const _activeGameCacheTtl = Duration(seconds: 45);
+
+  String? _lastCompletedBoardKey;
+  String? _boardBuildKeyInFlight;
+  Future<void>? _boardBuildFuture;
   
   // Auto-save timer (debounced)
   Timer? _autoSaveTimer;
@@ -374,6 +404,7 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
         print('QuestionPage: active timer sync on open failed: $e');
       }
       if (mounted) _syncUiFromTimerStore();
+      await _getActiveGameCached();
       await _loadQuestionBoardFromLastTimer();
       if (mounted) await _updateAnswerEditability();
     } catch (e) {
@@ -441,18 +472,18 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
     if (!mounted) return;
     _syncUiFromTimerStore();
     unawaited(() async {
-      if (!_isWriter) return;
-
-      final session = TimerStore.instance.questionSession;
-      final now = DateTime.now().toUtc();
-      final d = TimerStore.instance.displayState;
-      if (d.startTimerStatus == 'Running' &&
-          session != null &&
-          session.isActiveAt(now) &&
-          !_boardMatchesActiveSession(session)) {
-        await _tryLoadBoardFromActiveQuestionTimer();
-      } else if (!_hasRealQuestionBoard) {
-        await _tryLoadBoardFromActiveQuestionTimer();
+      if (_isWriter) {
+        final session = TimerStore.instance.questionSession;
+        final now = DateTime.now().toUtc();
+        final d = TimerStore.instance.displayState;
+        if (d.startTimerStatus == 'Running' &&
+            session != null &&
+            session.isActiveAt(now) &&
+            !_boardMatchesActiveSession(session)) {
+          await _tryLoadBoardFromActiveQuestionTimer();
+        } else if (!_hasRealQuestionBoard) {
+          await _tryLoadBoardFromActiveQuestionTimer();
+        }
       }
       await _updateAnswerEditability();
     }());
@@ -783,8 +814,7 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
 
     _pageScrollController.dispose();
     _answerPoolRevision.dispose();
-    // Save answers before disposing
-    _saveAnswers();
+    unawaited(_saveAnswers());
     
     // Unregister timer message handler
     if (_globalTimerMessageHandler == _handleTimerTrigger) {
@@ -870,7 +900,36 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
     // TODO: Implement get_game_for_round
   }
 
+  static String _boardBuildKey(Map<String, dynamic> message) {
+    final eventId = message['event_id']?.toString();
+    if (eventId != null && eventId.isNotEmpty) return eventId;
+    return '${message['timer_action']}_${message['slide_number']}_${message['question_id']}';
+  }
+
   Future<void> build_question_board(Map<String, dynamic> message) async {
+    final key = _boardBuildKey(message);
+    if (key == _lastCompletedBoardKey) {
+      print('QuestionPage: skip build_question_board — already built for $key');
+      if (mounted) {
+        _syncUiFromTimerStore();
+        unawaited(_updateAnswerEditability());
+      }
+      return;
+    }
+    if (_boardBuildKeyInFlight == key && _boardBuildFuture != null) {
+      print('QuestionPage: coalesce build_question_board for $key');
+      return _boardBuildFuture!;
+    }
+    _boardBuildKeyInFlight = key;
+    _boardBuildFuture = _buildQuestionBoardBody(message).whenComplete(() {
+      _lastCompletedBoardKey = key;
+      _boardBuildKeyInFlight = null;
+      _boardBuildFuture = null;
+    });
+    return _boardBuildFuture!;
+  }
+
+  Future<void> _buildQuestionBoardBody(Map<String, dynamic> message) async {
     try {
       print('QuestionPage: build_question_board called with message: $message');
       
@@ -908,7 +967,7 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
       
       // Get active game to get game name
       print('QuestionPage: Getting active game...');
-      final activeGame = await _getActiveGame();
+      final activeGame = await _getActiveGameCached();
       if (activeGame == null) {
         print('QuestionPage: No active game found');
         return;
@@ -947,8 +1006,7 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
           ? scoreQuestionId
           : int.tryParse(scoreQuestionId?.toString() ?? '');
       
-      // Update current game name for storage
-      _currentGameNameForStorage = gameName;
+      await _setGameNameForStorage(gameName);
       
       // Load game data into cache if not already loaded or if round changed
       final currentRound = _gameData.isNotEmpty 
@@ -1013,9 +1071,14 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
           tta = int.tryParse(ttaRaw.toString()) ?? 0;
         }
         if (canReapplyStart && tta > 0) {
-          print('QuestionPage: Re-applying global START timer with time_to_get_answer=$tta from game data');
+          print(
+            'QuestionPage: Re-applying global START timer with time_to_get_answer=$tta from game data',
+          );
           await reapplyGlobalStartTimerFromGameData(message, tta);
-          if (mounted) await _loadTimerStatus();
+          if (mounted) {
+            _syncUiFromTimerStore();
+            await _updateAnswerEditability();
+          }
         }
       }
       
@@ -1893,6 +1956,53 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
     }
   }
   
+  Future<void> _setGameNameForStorage(String gameName) async {
+    if (gameName.isEmpty) return;
+    _currentGameNameForStorage = gameName;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_cachedActiveGameNameKey, gameName);
+    } catch (_) {}
+  }
+
+  Future<bool> _ensureGameNameForStorage() async {
+    if (_currentGameNameForStorage.isNotEmpty) return true;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final cached = prefs.getString(_cachedActiveGameNameKey);
+      if (cached != null && cached.isNotEmpty) {
+        _currentGameNameForStorage = cached;
+        return true;
+      }
+    } catch (_) {}
+    final activeGame = await _getActiveGameCached();
+    final gameName = activeGame?['game_name'] as String?;
+    if (gameName != null && gameName.isNotEmpty) {
+      await _setGameNameForStorage(gameName);
+      return true;
+    }
+    return false;
+  }
+
+  Future<Map<String, dynamic>?> _getActiveGameCached() async {
+    final now = DateTime.now();
+    if (_cachedActiveGame != null &&
+        _cachedActiveGameAt != null &&
+        now.difference(_cachedActiveGameAt!) < _activeGameCacheTtl) {
+      return _cachedActiveGame;
+    }
+    final game = await _getActiveGame();
+    if (game != null) {
+      _cachedActiveGame = game;
+      _cachedActiveGameAt = now;
+      final gameName = game['game_name'] as String?;
+      if (gameName != null && gameName.isNotEmpty) {
+        await _setGameNameForStorage(gameName);
+      }
+    }
+    return game;
+  }
+
   /// Get active game from backend
   Future<Map<String, dynamic>?> _getActiveGame() async {
     try {
@@ -2081,7 +2191,7 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
   /// Save answers to persistent storage
   Future<void> _saveAnswers() async {
     try {
-      if (_currentGameNameForStorage.isEmpty) {
+      if (!await _ensureGameNameForStorage()) {
         print('QuestionPage: Cannot save answers - no game name set');
         return;
       }
@@ -2214,30 +2324,35 @@ class _QuestionPageState extends State<QuestionPage> with WidgetsBindingObserver
       case 'START_TIMER':
         print('QuestionPage: START_TIMER received');
         if (mounted) _syncUiFromTimerStore();
-        build_question_board(message).then((_) async {
-          if (mounted) _syncUiFromTimerStore();
-          await _updateAnswerEditability();
-        }).catchError((e) {
-          print('QuestionPage: Error in build_question_board for START_TIMER: $e');
-        });
+        unawaited(_updateAnswerEditability());
+        unawaited(
+          build_question_board(message).then((_) async {
+            if (mounted) await _updateAnswerEditability();
+          }).catchError((e) {
+            print('QuestionPage: Error in build_question_board for START_TIMER: $e');
+          }),
+        );
         break;
-        
+
       case 'STOP_TIMER':
       case 'PAUSE_TIMER':
         print('QuestionPage: $timerAction received');
+        _lastCompletedBoardKey = null;
         if (mounted) _syncUiFromTimerStore();
         unawaited(_updateAnswerEditability());
         break;
-        
+
       case 'LAST_TIMER':
         print('QuestionPage: LAST_TIMER received');
         if (mounted) _syncUiFromTimerStore();
-        build_question_board(message).then((_) async {
-          if (mounted) _syncUiFromTimerStore();
-          await _updateAnswerEditability();
-        }).catchError((e) {
-          print('QuestionPage: Error in build_question_board for LAST_TIMER: $e');
-        });
+        unawaited(_updateAnswerEditability());
+        unawaited(
+          build_question_board(message).then((_) async {
+            if (mounted) await _updateAnswerEditability();
+          }).catchError((e) {
+            print('QuestionPage: Error in build_question_board for LAST_TIMER: $e');
+          }),
+        );
         break;
         
       default:
